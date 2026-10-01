@@ -63,6 +63,7 @@ struct GemmDims {
     a_z: u32,
     b_z: u32,
     c_z: u32,
+    epilogue: u32,
     scale: f32,
 }
 
@@ -748,10 +749,10 @@ impl GpuModel {
             GemmDims {
                 m: rows as u32, n: hidden as u32, k: 512,
                 a_stride: 512, b_stride: hidden as u32, c_stride: hidden as u32,
-                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
+                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
             },
             (rows as u32).div_ceil(shaders::MT), (hidden as u32).div_ceil(shaders::NT),
-            bind!(0, &cur), bind!(1, &self.fp_wt), bind!(2, &self.fp_b), bind!(3, &act.x),
+            bind!(0, &cur), bind!(1, &self.fp_wt), bind!(2, &self.fp_b), bind!(3, &act.x), bind!(5, &self.zeros),
         );
 
         // ---- positional conv + add. One group per workgroup-y, gelu fused.
@@ -804,10 +805,10 @@ impl GpuModel {
                 GemmDims {
                     m: t_rows, n: 3 * cols, k: cols,
                     a_stride: cols, b_stride: 3 * cols, c_stride: 3 * cols,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), (3 * cols).div_ceil(shaders::NT),
-                bind!(0, &act.t1), bind!(1, &self.qkv_wt[li]), bind!(2, &self.qkv_b[li]), bind!(3, &act.qkv),
+                bind!(0, &act.t1), bind!(1, &self.qkv_wt[li]), bind!(2, &self.qkv_b[li]), bind!(3, &act.qkv), bind!(5, &self.zeros),
             );
             // K^T: rows hidden, cols t, from qkv rows offset T*1024, stride 3072
             dispatch!(
@@ -826,10 +827,11 @@ impl GpuModel {
                     a_off: 0, a_z: head_dim as u32,
                     b_off: 0, b_z: head_dim as u32 * t as u32,
                     c_off: 0, c_z: t_rows * t_rows,
+                    epilogue: 0,
                     scale: 0.125, // head_dim^-0.5: the attention scaling
                 },
                 t_rows.div_ceil(shaders::MT), t_rows.div_ceil(shaders::NT), heads as u32,
-                bind!(0, &act.qkv), bind!(1, &act.kt), bind!(2, &self.zeros), bind!(3, &act.scores),
+                bind!(0, &act.qkv), bind!(1, &act.kt), bind!(2, &self.zeros), bind!(3, &act.scores), bind!(5, &self.zeros),
             );
             // softmax over each (head, query) row
             dispatch!(
@@ -847,10 +849,11 @@ impl GpuModel {
                     a_off: 0, a_z: t_rows * t_rows,
                     b_off: (2 * hidden) as u32, b_z: head_dim as u32,
                     c_off: 0, c_z: head_dim as u32,
+                    epilogue: 0,
                     scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), (head_dim as u32).div_ceil(shaders::NT), heads as u32,
-                bind!(0, &act.scores), bind!(1, &act.qkv), bind!(2, &self.zeros), bind!(3, &act.attn_o),
+                bind!(0, &act.scores), bind!(1, &act.qkv), bind!(2, &self.zeros), bind!(3, &act.attn_o), bind!(5, &self.zeros),
             );
             // out proj + residual
             dispatch!(
@@ -858,16 +861,10 @@ impl GpuModel {
                 GemmDims {
                     m: t_rows, n: cols, k: cols,
                     a_stride: cols, b_stride: cols, c_stride: cols,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 2, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), cols.div_ceil(shaders::NT),
-                bind!(0, &act.attn_o), bind!(1, &self.out_wt[li]), bind!(2, &self.out_b[li]), bind!(3, &act.t2),
-            );
-            dispatch!(
-                P_ADD,
-                Cfg4 { a: (t * hidden) as u32, b: 0, c: 0, d: 0 },
-                ((t * hidden) as u32).div_ceil(WG), 1,
-                bind!(0, &act.t2), bind!(1, &act.x), bind!(2, &act.t3),
+                bind!(0, &act.attn_o), bind!(1, &self.out_wt[li]), bind!(2, &self.out_b[li]), bind!(3, &act.t3), bind!(5, &act.x),
             );
             // FFN: t3 is the new residual; swap x <-> t3
             std::mem::swap(&mut act.x, &mut act.t3);
@@ -883,32 +880,20 @@ impl GpuModel {
                 GemmDims {
                     m: t_rows, n: self.cfg.intermediate_size as u32, k: cols,
                     a_stride: cols, b_stride: self.cfg.intermediate_size as u32, c_stride: self.cfg.intermediate_size as u32,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 1, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), (self.cfg.intermediate_size as u32).div_ceil(shaders::NT),
-                bind!(0, &act.t1), bind!(1, &self.ff1_wt[li]), bind!(2, &self.ff1_b[li]), bind!(3, &act.t2),
-            );
-            dispatch!(
-                P_GELU,
-                Cfg4 { a: (t * self.cfg.intermediate_size) as u32, b: 0, c: 0, d: 0 },
-                ((t * self.cfg.intermediate_size) as u32).div_ceil(WG), 1,
-                bind!(0, &act.t2),
+                bind!(0, &act.t1), bind!(1, &self.ff1_wt[li]), bind!(2, &self.ff1_b[li]), bind!(3, &act.t2), bind!(5, &self.zeros),
             );
             dispatch!(
                 P_GEMM,
                 GemmDims {
                     m: t_rows, n: cols, k: self.cfg.intermediate_size as u32,
                     a_stride: self.cfg.intermediate_size as u32, b_stride: cols, c_stride: cols,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 2, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), cols.div_ceil(shaders::NT),
-                bind!(0, &act.t2), bind!(1, &self.ff2_wt[li]), bind!(2, &self.ff2_b[li]), bind!(3, &act.t3),
-            );
-            dispatch!(
-                P_ADD,
-                Cfg4 { a: (t * hidden) as u32, b: 0, c: 0, d: 0 },
-                ((t * hidden) as u32).div_ceil(WG), 1,
-                bind!(0, &act.t3), bind!(1, &act.x), bind!(2, &act.t1),
+                bind!(0, &act.t2), bind!(1, &self.ff2_wt[li]), bind!(2, &self.ff2_b[li]), bind!(3, &act.t1), bind!(5, &act.x),
             );
             std::mem::swap(&mut act.x, &mut act.t1);
         }
@@ -925,10 +910,10 @@ impl GpuModel {
             GemmDims {
                 m: t as u32, n: vocab as u32, k: hidden as u32,
                 a_stride: hidden as u32, b_stride: vocab as u32, c_stride: vocab as u32,
-                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
+                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
             },
             (t as u32).div_ceil(shaders::MT), (vocab as u32).div_ceil(shaders::NT),
-            bind!(0, &act.x), bind!(1, &self.lm_wt), bind!(2, &self.lm_b), bind!(3, &act.logits),
+            bind!(0, &act.x), bind!(1, &self.lm_wt), bind!(2, &self.lm_b), bind!(3, &act.logits), bind!(5, &self.zeros),
         );
         dispatch!(
             P_LOGSOFTMAX,
@@ -1065,11 +1050,11 @@ impl GpuModel {
                     let mut b = p;
                     if p == P_GEMM {
                         b = if gy == 1 {
-                            13
-                        } else if gy == (t as u32).div_ceil(shaders::NT) {
-                            12
-                        } else {
                             14
+                        } else if gy == (t as u32).div_ceil(shaders::NT) {
+                            13
+                        } else {
+                            15
                         };
                     }
                     acc[b] += dt;

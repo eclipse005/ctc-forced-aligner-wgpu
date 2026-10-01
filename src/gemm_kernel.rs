@@ -88,6 +88,7 @@ fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind) -> String {
     a_stride: u32, b_stride: u32, c_stride: u32,
     a_off: u32, b_off: u32, c_off: u32,
     a_z: u32, b_z: u32, c_z: u32,
+    epilogue: u32,
     scale: f32,
 }
 @group(0) @binding(0) var<storage, read> a: array<f32>;
@@ -95,6 +96,25 @@ fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind) -> String {
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> c: array<f32>;
 @group(0) @binding(4) var<uniform> d: Dims;
+@group(0) @binding(5) var<storage, read> res: array<f32>;
+
+// epilogue == 1 fuses the FFN gelu; == 2 adds the residual stream
+fn erf(x: f32) -> f32 {
+    let s = sign(x);
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+        + 0.254829592) * t * exp(-a * a);
+    return s * y;
+}
+
+fn gelu(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + erf(x / 1.4142135623730951));
+}
+
+fn gelu4(v: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(gelu(v.x), gelu(v.y), gelu(v.z), gelu(v.w));
+}
 "#,
         ),
         Kind::Conv => s.push_str(
@@ -337,18 +357,26 @@ fn emit_fma_step(s: &mut String, t: &Tile, kv: &str) {
 }
 
 fn emit_store(s: &mut String, t: &Tile, kind: Kind) {
-    let (dst, scale, base) = match kind {
-        Kind::Gemm => ("c", "d.scale", "c_off + gm * d.c_stride + gn"),
-        Kind::Conv => ("out", "1.0", "gm * d.n + gn"),
+    let (dst, scale, base, gemm) = match kind {
+        Kind::Gemm => ("c", "d.scale", "c_off + gm * d.c_stride + gn", true),
+        Kind::Conv => ("out", "1.0", "gm * d.n + gn", false),
     };
     s.push_str("    if (m_full && n_full) {\n");
-    emit_store_rows(s, t, dst, scale, base, false);
+    emit_store_rows(s, t, dst, scale, base, false, gemm);
     s.push_str("    } else {\n");
-    emit_store_rows(s, t, dst, scale, base, true);
+    emit_store_rows(s, t, dst, scale, base, true, gemm);
     s.push_str("    }\n");
 }
 
-fn emit_store_rows(s: &mut String, t: &Tile, dst: &str, scale: &str, base: &str, masked: bool) {
+fn emit_store_rows(
+    s: &mut String,
+    t: &Tile,
+    dst: &str,
+    scale: &str,
+    base: &str,
+    masked: bool,
+    gemm: bool,
+) {
     for col in 0..t.tn_vec {
         let _ = writeln!(s, "        {{");
         let _ = writeln!(s, "            let gn = n0 + (lid.x + {}u) * 4u;", col * 16);
@@ -368,8 +396,38 @@ fn emit_store_rows(s: &mut String, t: &Tile, dst: &str, scale: &str, base: &str,
         for row in 0..t.tm {
             let _ = writeln!(s, "            {{");
             let _ = writeln!(s, "                let gm = m0 + row{row};");
-            let _ = writeln!(s, "                let o = acc_{row}_{col} * {scale} + biasv;");
             let _ = writeln!(s, "                let base = {base};");
+            let _ = writeln!(s, "                var o = acc_{row}_{col} * {scale} + biasv;");
+            if gemm {
+                s.push_str("                if (d.epilogue == 1u) {
+");
+                s.push_str("                    o = gelu4(o);
+");
+                s.push_str("                } else if (d.epilogue == 2u) {
+");
+                s.push_str("                    var resv = vec4<f32>(0.0);
+");
+                s.push_str("                    if (gm < d.m && gn + 3u < d.n) {
+");
+                s.push_str("                        resv = vec4<f32>(res[base], res[base + 1u], res[base + 2u], res[base + 3u]);
+");
+                s.push_str("                    } else if (gm < d.m) {
+");
+                s.push_str("                        if (gn < d.n) { resv.x = res[base]; }
+");
+                s.push_str("                        if (gn + 1u < d.n) { resv.y = res[base + 1u]; }
+");
+                s.push_str("                        if (gn + 2u < d.n) { resv.z = res[base + 2u]; }
+");
+                s.push_str("                        if (gn + 3u < d.n) { resv.w = res[base + 3u]; }
+");
+                s.push_str("                    }
+");
+                s.push_str("                    o = o + resv;
+");
+                s.push_str("                }
+");
+            }
             if masked {
                 s.push_str("                if (gm < d.m && gn + 3u < d.n) {\n");
                 store4(s, dst);
