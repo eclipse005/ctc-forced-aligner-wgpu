@@ -169,11 +169,35 @@ pub fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec<usize>
 /// pre-gathered (T, S) matrix (the GPU gather kernel's output). Both
 /// yield bit-identical f32 values, so the DP — and the timestamps — are
 /// identical either way.
-trait Emissions {
+///
+/// Public so the aligner can plug in its own source: for a long transcript it
+/// keeps the lm-head logits per window instead of the trellis and gathers the
+/// columns on demand ([`ctc_forced_align_emissions`]).
+pub trait Emissions {
     /// Fill `emit[0..num_states]` with frame `t`'s state scores.
     fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]);
     /// Score of expanded state `st` at frame `t` (frame_scores, collapse).
     fn score(&self, t: usize, st: usize) -> f32;
+    /// The path's per-frame scores, `out[t] = score(t, states[t])`.
+    ///
+    /// The default walks frame by frame.  A source that materialises a window
+    /// on demand overrides this to visit each window once, since the traceback
+    /// has to be finished before `states` exists and so the path pass is a
+    /// *second* walk over the same windows.
+    fn score_path(&self, states: &[i32], out: &mut [f64]) {
+        for (t, &st) in states.iter().enumerate() {
+            out[t] = self.score(t, st as usize) as f64;
+        }
+    }
+}
+
+impl<T: Emissions + ?Sized> Emissions for &T {
+    fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]) {
+        (**self).fill_emit(t, emit, token_ids)
+    }
+    fn score(&self, t: usize, st: usize) -> f32 {
+        (**self).score(t, st)
+    }
 }
 
 struct FullRows<'a> {
@@ -213,6 +237,71 @@ impl Emissions for GatheredRows<'_> {
     }
 }
 
+/// The gathered trellis as one (frames × S) block per window: the aligner
+/// collects each chunk's gathered matrix as it is produced and runs the DP
+/// straight over them, so the frames never sit in a second contiguous copy.
+#[derive(Debug, Clone, Default)]
+pub struct GatheredChunks {
+    /// per window: (kept_frames × S) row-major
+    pub chunks: Vec<Vec<f32>>,
+    /// kept frames per window (the last window matches — the tail padding is
+    /// trimmed from its block before the DP runs)
+    pub frames_per_chunk: usize,
+    pub num_states: usize,
+}
+
+impl GatheredChunks {
+    pub fn total_frames(&self) -> usize {
+        self.chunks.iter().map(|c| c.len() / self.num_states.max(1)).sum()
+    }
+
+    /// `fill_emit`/`score` locate a frame as `t / frames_per_chunk`, so every
+    /// block but the last must hold exactly `frames_per_chunk` whole rows.  The
+    /// aligner guarantees that by construction (every window is encoded from
+    /// an identically sized chunk, and only the last one is trimmed); a short
+    /// block anywhere else would silently shift every later frame, so refuse
+    /// it rather than return a plausible wrong alignment.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let s = self.num_states;
+        anyhow::ensure!(s > 0, "trellis has no states");
+        anyhow::ensure!(
+            self.frames_per_chunk > 0,
+            "frames_per_chunk must be positive"
+        );
+        let last = self.chunks.len().saturating_sub(1);
+        for (i, c) in self.chunks.iter().enumerate() {
+            anyhow::ensure!(
+                c.len() % s == 0,
+                "block {i} holds {} values, not a whole number of {s}-state rows",
+                c.len()
+            );
+            if i != last {
+                anyhow::ensure!(
+                    c.len() == self.frames_per_chunk * s,
+                    "block {i} holds {} rows, expected {} (only the last block may be short)",
+                    c.len() / s,
+                    self.frames_per_chunk
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Emissions for GatheredChunks {
+    fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
+        let s = self.num_states;
+        let row = &self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s..(t % self.frames_per_chunk + 1) * s];
+        for (e, &v) in emit.iter_mut().zip(row) {
+            *e = v as f64;
+        }
+    }
+    fn score(&self, t: usize, st: usize) -> f32 {
+        let s = self.num_states;
+        self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s + st]
+    }
+}
+
 /// Force-align `token_ids` against `log_probs` ((T, V) row-major, f32).
 #[allow(clippy::too_many_arguments)]
 pub fn ctc_forced_align(
@@ -227,7 +316,7 @@ pub fn ctc_forced_align(
 ) -> anyhow::Result<AlignmentResult> {
     let labels = build_expanded_labels(token_ids, blank_id);
     let em = FullRows { log_probs, vocab, labels: &labels, blank_id };
-    align(em, num_frames, &labels, blank_id, token_ids, frame_rate, pieces, return_path)
+    align(&em, num_frames, &labels, blank_id, token_ids, frame_rate, pieces, return_path)
 }
 
 /// Force-align against a pre-gathered (T, S) score matrix with
@@ -260,11 +349,52 @@ pub fn ctc_forced_align_gathered(
         .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
         .collect();
     let em = GatheredRows { gathered, num_states };
+    align(&em, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
+}
+
+/// Same DP over [`GatheredChunks`]: the per-window blocks the aligner
+/// collects on the fly.  Values must match the contiguous gather exactly
+/// (they are the same f32s, so the alignment is bit-identical).
+pub fn ctc_forced_align_gathered_chunks(
+    chunks: &GatheredChunks,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+) -> anyhow::Result<AlignmentResult> {
+    let num_states = chunks.num_states;
+    anyhow::ensure!(
+        num_states == 2 * token_ids.len() + 1,
+        "gathered states {num_states} != 2·{}+1",
+        token_ids.len()
+    );
+    chunks.validate()?;
+    let num_frames = chunks.total_frames();
+    let labels: Vec<usize> = (0..num_states)
+        .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
+        .collect();
+    align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
+}
+
+/// The same DP over any [`Emissions`] source.  The aligner uses it for the
+/// lazy-logits trellis, which produces the identical f32 values the gathered
+/// blocks hold — it just materialises a window's columns only when the DP
+/// reaches it.
+pub fn ctc_forced_align_emissions(
+    em: &impl Emissions,
+    num_frames: usize,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+) -> anyhow::Result<AlignmentResult> {
+    let num_states = 2 * token_ids.len() + 1;
+    let labels: Vec<usize> = (0..num_states)
+        .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
+        .collect();
     align(em, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
 }
 
 fn align(
-    em: impl Emissions,
+    em: &impl Emissions,
     t_len: usize,
     labels: &[usize],
     blank_id: usize,
@@ -354,10 +484,9 @@ fn align(
         states[t - 1] = cur as i32;
     }
 
-    let frame_scores: Vec<f64> = (0..t_len)
-        .map(|t| em.score(t, states[t] as usize) as f64)
-        .collect();
-    let tokens = collapse(&states, &em, token_ids, pieces, frame_rate);
+    let mut frame_scores = vec![0.0f64; t_len];
+    em.score_path(&states, &mut frame_scores);
+    let tokens = collapse(&states, &frame_scores, token_ids, pieces, frame_rate);
 
     Ok(AlignmentResult {
         tokens,
@@ -372,7 +501,7 @@ fn align(
 #[allow(clippy::too_many_arguments)]
 fn collapse(
     states: &[i32],
-    em: &impl Emissions,
+    frame_scores: &[f64],
     token_ids: &[usize],
     pieces: Option<&[String]>,
     frame_rate: f64,
@@ -394,7 +523,8 @@ fn collapse(
             starts[i] = t as i64;
         }
         ends[i] = t as i64;
-        sums[i] += em.score(t, st) as f64;
+        // the same value frame_scores[t] holds: the path's state at frame t
+        sums[i] += frame_scores[t];
         counts[i] += 1;
     }
 
@@ -550,5 +680,85 @@ mod tests {
         for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    /// The per-window trellis the aligner actually feeds the DP must land on
+    /// the same alignment as the contiguous one, for a block size that does
+    /// not divide the frame count (so the last block is short).
+    #[test]
+    fn chunked_gathered_matches_contiguous() {
+        let (t, v, l, per) = (97usize, 40usize, 11usize, 13usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = (1..=l).map(|i| (i * 3) % v).collect();
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let log_probs: Vec<f32> = (0..t * v)
+            .map(|i| -((i % 89) as f32) * 0.11 - ((i / v) as f32 % 7.0) * 0.05)
+            .collect();
+        let want = ctc_forced_align(
+            &log_probs, t, v, &token_ids, blank, 50.0, Some(&pieces), false,
+        )
+        .unwrap();
+
+        let labels = build_expanded_labels(&token_ids, blank);
+        let s = labels.len();
+        let mut flat = Vec::with_capacity(t * s);
+        for f in 0..t {
+            for &st in &labels {
+                flat.push(log_probs[f * v + st]);
+            }
+        }
+        let blocks = flat
+            .chunks(per * s)
+            .map(|c| c.to_vec())
+            .collect::<Vec<_>>();
+        let trellis = GatheredChunks {
+            chunks: blocks,
+            frames_per_chunk: per.min(t),
+            num_states: s,
+        };
+        trellis.validate().unwrap();
+        assert_eq!(trellis.total_frames(), t);
+
+        let got = ctc_forced_align_gathered_chunks(&trellis, &token_ids, 50.0, Some(&pieces))
+            .unwrap();
+
+        assert_eq!(got.tokens.len(), want.tokens.len());
+        for (g, w) in got.tokens.iter().zip(&want.tokens) {
+            assert_eq!((g.start_frame, g.end_frame), (w.start_frame, w.end_frame));
+            assert_eq!(g.score.to_bits(), w.score.to_bits(), "token score bits");
+        }
+        assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
+        for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    /// A short block before the last one would shift every later frame and
+    /// return a plausible but wrong alignment, so it has to be an error.
+    #[test]
+    fn chunked_gathered_rejects_short_middle_block() {
+        let (t, v, l) = (40usize, 20usize, 5usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = (1..=l).map(|i| (i * 3) % v).collect();
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let log_probs: Vec<f32> = (0..t * v).map(|i| -((i % 89) as f32) * 0.11).collect();
+        let labels = build_expanded_labels(&token_ids, blank);
+        let s = labels.len();
+        let per = 10usize;
+        let mut flat = Vec::new();
+        for f in 0..t {
+            for &st in &labels {
+                flat.push(log_probs[f * v + st]);
+            }
+        }
+        let mut blocks: Vec<Vec<f32>> = flat.chunks(per * s).map(|c| c.to_vec()).collect();
+        blocks[0].truncate(per * s - s); // one row short, not the last block
+
+        let trellis = GatheredChunks { chunks: blocks, frames_per_chunk: per, num_states: s };
+        let err = trellis.validate().unwrap_err();
+        assert!(err.to_string().contains("block 0"), "{err}");
+        assert!(
+            ctc_forced_align_gathered_chunks(&trellis, &token_ids, 50.0, Some(&pieces)).is_err()
+        );
     }
 }

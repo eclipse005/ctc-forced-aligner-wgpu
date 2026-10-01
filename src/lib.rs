@@ -19,6 +19,7 @@
 //! the entry point.
 
 pub mod align_inference;
+pub mod alloc_stats;
 pub mod fix_timestamp;
 pub mod audio;
 pub mod config;

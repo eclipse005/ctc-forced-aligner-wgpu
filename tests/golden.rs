@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use rayon::prelude::*;
 use ctc_forced_aligner_wgpu::align_inference::{Aligner, BLANK_ID, FRAME_RATE};
 use ctc_forced_aligner_wgpu::audio::{load_audio, znorm};
 use ctc_forced_aligner_wgpu::viterbi::ctc_forced_align;
@@ -163,6 +164,57 @@ fn golden_stages_and_tokens() {
             expanded.len()
         );
         assert!(gmax < 1e-3, "gathered epilogue diverged: {gmax}");
+
+        // The aligner may instead park the lm head's logits and gather the
+        // trellis columns later (Trellis::Logits — the cheaper store once the
+        // transcript passes ~5 k characters).  That re-gather must be the
+        // *same f32s*, since it is the same kernel on the same logits, and the
+        // normaliser it records has to reproduce a single column exactly.
+        {
+            let logits = model
+                .forward_logits(
+                    &input,
+                    &mut ctc_forced_aligner_wgpu::wav2vec2::Scratch::default(),
+                )
+                .unwrap();
+            let s = expanded.len();
+            let cols: Vec<i32> = expanded.iter().map(|&x| x as i32).collect();
+            assert_eq!(logits.len(), t_frames * vocab, "logits shape");
+            let mut late = vec![0.0f32; t_frames * s];
+            let mut norm = vec![0.0f32; t_frames];
+            for (t, (src, dst)) in logits
+                .par_chunks_exact(vocab)
+                .zip(late.par_chunks_mut(s))
+                .enumerate()
+                .collect::<Vec<_>>()
+            {
+                norm[t] = model.gather_logits_row(src, &cols, dst);
+            }
+            let mut bits = 0usize;
+            let mut worst = 0.0f32;
+            for i in 0..late.len() {
+                if late[i].to_bits() != g[i].to_bits() {
+                    bits += 1;
+                    worst = worst.max((late[i] - g[i]).abs());
+                }
+            }
+            println!(
+                "lazy gather vs fused gather: {bits}/{} values differ in bits, max {worst:.3e}",
+                late.len()
+            );
+            assert_eq!(bits, 0, "lazy gather is not bit-identical to the fused one");
+
+            // and the recorded normaliser must reproduce any single column
+            for &(t, s_idx) in &[(0usize, 0usize), (t_frames / 2, s - 1), (t_frames - 1, 3)] {
+                let col = cols[s_idx] as usize;
+                let v = logits[t * vocab + col] + model.lm_bias()[col] - norm[t];
+                assert_eq!(
+                    v.to_bits(),
+                    g[t * s + s_idx].to_bits(),
+                    "normaliser path differs at frame {t} state {s_idx}"
+                );
+            }
+        }
     }
 
     let res = ctc_forced_align(

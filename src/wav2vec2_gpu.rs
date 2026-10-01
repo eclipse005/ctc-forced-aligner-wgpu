@@ -30,6 +30,20 @@ fn row_grid(rows: u32) -> (u32, u32) {
     }
 }
 
+/// Same fold for flat one-thread-per-element kernels: `x` takes the first
+/// 65535 workgroups, `y` the rest, and the shader rebuilds the element index
+/// from `(workgroup_id.x + workgroup_id.y * 65535) * WG +
+/// local_invocation_id.x`.  Needed wherever the element count scales with the
+/// transcript (the trellis gather is T*S) rather than with `t` alone.
+fn flat_grid(total: u32) -> (u32, u32) {
+    let groups = total.div_ceil(WG).max(1);
+    if groups <= WG_LIMIT {
+        (groups, 1)
+    } else {
+        (WG_LIMIT, groups.div_ceil(WG_LIMIT))
+    }
+}
+
 /// `[out, in_pg, taps]` → `[group, tap * in_pg + ci, oc]`, oc contiguous.
 fn transpose_pos(w: &[f32], out_c: usize, in_pg: usize, taps: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_c * in_pg * taps);
@@ -492,6 +506,13 @@ impl GpuModel {
         self.forward_impl(input, Some(expanded))
     }
 
+    /// Columns per row of [`GpuModel::forward`]'s log-prob block.  The aligner
+    /// compares it against the trellis width to decide which of the two
+    /// equivalent trellis representations is the smaller thing to hold.
+    pub fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+
     fn forward_impl(&self, input: &[f32], gather: Option<&[u32]>) -> Result<Vec<f32>> {
         let gpu = &self.gpu;
         let hidden = self.cfg.hidden_size;
@@ -517,9 +538,10 @@ impl GpuModel {
         }
         let (x_in, convs, staging, cached, mut act, ubuf) = {
             let mut guard = self.scratch.lock().unwrap();
+            let gathered = gather.is_some();
             let reuse = guard
                 .as_ref()
-                .map(|s| s.n_in == input.len() && s.t == t)
+                .map(|s| s.n_in == input.len() && s.t == t && s.gathered == gathered)
                 .unwrap_or(false);
             if !reuse {
                 let st = |label: &str, n: usize| gpu.storage(label, f32s(n));
@@ -533,6 +555,7 @@ impl GpuModel {
                 *guard = Some(Scratch {
                     n_in: input.len(),
                     t,
+                    gathered,
                     x_in: st("x_in", input.len()),
                     convs,
                     x: st("x", t * hidden),
@@ -544,9 +567,11 @@ impl GpuModel {
                     scores: st("scores", scores_n),
                     attn_o: st("attn_o", t * hidden),
                     logits: st("logits", t * vocab),
+                    // the gathered readback never touches the MAP_READ staging;
+                    // a 34 s chunk's full staging is 70 MB of dead VRAM there
                     staging: gpu.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("logits-staging"),
-                        size: f32s(t * vocab),
+                        size: if gathered { 16 } else { f32s(t * vocab) },
                         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     }),
@@ -934,11 +959,22 @@ impl GpuModel {
         // log-probs, so the readback below is (T, S) instead of (T, V)
         let gather_out = match gather {
             Some(expanded) => {
+                // S grows with the transcript, so T*S overflows a single
+                // dimension's 65535-workgroup limit on anything but a short
+                // transcript (15 m audio: T=1700, S=31130 -> 206595 groups).
+                // The gather kernel folds workgroups across x and y; see
+                // `flat_grid`.
+                anyhow::ensure!(
+                    expanded.len() <= 65536,
+                    "transcript too long for the labels buffer"
+                );
+                let total = u32::try_from(t * expanded.len()).context("gather size")?;
+                let (gx, gy) = flat_grid(total);
                 let buf = gpu.storage("gather-out", (t * expanded.len() * 4) as u64);
                 dispatch!(
                     P_GATHER,
-                    Cfg4 { a: (t * expanded.len()) as u32, b: expanded.len() as u32, c: vocab as u32, d: 0 },
-                    ((t * expanded.len()) as u32).div_ceil(WG), 1,
+                    Cfg4 { a: total, b: expanded.len() as u32, c: vocab as u32, d: 0 },
+                    gx, gy,
                     bind!(0, &act.logits), bind!(1, &self.labels), bind!(2, &buf),
                 );
                 Some(buf)
@@ -960,7 +996,6 @@ impl GpuModel {
         // under the Windows TDR window, and one wait keeps the GPU busy.
         gpu.upload(&x_in, bytemuck::cast_slice(input));
         if let Some(expanded) = gather {
-            anyhow::ensure!(expanded.len() <= 65536, "transcript too long for the labels buffer");
             gpu.upload(&self.labels, bytemuck::cast_slice(expanded));
         }
         if !uni.is_empty() {
@@ -1118,6 +1153,9 @@ const UNIFORM_ALIGN: u64 = 256;
 struct Scratch {
     n_in: usize,
     t: usize,
+    /// true when this scratch was built for the gathered readback (which
+    /// never touches the MAP_READ staging, so it is a stub there)
+    gathered: bool,
     x_in: wgpu::Buffer,
     convs: Vec<wgpu::Buffer>,
     x: wgpu::Buffer,

@@ -5,13 +5,17 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 
 use crate::audio::{load_audio, znorm, TARGET_SR};
 use crate::fix_timestamp::fix_timestamp;
 use crate::config::Wav2Vec2Config;
 use crate::gpu::DeviceSelector;
 use crate::spans::{build_segments, build_words};
-use crate::viterbi::{build_expanded_labels, ctc_forced_align_gathered, TokenAlignment};
+use crate::viterbi::{
+    build_expanded_labels, ctc_forced_align_emissions, ctc_forced_align_gathered_chunks,
+    Emissions, GatheredChunks, TokenAlignment,
+};
 use crate::views::skipped_chars;
 use crate::vocab::Vocab;
 use crate::wav2vec2::Model;
@@ -161,7 +165,7 @@ impl Aligner {
         // the same f32s the full path would read, so the DP is unchanged.
         let expanded = build_expanded_labels(&ids, BLANK_ID);
         let t_enc = std::time::Instant::now();
-        let gathered = self.log_probs_gathered(&waveform, window_sec, context_sec, &expanded)?;
+        let trellis = self.log_probs_trellis(&waveform, window_sec, context_sec, &expanded)?;
         let encode_s = t_enc.elapsed().as_secs_f64();
         crate::wav2vec2::prof::dump(&format!(
             "{} [{}]",
@@ -169,15 +173,21 @@ impl Aligner {
             self.backend_name()
         ));
         let t_al = std::time::Instant::now();
-        let states = expanded.len();
-        let mut res = ctc_forced_align_gathered(
-            &gathered,
-            gathered.len() / states,
-            states,
-            &ids,
-            FRAME_RATE,
-            Some(&pieces),
-        )?;
+        let mut res = match trellis {
+            Trellis::Gathered(gathered) => {
+                ctc_forced_align_gathered_chunks(&gathered, &ids, FRAME_RATE, Some(&pieces))?
+            }
+            Trellis::Logits(blocks) => {
+                let gather = match &self.tower {
+                    Tower::Cpu(m) => RowGather::Cpu(m),
+                    Tower::Gpu(_) => RowGather::Gpu,
+                };
+                let em = LogitsEmissions::new(&blocks, gather, &expanded);
+                let frames = em.total_frames();
+                em.validate()?;
+                ctc_forced_align_emissions(&em, frames, &ids, FRAME_RATE, Some(&pieces))?
+            }
+        };
         let align_s = t_al.elapsed().as_secs_f64();
 
         fix_timestamp(&mut res.tokens);
@@ -247,23 +257,81 @@ impl Aligner {
         })
     }
 
-    /// Trellis-label log-probabilities for a raw (un-normalised) waveform:
-    /// (frames, expanded.len()) row-major.
-    fn log_probs_gathered(
+    /// Trellis-label log-probabilities for a raw (un-normalised) waveform,
+    /// in whichever of the two equivalent storage forms is smaller.
+    fn log_probs_trellis(
         &self,
         waveform: &[f32],
         window_sec: Option<f64>,
         context_sec: f64,
         expanded: &[usize],
-    ) -> Result<Vec<f32>> {
+    ) -> Result<Trellis> {
+        // The DP reads one f32 per (frame, expanded state), so the trellis is
+        // T×(2·tokens+1).  The alternative is the lm head's T×vocab output,
+        // and whichever is narrower wins: a short transcript's trellis
+        // (3 m: 10500×6533) is well under the 10288-wide log-prob block, a
+        // long one (15 m: 43500×31130 = 5.4 GB) is 2.8× over it.  Both hold
+        // the identical f32 values, so this is a storage decision only.
+        // `CTC_TRELLIS=auto|gathered|logits` forces either side of it.
+        let vocab = self.vocab_size();
+        let use_logits = match std::env::var("CTC_TRELLIS").ok().as_deref() {
+            Some("gathered") => false,
+            Some("logits") => true,
+            _ => expanded.len() > vocab,
+        };
         let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
         match win {
             None => {
                 let mut input = waveform.to_vec();
                 znorm(&mut input);
-                self.forward_gathered(&input, expanded, &mut crate::wav2vec2::Scratch::default())
+                let mut scratch = crate::wav2vec2::Scratch::default();
+                Ok(if use_logits {
+                    let g = self.forward_logits(&input, &mut scratch)?;
+                    let rows = g.len() / vocab;
+                    Trellis::Logits(LogitsBlocks {
+                        blocks: vec![g],
+                        vocab,
+                        num_states: expanded.len(),
+                        row_offset: 0,
+                        frames_per_chunk: rows.max(1),
+                        spans: vec![(0usize, 0usize, rows)],
+                    })
+                } else {
+                    let g = self.forward_gathered(&input, expanded, &mut scratch)?;
+                    let frames = g.len() / expanded.len();
+                    Trellis::Gathered(GatheredChunks {
+                        chunks: vec![g],
+                        frames_per_chunk: frames.max(1),
+                        num_states: expanded.len(),
+                    })
+                })
             }
-            Some(win) => self.log_probs_chunked_gathered(waveform, win, context_sec, expanded),
+            Some(win) => self.log_probs_chunked(waveform, win, context_sec, expanded, use_logits),
+        }
+    }
+
+    fn vocab_size(&self) -> usize {
+        match &self.tower {
+            Tower::Cpu(m) => m.vocab_size(),
+            Tower::Gpu(g) => g.vocab_size(),
+        }
+    }
+
+    /// The lm head's (frames, vocab) block — what the trellis is gathered
+    /// from on demand in [`Trellis::Logits`].  The CPU tower's rows are
+    /// bias-free logits, the GPU tower's are already log-softmaxed; the
+    /// matching gather lives in [`RowGather`].
+    fn forward_logits(
+        &self,
+        input: &[f32],
+        scratch: &mut crate::wav2vec2::Scratch,
+    ) -> Result<Vec<f32>> {
+        match &self.tower {
+            // the gathered path reuses a scratch logits buffer; here the GEMM
+            // writes straight into the block that is kept
+            Tower::Cpu(m) => m.forward_logits(input, scratch),
+            // no gather kernel: (t, vocab) log-probs instead of (t, S) trellis
+            Tower::Gpu(g) => g.forward(input),
         }
     }
 
@@ -294,30 +362,62 @@ impl Aligner {
     /// the middle `win` frames of each chunk are kept, so the stream tiles
     /// the audio exactly.  Normalisation is per chunk, as the Python path
     /// does; the gather is applied per chunk before readback.
-    fn log_probs_chunked_gathered(
+    ///
+    /// The trellis comes back one window at a time, so its memory commits as
+    /// the file is encoded instead of doubling a single 5 GB allocation on the
+    /// way (see `GatheredChunks`), or — in `Logits` mode — never materialising
+    /// the wide trellis at all.
+    fn log_probs_chunked(
         &self,
         waveform: &[f32],
         win: usize,
         ctx_sec: f64,
         expanded: &[usize],
-    ) -> Result<Vec<f32>> {
+        use_logits: bool,
+    ) -> Result<Trellis> {
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
         let states = expanded.len();
+        let vocab = self.vocab_size();
         if waveform.len() < win {
             let mut input = waveform.to_vec();
             znorm(&mut input);
-            return self.forward_gathered(&input, expanded, &mut crate::wav2vec2::Scratch::default());
+            let mut scratch = crate::wav2vec2::Scratch::default();
+            if use_logits {
+                let g = self.forward_logits(&input, &mut scratch)?;
+                let rows = g.len() / vocab;
+                return Ok(Trellis::Logits(LogitsBlocks {
+                    blocks: vec![g],
+                    vocab,
+                    num_states: states,
+                    row_offset: 0,
+                    frames_per_chunk: rows.max(1),
+                    spans: vec![(0usize, 0usize, rows)],
+                }));
+            }
+            let g = self.forward_gathered(&input, expanded, &mut scratch)?;
+            let frames = g.len() / states;
+            return Ok(Trellis::Gathered(GatheredChunks {
+                chunks: vec![g],
+                frames_per_chunk: frames.max(1),
+                num_states: states,
+            }));
         }
         let ctx_frames = ctx / SUBSAMPLING;
         let win_frames = win / SUBSAMPLING;
         anyhow::ensure!(ctx_frames >= 64, "context must cover the ±64-frame positional conv");
+        anyhow::ensure!(win_frames > 0, "window must span at least one frame");
 
         let n = waveform.len();
         let extension = n.div_ceil(win) * win - n;
         // padded = [ctx zeros | waveform | ctx+extension zeros]
         let padded_len = n + 2 * ctx + extension;
+        let ext_frames = ((extension as f64 / TARGET_SR as f64 * FRAME_RATE).ceil()) as usize;
 
-        let mut chunks = Vec::new();
+        // rows kept per window: the middle win_frames, clamped for a short one
+        let kept_of = |rows: usize| (ctx_frames + win_frames).min(rows) - ctx_frames.min(rows);
+        let mut blocks: Vec<Vec<f32>> = Vec::new();
+        let mut scratch = crate::wav2vec2::Scratch::default();
+        // one scratch for the whole file: no per-chunk buffer churn
         let mut start = 0usize; // chunk start inside `padded`
         while start + win + 2 * ctx <= padded_len {
             // chunk = [ctx zeros | win real samples | ctx zeros], gathered from
@@ -331,27 +431,413 @@ impl Aligner {
                 }
             }
             znorm(&mut chunk);
-            chunks.push(chunk);
+
+            if use_logits {
+                // keep the whole lm-head block: no per-chunk copy, and the
+                // DP gathers this window's columns when it gets there
+                let g = self.forward_logits(&chunk, &mut scratch)?;
+                let rows = g.len() / vocab;
+                blocks.push(g);
+                if crate::alloc_stats::enabled() {
+                    let (live, peak) = crate::alloc_stats::stats();
+                    eprintln!(
+                        "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  logits {} MB, {} kept rows",
+                        blocks.len() - 1,
+                        blocks[blocks.len() - 1].capacity() * 4 >> 20,
+                        kept_of(rows),
+                    );
+                }
+            } else {
+                let g = self.forward_gathered(&chunk, expanded, &mut scratch)?;
+                let rows = g.len() / states;
+                let keep_lo = (ctx_frames * states).min(g.len());
+                let keep_hi = ((ctx_frames + win_frames).min(rows)) * states;
+                let mut block = Vec::with_capacity(keep_hi - keep_lo);
+                block.extend_from_slice(&g[keep_lo..keep_hi]);
+                blocks.push(block);
+                if crate::alloc_stats::enabled() {
+                    let (live, peak) = crate::alloc_stats::stats();
+                    let c = blocks.len() - 1;
+                    eprintln!(
+                        "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  block {} MB",
+                        c,
+                        blocks[c].capacity() * 4 >> 20
+                    );
+                }
+            }
             start += win;
         }
 
-        let mut scratch = crate::wav2vec2::Scratch::default();
-        // one scratch for the whole file: no per-chunk buffer churn
-        let mut out: Vec<f32> = Vec::new();
-        for chunk in &chunks {
-            let g = self.forward_gathered(chunk, expanded, &mut scratch)?;
-            let rows = g.len() / states;
-            let keep_lo = (ctx_frames * states).min(g.len());
-            let keep_hi = ((ctx_frames + win_frames).min(rows)) * states;
-            out.extend_from_slice(&g[keep_lo..keep_hi]);
+        // the tail zero-padding contributed ext_frames of frames: drop them
+        // from the end of the kept stream, which is the last window's last
+        // rows.  (The gathered path truncates the concatenated blocks, which
+        // lands on the same rows; the logits path cannot truncate the block —
+        // the padding sits *before* its end, inside the kept range — so it
+        // shortens the last span instead.)
+        if ext_frames > 0 {
+            if use_logits {
+                // nothing to trim: the block keeps its context rows
+            } else if let Some(last) = blocks.last_mut() {
+                let keep = last.len().saturating_sub(ext_frames * states);
+                last.truncate(keep);
+            }
         }
+        if use_logits {
+            let mut spans: Vec<(usize, usize, usize)> = blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i, ctx_frames.min(b.len() / vocab), kept_of(b.len() / vocab)))
+                .collect();
+            if let Some(last) = spans.last_mut() {
+                last.2 = last.2.saturating_sub(ext_frames);
+            }
+            Ok(Trellis::Logits(LogitsBlocks {
+                frames_per_chunk: spans.first().map_or(1, |s| s.2.max(1)),
+                row_offset: spans.first().map_or(0, |s| s.1),
+                blocks,
+                vocab,
+                num_states: states,
+                spans,
+            }))
+        } else {
+            Ok(Trellis::Gathered(GatheredChunks {
+                chunks: blocks,
+                frames_per_chunk: win_frames,
+                num_states: states,
+            }))
+        }
+    }
+}
 
-        // drop the frames the tail padding contributed
-        let ext_frames = ((extension as f64 / TARGET_SR as f64 * FRAME_RATE).ceil()) as usize;
-        if ext_frames > 0 && out.len() >= ext_frames * states {
-            let keep = out.len() - ext_frames * states;
-            out.truncate(keep);
+/// How the aligner holds one file's trellis between the forward pass and the
+/// Viterbi.  Both variants hold the same f32 values, so the alignment does
+/// not depend on which one a run picks.
+pub enum Trellis {
+    /// One (kept_frames × S) block per window — used when the trellis is
+    /// narrower than the vocabulary (a short transcript).
+    Gathered(GatheredChunks),
+    /// The lm head's (rows × vocab) block per window, narrower than the
+    /// trellis once the transcript passes ~5 k characters (15 m: 2.2 GB of
+    /// logits against a 5.4 GB trellis).  The DP gathers each window's
+    /// columns on demand, so only one window's trellis is ever resident.
+    Logits(LogitsBlocks),
+}
+
+/// Per-window lm-head blocks plus the row window the DP is allowed to read:
+/// the same kept frames the gathered path keeps, addressed inside the wider
+/// block.
+pub struct LogitsBlocks {
+    blocks: Vec<Vec<f32>>,
+    /// columns per row (the vocabulary)
+    vocab: usize,
+    /// columns the DP reads (S = 2·tokens+1)
+    num_states: usize,
+    /// kept frames per window; the last window may be shorter
+    frames_per_chunk: usize,
+    /// first kept row inside every block
+    row_offset: usize,
+    /// per block: (index, first kept row, kept frames) — the invariant the
+    /// `t / frames_per_chunk` addressing relies on
+    spans: Vec<(usize, usize, usize)>,
+}
+
+impl LogitsBlocks {
+    fn total_frames(&self) -> usize {
+        self.spans.iter().map(|s| s.2).sum()
+    }
+
+    /// First frame of window `b` in the DP's frame numbering.
+    fn frame_base(&self, b: usize) -> usize {
+        b * self.frames_per_chunk
+    }
+
+    /// (window, first kept row, kept frames) holding frame `t`.
+    fn span_of(&self, t: usize) -> (usize, usize, usize) {
+        let b = t / self.frames_per_chunk;
+        let s = self.spans[b];
+        (b, s.1, s.2)
+    }
+
+    /// Every window but the last must contribute exactly `frames_per_chunk`
+    /// frames from the same row offset, or the DP's arithmetic addressing
+    /// would read the wrong row instead of failing.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.vocab > 0 && self.num_states > 0, "empty trellis");
+        anyhow::ensure!(self.frames_per_chunk > 0, "frames_per_chunk must be positive");
+        let last = self.spans.len().saturating_sub(1);
+        for (i, &(b, row, kept)) in self.spans.iter().enumerate() {
+            anyhow::ensure!(b == i, "block span {i} out of order");
+            let rows = self.blocks.get(i).map_or(0, |x| x.len() / self.vocab);
+            anyhow::ensure!(
+                self.blocks[i].len() % self.vocab == 0,
+                "block {i} is not a whole number of {0}-column rows",
+                self.vocab
+            );
+            anyhow::ensure!(row + kept <= rows, "block {i} keeps {kept} of {rows} rows");
+            if i != last {
+                anyhow::ensure!(
+                    kept == self.frames_per_chunk && row == self.row_offset,
+                    "block {i} keeps {kept}@{row}, expected {}@{} (only the last may be short)",
+                    self.frames_per_chunk,
+                    self.row_offset
+                );
+            }
         }
-        Ok(out)
+        Ok(())
+    }
+}
+
+/// Gathers one row of an lm-head block into the trellis columns, per tower:
+/// the CPU's rows are bias-free logits, the GPU's are already log-softmaxed
+/// (its gather kernel is a plain column copy, so this reproduces it exactly).
+enum RowGather<'a> {
+    Cpu(&'a Model),
+    Gpu,
+}
+
+impl RowGather<'_> {
+    /// Fill `dst` with the trellis columns of `src`, returning the row's
+    /// log-softmax normaliser (`0` on the GPU tower, whose rows are already
+    /// log-probs).
+    fn row(&self, src: &[f32], cols: &[i32], dst: &mut [f32]) -> f32 {
+        match self {
+            RowGather::Cpu(m) => m.gather_logits_row(src, cols, dst),
+            RowGather::Gpu => {
+                for (j, &c) in cols.iter().enumerate() {
+                    dst[j] = src[c as usize];
+                }
+                0.0
+            }
+        }
+    }
+
+    /// One trellis column of `src`, reusing a normaliser a previous pass
+    /// recorded.  Bit-identical to the `row` call that produced it: same
+    /// operands, same `x + bias - c` arithmetic.
+    fn value(&self, src: &[f32], col: usize, c: f32) -> f32 {
+        match self {
+            RowGather::Cpu(m) => src[col] + m.lm_bias()[col] - c,
+            RowGather::Gpu => src[col],
+        }
+    }
+}
+
+/// [`Emissions`] over [`Trellis::Logits`]: the DP walks forward, so each
+/// window's columns are gathered the first time a frame inside it is reached
+/// and dropped when the walk moves past it.  Peak cost is one window's
+/// trellis (t×S) on top of the stored logits, not the whole file's.
+struct LogitsEmissions<'a> {
+    blocks: &'a LogitsBlocks,
+    gather: RowGather<'a>,
+    /// the expanded labels, as the gather kernel wants them
+    cols: Vec<i32>,
+    /// (block index, its trellis block), the one window currently gathered
+    cache: std::cell::RefCell<Option<(usize, Vec<f32>)>>,
+    /// per frame, the log-softmax normaliser recorded while the DP gathered
+    /// its window (0 on the GPU tower, whose blocks are already log-probs).
+    /// This is what lets the post-traceback pass read the path's column
+    /// straight out of the stored logits instead of gathering every window a
+    /// second time — 46 k reads instead of 5.8 GB of writes.
+    norm: std::cell::RefCell<Vec<f32>>,
+}
+
+impl<'a> LogitsEmissions<'a> {
+    fn new(blocks: &'a LogitsBlocks, gather: RowGather<'a>, expanded: &[usize]) -> Self {
+        let frames = blocks.total_frames();
+        LogitsEmissions {
+            blocks,
+            gather,
+            cols: expanded.iter().map(|&x| x as i32).collect(),
+            cache: std::cell::RefCell::new(None),
+            norm: std::cell::RefCell::new(vec![0.0; frames]),
+        }
+    }
+
+    fn total_frames(&self) -> usize {
+        self.blocks.total_frames()
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.blocks.num_states == self.cols.len(),
+            "trellis has {} states but {} columns",
+            self.blocks.num_states,
+            self.cols.len()
+        );
+        self.blocks.validate()
+    }
+
+    /// One window's trellis block, gathered on first use and then replaced as
+    /// the DP walks into the next window.  The buffer is reused across windows
+    /// (only the last one is shorter), so the 187 MB is faulted in once.
+    fn window(&self, b: usize) -> std::cell::RefMut<'_, [f32]> {
+        use std::cell::RefMut;
+        let mut cache = self.cache.borrow_mut();
+        let stale = cache.as_ref().map(|(i, _)| *i != b).unwrap_or(true);
+        if stale {
+            let s = self.blocks.num_states;
+            let (_, row_offset, kept) = self.blocks.spans[b];
+            let vocab = self.blocks.vocab;
+            // slice to the kept rows first: same shape as the forward's fused
+            // gather, and no `skip` adaptor in the parallel iterator
+            let src = &self.blocks.blocks[b][row_offset * vocab..][..kept * vocab];
+            let need = kept * s;
+            let out = match cache.as_mut() {
+                Some((_, buf)) if buf.len() == need => buf,
+                _ => {
+                    cache.replace((b, vec![0.0f32; need]));
+                    &mut cache.as_mut().expect("just filled").1
+                }
+            };
+            let gather = &self.gather;
+            let cols = &self.cols;
+            let t0 = b * self.blocks.frames_per_chunk;
+            // record each row's normaliser so the post-traceback pass never
+            // has to gather this window again
+            let mut norm = self.norm.borrow_mut();
+            let norm_row = &mut norm[t0..t0 + kept];
+            src.par_chunks_exact(vocab)
+                .zip(out.par_chunks_mut(s))
+                .zip(norm_row.par_iter_mut())
+                .for_each(|((row, dst), c)| *c = gather.row(row, cols, dst));
+            drop(norm);
+            cache.as_mut().expect("just filled").0 = b;
+        }
+        RefMut::map(cache, |c: &mut Option<(usize, Vec<f32>)>| {
+            c.as_mut().expect("just filled").1.as_mut_slice()
+        })
+    }
+}
+
+impl Emissions for LogitsEmissions<'_> {
+    fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
+        let s = self.blocks.num_states;
+        let fpc = self.blocks.frames_per_chunk;
+        let block = self.window(t / fpc);
+        let row = &block[(t % fpc) * s..][..s];
+        for (e, &v) in emit.iter_mut().zip(row) {
+            *e = v as f64;
+        }
+    }
+
+    /// One column of `t`'s row, straight from the stored logits.  The window
+    /// holding `t` has to have been gathered at least once for its
+    /// normaliser to exist — the DP reads frame 0's two states *before* its
+    /// first `fill_emit`, so this may be what triggers the gather.  After the
+    /// DP, every window is normalised and this is a single indexed read.
+    fn score(&self, t: usize, st: usize) -> f32 {
+        let b = self.blocks;
+        let (block, row, kept) = b.span_of(t);
+        let _ = self.window(block); // records this row's normaliser
+        let col = self.cols[st] as usize;
+        let r = t - b.frame_base(block);
+        debug_assert!(r < kept);
+        let src = &b.blocks[block][(row + r) * b.vocab..][..b.vocab];
+        self.gather.value(src, col, self.norm.borrow()[t])
+    }
+
+    /// The path's per-frame scores, window by window, without re-gathering:
+    /// `score_path` is only reached after the DP has normalised every row.
+    fn score_path(&self, states: &[i32], out: &mut [f64]) {
+        let b = self.blocks;
+        let norm = self.norm.borrow();
+        for (bi, &(_, row, kept)) in b.spans.iter().enumerate() {
+            let base = bi * b.frames_per_chunk;
+            let src = &b.blocks[bi][row * b.vocab..][..kept * b.vocab];
+            for r in 0..kept {
+                let t = base + r;
+                let col = self.cols[states[t] as usize] as usize;
+                out[t] = self.gather.value(&src[r * b.vocab..][..b.vocab], col, norm[t]) as f64;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two trellis representations must be interchangeable: the lazy
+    /// logits gather reads a window's columns out of the wider lm-head block,
+    /// and any mistake in the `t / frames_per_chunk` + row-offset addressing
+    /// — or in how the last, short window is trimmed — would shift timestamps
+    /// instead of failing.  `RowGather::Gpu` is the pure column copy, so this
+    /// needs no model.
+    #[test]
+    fn lazy_logits_trellis_matches_gathered_blocks() {
+        let (vocab, l) = (23usize, 5usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = (1..=l).map(|i| (i * 3) % vocab).collect();
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let expanded = crate::viterbi::build_expanded_labels(&token_ids, blank);
+        let s = expanded.len();
+        assert_eq!(s, 2 * l + 1);
+
+        // three windows of `per` kept rows, the last short; context rows in
+        // front of each block
+        let (row_offset, kept_last, per) = (5usize, 7usize, 13usize);
+        let rows_per = row_offset + per;
+        let total_kept = 2 * per + kept_last;
+        let total_rows = 3 * rows_per;
+
+        // "log-prob" block: the gather is a column copy, values are arbitrary
+        let block_all: Vec<f32> = (0..total_rows * vocab)
+            .map(|i| -((i % 37) as f32) * 0.07 - 0.3)
+            .collect();
+
+        let mut blocks = Vec::new();
+        let mut spans = Vec::new();
+        for i in 0..3 {
+            let kept = if i == 2 { kept_last } else { per };
+            blocks.push(
+                block_all[i * rows_per * vocab..(i * rows_per + rows_per) * vocab].to_vec(),
+            );
+            spans.push((i, row_offset, kept));
+        }
+        let lb = LogitsBlocks {
+            blocks,
+            vocab,
+            num_states: s,
+            frames_per_chunk: per,
+            row_offset,
+            spans,
+        };
+
+        // the same values, gathered: what the block-per-window path holds
+        let mut flat = Vec::with_capacity(total_kept * s);
+        for (b, &(_, row, kept)) in lb.spans.iter().enumerate() {
+            for r in 0..kept {
+                let src = &lb.blocks[b][(row + r) * vocab..][..vocab];
+                for &c in &expanded {
+                    flat.push(src[c]);
+                }
+            }
+        }
+        let gc = GatheredChunks {
+            chunks: flat.chunks(per * s).map(|c| c.to_vec()).collect(),
+            frames_per_chunk: per,
+            num_states: s,
+        };
+        gc.validate().unwrap();
+
+        let em = LogitsEmissions::new(&lb, RowGather::Gpu, &expanded);
+        em.validate().unwrap();
+        assert_eq!(em.total_frames(), total_kept);
+        assert_eq!(gc.total_frames(), total_kept);
+
+        let want = ctc_forced_align_gathered_chunks(&gc, &token_ids, 50.0, Some(&pieces)).unwrap();
+        let got = ctc_forced_align_emissions(&em, total_kept, &token_ids, 50.0, Some(&pieces))
+            .unwrap();
+
+        assert_eq!(got.tokens.len(), want.tokens.len());
+        for (g, w) in got.tokens.iter().zip(&want.tokens) {
+            assert_eq!((g.start_frame, g.end_frame), (w.start_frame, w.end_frame));
+            assert_eq!(g.score.to_bits(), w.score.to_bits(), "token score bits");
+        }
+        assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
+        assert_eq!(got.frame_scores.len(), want.frame_scores.len());
+        for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
     }
 }

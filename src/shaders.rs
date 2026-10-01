@@ -380,8 +380,13 @@ struct Cfg { total: u32, s: u32, v: u32, _p0: u32 }
 @group(0) @binding(3) var<uniform> cfg: Cfg;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    // the host folds workgroups across x and y (one dimension caps at 65535);
+    // see `flat_grid` in wav2vec2_gpu.rs
+    let i = (wg.x + wg.y * 65535u) * 256u + lid.x;
     if (i < cfg.total) {
         let t = i / cfg.s;
         out[i] = lp[t * cfg.v + labels[i % cfg.s]];

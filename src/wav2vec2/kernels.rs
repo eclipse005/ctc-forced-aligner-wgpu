@@ -159,11 +159,24 @@ pub(super) fn log_softmax_row(row: &mut [f32]) {
 /// full-matrix path to the GEMM's destination-add rounding.
 #[inline]
 pub(super) fn log_softmax_gather_row(x: &[f32], bias: &[f32], cols: &[i32], out: &mut [f32]) {
+    log_softmax_gather_row_c(x, bias, cols, out);
+}
+
+/// As [`log_softmax_gather_row`], returning the row's log-softmax normaliser
+/// `c`, so a later pass can read a single column as `x[st] + bias[st] - c`
+/// without sweeping the row again.
+#[inline]
+pub(super) fn log_softmax_gather_row_c(
+    x: &[f32],
+    bias: &[f32],
+    cols: &[i32],
+    out: &mut [f32],
+) -> f32 {
     debug_assert_eq!(x.len(), bias.len());
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2::have_avx2_fma() {
-        unsafe { crate::simd::avx2::log_softmax_gather_inplace(x, bias, cols, out) };
-        return;
+        // SAFETY: the runtime avx2+fma check.
+        return unsafe { crate::simd::avx2::log_softmax_gather_inplace(x, bias, cols, out) };
     }
     let mut max = f32::NEG_INFINITY;
     for (v, b) in x.iter().zip(bias) {
@@ -178,6 +191,7 @@ pub(super) fn log_softmax_gather_row(x: &[f32], bias: &[f32], cols: &[i32], out:
         let st = st as usize;
         *o = x[st] + bias[st] - c;
     }
+    c
 }
 
 // ---------------------------------------------------------------------------

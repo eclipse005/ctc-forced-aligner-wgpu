@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use super::kernels::{
     add3_bias_par, add_bias_par, add_par, conv_ln_gelu, gelu, gelu_bias, log_softmax_gather_row,
-    log_softmax_row, scale_attn_rows_par, softmax_row_sum, SendPtr,
+    log_softmax_gather_row_c, log_softmax_row, scale_attn_rows_par, softmax_row_sum, SendPtr,
 };
 use super::prof::{prof, *};
 use super::{ConvLayer, Model, StageSet, Stages};
@@ -76,6 +76,21 @@ fn q_block_default(t: usize) -> usize {
     want.min(t).max(1)
 }
 
+/// What the lm-head epilogue emits.  The DP only ever reads the trellis
+/// columns, so [`Tail::Gathered`] is the normal choice — but the trellis is
+/// `t × (2·tokens+1)` wide, i.e. *wider than the vocabulary* once a transcript
+/// runs past ~5 k characters.  Then [`Tail::Logits`] parks the smaller
+/// `(t, vocab)` block instead and the aligner gathers the columns lazily.
+#[derive(Clone, Copy)]
+enum Tail<'a> {
+    /// `(t, vocab)` log-softmax: the reference path.
+    Full,
+    /// `(t, S)` trellis log-probs for the expanded labels.
+    Gathered(&'a [usize]),
+    /// `(t, vocab)` lm-head output, neither biased nor log-softmaxed.
+    Logits,
+}
+
 impl Model {
     /// Full forward on one z-normalised waveform. Returns log_probs (T, V).
     pub fn forward(&self, input: &[f32], stages: &StageSet) -> Result<(Vec<f32>, Stages)> {
@@ -93,7 +108,7 @@ impl Model {
         stages: &StageSet,
         scratch: &mut Scratch,
     ) -> Result<(Vec<f32>, Stages)> {
-        self.forward_inner(input, stages, scratch, None)
+        self.forward_inner(input, stages, scratch, Tail::Full)
     }
 
     /// Same forward, but the lm-head epilogue emits only the gathered trellis
@@ -108,7 +123,39 @@ impl Model {
         scratch: &mut Scratch,
         expanded: &[usize],
     ) -> Result<(Vec<f32>, Stages)> {
-        self.forward_inner(input, stages, scratch, Some(expanded))
+        self.forward_inner(input, stages, scratch, Tail::Gathered(expanded))
+    }
+
+    /// The lm head's raw output, `(t, vocab)` — no log-softmax, and on this
+    /// tower no bias either (`Model::gather_logits_row` adds it back).
+    ///
+    /// The trellis is `t × (2·tokens+1)` wide, so for a long transcript it is
+    /// *larger* than the vocabulary: parking the logits and gathering the
+    /// trellis columns later is then the cheaper way to hold the same scores
+    /// (see `Aligner::log_probs_trellis`).  The GEMM writes straight into the
+    /// returned buffer, so this replaces the per-chunk 186 MB
+    /// `extend_from_slice` the gathered path pays instead.
+    pub fn forward_logits(&self, input: &[f32], scratch: &mut Scratch) -> Result<Vec<f32>> {
+        Ok(self.forward_inner(input, &StageSet::default(), scratch, Tail::Logits)?.0)
+    }
+
+    /// Gather the trellis columns out of one row of [`Model::forward_logits`]
+    /// (bias-free logits): identical to what `forward_gathered_with` writes.
+    /// Returns the row's log-softmax normaliser, so the aligner can read a
+    /// single column of the same row later without re-sweeping it.
+    pub fn gather_logits_row(&self, row: &[f32], cols: &[i32], out: &mut [f32]) -> f32 {
+        log_softmax_gather_row_c(row, &self.lm_head.b, cols, out)
+    }
+
+    /// The vocabulary width `forward_logits` writes.
+    pub fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+
+    /// The lm head's bias, which [`Model::gather_logits_row`] folds into the
+    /// row it normalises.
+    pub fn lm_bias(&self) -> &[f32] {
+        &self.lm_head.b
     }
 
     fn forward_inner(
@@ -116,7 +163,7 @@ impl Model {
         input: &[f32],
         stages: &StageSet,
         scratch: &mut Scratch,
-        gather: Option<&[usize]>,
+        tail: Tail<'_>,
     ) -> Result<(Vec<f32>, Stages)> {
         let mut out_stages = Stages::default();
 
@@ -186,7 +233,12 @@ impl Model {
         fit(&mut scratch.conv_p, even_max);
         fit(&mut scratch.conv_q, odd_max);
         fit(&mut scratch.conv_a, band_max);
-        fit(&mut scratch.logits, t * self.cfg.vocab_size);
+        // only the gathered epilogue reuses the scratch logits buffer; the
+        // `Logits` tail allocates its own block and would otherwise hold 70 MB
+        // of scratch for nothing
+        if matches!(tail, Tail::Gathered(_)) {
+            fit(&mut scratch.logits, t * self.cfg.vocab_size);
+        }
 
         let Scratch {
             ln,
@@ -449,8 +501,8 @@ impl Model {
         // max / sum-exp and emits only the trellis columns.
         let vocab = self.cfg.vocab_size;
         let log_probs: Vec<f32>;
-        match gather {
-            None => {
+        match tail {
+            Tail::Full => {
                 let mut lp;
                 prof!(LM_HEAD, {
                     lp = self.lm_head.apply(ln_buf, t);
@@ -460,7 +512,7 @@ impl Model {
                 });
                 log_probs = lp;
             }
-            Some(expanded) => {
+            Tail::Gathered(expanded) => {
                 let logits_buf = &mut logits[..t * vocab];
                 prof!(LM_HEAD, {
                     self.lm_head.apply_into_nobias(ln_buf, t, logits_buf);
@@ -474,6 +526,16 @@ impl Model {
                         .par_chunks_exact(vocab)
                         .zip(out.par_chunks_mut(s))
                         .for_each(|(x, o)| log_softmax_gather_row(x, bias, &cols, o));
+                });
+                log_probs = out;
+            }
+            Tail::Logits => {
+                // The GEMM writes straight into the block the caller keeps:
+                // no scratch copy, and the aligner gathers the trellis columns
+                // out of it later (`gather_logits_row`).
+                let mut out = vec![0.0f32; t * vocab];
+                prof!(LM_HEAD, {
+                    self.lm_head.apply_into_nobias(ln_buf, t, &mut out);
                 });
                 log_probs = out;
             }

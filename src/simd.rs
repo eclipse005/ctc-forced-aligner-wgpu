@@ -227,11 +227,14 @@ pub mod avx2 {
     }
 
     /// Fused lm-head epilogue for one row:
-    /// `out[j] = log_softmax(x + bias)[cols[j]]`.
+    /// `out[j] = log_softmax(x + bias)[cols[j]]`, returning the row's
+    /// log-softmax normaliser `c = max + ln(sum(exp(x + bias - max)))`.
     ///
     /// Same lane structure as [`log_softmax_inplace`]: serial max over the
     /// biased row, 8-lane exp sums, `out = (x+b) - (max + ln(sum))` on the
-    /// gathered columns only.
+    /// gathered columns only.  The caller gets `c` back so a later pass that
+    /// needs one column of the same row (the aligner's post-traceback pass)
+    /// can reuse it instead of re-sweeping the row.
     ///
     /// # Safety
     /// `x` and `bias` must have the same length; every index in `cols` must be
@@ -242,7 +245,7 @@ pub mod avx2 {
         bias: &[f32],
         cols: &[i32],
         out: &mut [f32],
-    ) {
+    ) -> f32 {
         let mut max = f32::NEG_INFINITY;
         for (v, b) in x.iter().zip(bias) {
             max = max.max(*v + *b);
@@ -280,6 +283,7 @@ pub mod avx2 {
             let st = cols[j] as usize;
             out[j] = x[st] + bias[st] - c;
         }
+        c
     }
 
     pub fn have_avx2_fma() -> bool {
