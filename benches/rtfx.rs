@@ -34,6 +34,10 @@ fn bench_forward(c: &mut Criterion) {
     let stages = StageSet::default();
 
     let mut group = c.benchmark_group("cpu_forward");
+    // one forward is ~2 s; criterion's defaults (100 samples / 5 s budget)
+    // would take ~7 min per bench to fall back to 100 forced iterations
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(50));
     group.throughput(Throughput::Elements((input.len() / 320) as u64));
 
     // steady state: one Scratch reused across iterations (the aligner's path)
