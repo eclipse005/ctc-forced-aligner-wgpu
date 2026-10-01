@@ -2,6 +2,9 @@
 //! every forward stage is compared numerically, and the final token
 //! timestamps must match `alignment_eager.json` / `alignment_sdpa.json`
 //! exactly.
+//!
+//! Directories: `$CTC_GOLDEN_DIR` (default `<repo>/golden`) and
+//! `$CTC_MODEL_DIR` (default the local omniASR checkpoint path).
 
 use std::path::PathBuf;
 
@@ -10,8 +13,17 @@ use ctc_forced_aligner_wgpu::audio::{load_audio, znorm};
 use ctc_forced_aligner_wgpu::viterbi::ctc_forced_align;
 use ctc_forced_aligner_wgpu::wav2vec2::StageSet;
 
-const GOLDEN: &str = r"D:\ctc-forced-aligner-wgpu\golden";
-const MODEL: &str = r"D:\omnilingual-asr\models\omniASR-CTC-300M-v2-hf";
+fn golden_dir() -> PathBuf {
+    std::env::var_os("CTC_GOLDEN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden"))
+}
+
+fn model_dir() -> PathBuf {
+    std::env::var_os("CTC_MODEL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"D:\omnilingual-asr\models\omniASR-CTC-300M-v2-hf"))
+}
 
 fn load_f32(path: &std::path::Path) -> Vec<f32> {
     let bytes = std::fs::read(path).expect("read golden");
@@ -35,7 +47,7 @@ fn diff(a: &[f32], b: &[f32]) -> (f64, f64) {
 
 #[test]
 fn golden_stages_and_tokens() {
-    let root = PathBuf::from(GOLDEN);
+    let root = golden_dir();
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).unwrap())
             .unwrap();
@@ -43,7 +55,7 @@ fn golden_stages_and_tokens() {
     let wav_path = PathBuf::from(manifest["wav"].as_str().unwrap());
     let text = manifest["ref"].as_str().unwrap();
 
-    let aligner = Aligner::load(std::path::Path::new(MODEL)).unwrap();
+    let aligner = Aligner::load(&model_dir()).unwrap();
     let model = match &aligner.tower {
         ctc_forced_aligner_wgpu::align_inference::Tower::Cpu(m) => m,
         _ => unreachable!(),
@@ -211,7 +223,7 @@ fn golden_stages_and_tokens() {
 /// adapter exists.
 #[test]
 fn gpu_golden_tokens() {
-    let root = PathBuf::from(GOLDEN);
+    let root = golden_dir();
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("manifest.json")).unwrap())
             .unwrap();
@@ -219,8 +231,7 @@ fn gpu_golden_tokens() {
     let text = manifest["ref"].as_str().unwrap();
 
     let selector = ctc_forced_aligner_wgpu::DeviceSelector::parse("auto").unwrap();
-    let aligner = match ctc_forced_aligner_wgpu::Aligner::load_on(std::path::Path::new(MODEL), selector)
-    {
+    let aligner = match ctc_forced_aligner_wgpu::Aligner::load_on(&model_dir(), selector) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("no usable GPU adapter, skipping: {e:#}");
