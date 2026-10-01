@@ -1,0 +1,369 @@
+//! The aligner's forward: (audio, text) → character / word / segment
+//! timestamps.  Orchestration port of `omni_align/aligner.py` +
+//! `backend.log_probs_chunked`, producing the same JSON schema.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+use crate::audio::{load_audio, znorm, TARGET_SR};
+use crate::fix_timestamp::fix_timestamp;
+use crate::config::Wav2Vec2Config;
+use crate::gpu::DeviceSelector;
+use crate::spans::{build_segments, build_words};
+use crate::viterbi::{ctc_forced_align, TokenAlignment};
+use crate::views::skipped_chars;
+use crate::vocab::Vocab;
+use crate::wav2vec2::Model;
+use crate::wav2vec2_gpu::GpuModel;
+
+/// The model, on either backend.  Both towers are token-identical to the
+/// Python reference (see tests/golden.rs).
+pub enum Tower {
+    Cpu(Model),
+    Gpu(GpuModel),
+    /// Two different GPUs. Chunks are paired across them.
+    Dual(GpuModel, GpuModel),
+}
+
+pub const FRAME_RATE: f64 = 50.0;
+pub const BLANK_ID: usize = 0;
+const SUBSAMPLING: usize = 320; // samples per frame
+
+pub struct Aligner {
+    pub tower: Tower,
+    pub vocab: Vocab,
+    pub model_dir: PathBuf,
+}
+
+/// One output JSON, mirroring `omni_align.cli.to_json_obj` field for field.
+#[derive(serde::Serialize)]
+pub struct AlignOutput {
+    pub audio: String,
+    pub text: String,
+    pub duration: f64,
+    pub frames: usize,
+    pub frame_rate: f64,
+    pub mean_frame_score: f64,
+    pub log_prob: f64,
+    /// Transcript characters the vocabulary dropped, in order.
+    pub skipped: Vec<String>,
+    pub chars: Vec<serde_json::Value>,
+    pub words: Vec<serde_json::Value>,
+    pub segments: Vec<serde_json::Value>,
+    /// Encoder time. Omitted from JSON so the schema stays the Python one.
+    #[serde(skip)]
+    pub encode_s: f64,
+    /// Viterbi time. Omitted from JSON for the same reason.
+    #[serde(skip)]
+    pub align_s: f64,
+    /// Tight character alignments. Not serialized; `chars` is the JSON form.
+    #[serde(skip)]
+    pub tokens: Vec<TokenAlignment>,
+    /// Winning-label log-prob per frame, including blanks. Used by spans.
+    #[serde(skip)]
+    pub frame_scores: Vec<f64>,
+}
+
+fn r4(x: f64) -> f64 {
+    (x * 10000.0).round() / 10000.0
+}
+
+impl Aligner {
+    /// CPU backend (the reference twin).
+    pub fn load(model_dir: &Path) -> Result<Self> {
+        Self::load_on(model_dir, DeviceSelector::Cpu)
+    }
+
+    /// Explicit backend: `Cpu` or any wgpu selector (`auto`, `vulkan:0`, ...).
+    pub fn load_on(model_dir: &Path, selector: DeviceSelector) -> Result<Self> {
+        let tower = match selector {
+            DeviceSelector::Cpu => Tower::Cpu(Model::load(model_dir)?),
+            _ => Tower::Gpu(GpuModel::load(model_dir, selector)?),
+        };
+        let vocab = Vocab::load(model_dir)?;
+        Ok(Self { tower, vocab, model_dir: model_dir.to_path_buf() })
+    }
+
+    /// Vulkan device 0 and DX12 device 0, when they are different cards.
+    /// The same card exposed twice stays on the Vulkan one.
+    pub fn load_dual(model_dir: &Path) -> Result<Self> {
+        let primary = GpuModel::load(model_dir, DeviceSelector::parse("vulkan:0")?)?;
+        let secondary = match GpuModel::load(model_dir, DeviceSelector::parse("dx12:0")?) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("second gpu unavailable ({e:#}); using {}", primary.describe());
+                let vocab = Vocab::load(model_dir)?;
+                return Ok(Self {
+                    tower: Tower::Gpu(primary),
+                    vocab,
+                    model_dir: model_dir.to_path_buf(),
+                });
+            }
+        };
+        if primary.adapter_name() == secondary.adapter_name() {
+            eprintln!(
+                "vulkan:0 and dx12:0 are both {}; using one device",
+                primary.adapter_name()
+            );
+            let vocab = Vocab::load(model_dir)?;
+            return Ok(Self {
+                tower: Tower::Gpu(primary),
+                vocab,
+                model_dir: model_dir.to_path_buf(),
+            });
+        }
+        let vocab = Vocab::load(model_dir)?;
+        Ok(Self {
+            tower: Tower::Dual(primary, secondary),
+            vocab,
+            model_dir: model_dir.to_path_buf(),
+        })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        match self.tower {
+            Tower::Cpu(_) => "cpu",
+            Tower::Gpu(_) => "wgpu",
+            Tower::Dual(_, _) => "dual",
+        }
+    }
+
+    pub fn device_desc(&self) -> String {
+        match &self.tower {
+            Tower::Cpu(_) => "cpu".to_string(),
+            Tower::Gpu(g) => g.describe(),
+            Tower::Dual(a, b) => format!("{} + {}", a.describe(), b.describe()),
+        }
+    }
+
+    pub fn config(&self) -> &Wav2Vec2Config {
+        match &self.tower {
+            Tower::Cpu(m) => &m.cfg,
+            Tower::Gpu(g) | Tower::Dual(g, _) => &g.cfg,
+        }
+    }
+
+    /// Public forward for tests/benchmarks: z-normalised waveform -> log_probs.
+    pub fn forward_pub(&self, input: &[f32]) -> Result<Vec<f32>> {
+        self.forward(input)
+    }
+
+    fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
+        match &self.tower {
+            Tower::Cpu(m) => Ok(m.forward(input, &Default::default())?.0),
+            Tower::Gpu(g) | Tower::Dual(g, _) => g.forward(input),
+        }
+    }
+
+    /// Align one file against its transcript.
+    ///
+    /// `window_sec = None` encodes the whole file in one pass (matches the
+    /// Python unchunked path); `Some(w)` uses w-second windows with
+    /// `context_sec` of context on each side (matches `log_probs_chunked`).
+    pub fn align(
+        &self,
+        audio_path: &Path,
+        text: &str,
+        window_sec: Option<f64>,
+        context_sec: f64,
+    ) -> Result<AlignOutput> {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (ids, pieces) = self.vocab.tokenise(&text);
+        if ids.is_empty() {
+            anyhow::bail!("no in-vocabulary characters in the transcript");
+        }
+
+        let (waveform, sr) = load_audio(audio_path)
+            .with_context(|| format!("load {}", audio_path.display()))?;
+        anyhow::ensure!(sr == TARGET_SR, "expected {TARGET_SR} Hz after decoding");
+        let duration = waveform.len() as f64 / sr as f64;
+
+        let t_enc = std::time::Instant::now();
+        let log_probs = self.log_probs(&waveform, window_sec, context_sec)?;
+        let encode_s = t_enc.elapsed().as_secs_f64();
+        let vocab = self.config().vocab_size;
+        let t_al = std::time::Instant::now();
+        let mut res = ctc_forced_align(
+            &log_probs,
+            log_probs.len() / vocab,
+            vocab,
+            &ids,
+            BLANK_ID,
+            FRAME_RATE,
+            Some(&pieces),
+            false,
+        )?;
+        let align_s = t_al.elapsed().as_secs_f64();
+
+        fix_timestamp(&mut res.tokens);
+        let words = build_words(&res.tokens);
+        let segments = build_segments(&res.tokens, &words);
+        let skipped = skipped_chars(&text, &pieces);
+        let chars: Vec<serde_json::Value> = res
+            .tokens
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "index": t.index,
+                    "token_id": t.token_id,
+                    "piece": t.piece,
+                    "start": r4(t.start),
+                    "end": r4(t.end),
+                    "mid": r4(t.mid()),
+                    "duration": r4(t.duration()),
+                    "start_frame": t.start_frame,
+                    "end_frame": t.end_frame,
+                    "score": r4(t.score),
+                })
+            })
+            .collect();
+
+        Ok(AlignOutput {
+            audio: audio_path.display().to_string(),
+            text,
+            duration: r4(duration),
+            frames: res.frames,
+            frame_rate: res.frame_rate,
+            mean_frame_score: r4(res.mean_frame_score()),
+            log_prob: r4(res.log_prob),
+            skipped,
+            chars,
+            words: words
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "index": w.index,
+                        "text": w.text,
+                        "start": r4(w.start),
+                        "end": r4(w.end),
+                        "duration": r4(w.duration()),
+                        "char_start": w.char_start,
+                        "char_end": w.char_end,
+                    })
+                })
+                .collect(),
+            segments: segments
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "index": s.index,
+                        "text": s.text,
+                        "start": r4(s.start),
+                        "end": r4(s.end),
+                        "duration": r4(s.end - s.start),
+                        "words": s.words,
+                    })
+                })
+                .collect(),
+            encode_s,
+            align_s,
+            tokens: res.tokens,
+            frame_scores: res.frame_scores,
+        })
+    }
+
+    /// Frame log-probabilities for a raw (un-normalised) waveform.
+    fn log_probs(&self, waveform: &[f32], window_sec: Option<f64>, context_sec: f64) -> Result<Vec<f32>> {
+        let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
+        match win {
+            None => {
+                let mut input = waveform.to_vec();
+                znorm(&mut input);
+                self.forward(&input)
+            }
+            Some(win) => self.log_probs_chunked(waveform, win, context_sec),
+        }
+    }
+
+    /// Windowed encoding (port of `backend.log_probs_chunked`): chunks of
+    /// `win` samples carry `ctx` real samples on both sides; only the middle
+    /// `win` frames of each chunk are kept, so the stream tiles the audio
+    /// exactly.  Normalisation is per chunk, as the Python path does.
+    fn log_probs_chunked(&self, waveform: &[f32], win: usize, ctx_sec: f64) -> Result<Vec<f32>> {
+        let ctx = (ctx_sec * TARGET_SR as f64) as usize;
+        if waveform.len() < win {
+            let mut input = waveform.to_vec();
+            znorm(&mut input);
+            return self.forward(&input);
+        }
+        let ctx_frames = ctx / SUBSAMPLING;
+        let win_frames = win / SUBSAMPLING;
+        anyhow::ensure!(ctx_frames >= 64, "context must cover the ±64-frame positional conv");
+
+        let n = waveform.len();
+        let extension = n.div_ceil(win) * win - n;
+        // padded = [ctx zeros | waveform | ctx+extension zeros]
+        let padded_len = n + 2 * ctx + extension;
+
+        let mut chunks = Vec::new();
+        let mut start = 0usize; // chunk start inside `padded`
+        while start + win + 2 * ctx <= padded_len {
+            // chunk = [ctx zeros | win real samples | ctx zeros], gathered from
+            // the waveform with zero fill at the file edges
+            let w_lo = start as i64 - ctx as i64; // waveform index of chunk sample 0
+            let mut chunk = vec![0.0f32; win + 2 * ctx];
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                let wi = w_lo + i as i64;
+                if wi >= 0 && (wi as usize) < n {
+                    *slot = waveform[wi as usize];
+                }
+            }
+            znorm(&mut chunk);
+            chunks.push(chunk);
+            start += win;
+        }
+
+        let vocab = self.config().vocab_size;
+        let encoded = match &self.tower {
+            Tower::Dual(a, b) => forward_pair(a, b, &chunks)?,
+            _ => {
+                let mut out = Vec::with_capacity(chunks.len());
+                for chunk in &chunks {
+                    out.push(self.forward(chunk)?);
+                }
+                out
+            }
+        };
+        let mut out: Vec<f32> = Vec::new();
+        for lp in &encoded {
+            let keep_lo = ctx_frames;
+            let keep_hi = (ctx_frames + win_frames).min(lp.len() / vocab);
+            out.extend_from_slice(&lp[keep_lo * vocab..keep_hi * vocab]);
+        }
+
+        // drop the frames the tail padding contributed
+        let ext_frames = ((extension as f64 / TARGET_SR as f64 * FRAME_RATE).ceil()) as usize;
+        if ext_frames > 0 && out.len() >= ext_frames * vocab {
+            let keep = out.len() - ext_frames * vocab;
+            out.truncate(keep);
+        }
+        Ok(out)
+    }
+}
+
+/// One chunk on each GPU at a time. Odd tail stays on the first device.
+fn forward_pair(a: &GpuModel, b: &GpuModel, chunks: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut i = 0;
+    while i < chunks.len() {
+        if i + 1 < chunks.len() {
+            let i0 = i;
+            let (left, right) = std::thread::scope(|scope| {
+                let h0 = scope.spawn(|| a.forward(&chunks[i0]));
+                let h1 = scope.spawn(|| b.forward(&chunks[i0 + 1]));
+                (
+                    h0.join().expect("gpu thread"),
+                    h1.join().expect("gpu thread"),
+                )
+            });
+            out.push(left?);
+            out.push(right?);
+            i += 2;
+        } else {
+            out.push(a.forward(&chunks[i])?);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
