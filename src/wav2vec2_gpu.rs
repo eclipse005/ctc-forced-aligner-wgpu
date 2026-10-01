@@ -281,7 +281,7 @@ impl GpuModel {
                 let (f1w, f1b) = lin(base("feed_forward.intermediate_dense")).unwrap();
                 let (f2w, f2b) = lin(base("feed_forward.output_dense")).unwrap();
                 let (l1w, l1b) = lin(base("layer_norm")).unwrap();
-                let (l2w, l2b) = lin(base("final_layer_norm")).unwrap();
+                let (l2w, _l2b) = lin(base("final_layer_norm")).unwrap();
                 // fused (K, 3K): row k = [Wq[:,k] | Wk[:,k] | Wv[:,k]]
                 let qt = tr(&qw, cfg.hidden_size, cfg.hidden_size);
                 let kt = tr(&kw, cfg.hidden_size, cfg.hidden_size);
@@ -322,7 +322,7 @@ impl GpuModel {
 
         // ---- upload
         let mut up = gpu.uploader();
-        let mut put = |up: &mut BulkUpload, data: &[f32], label: &str| -> wgpu::Buffer {
+        let put = |up: &mut BulkUpload, data: &[f32], label: &str| -> wgpu::Buffer {
             let mut bytes = Vec::with_capacity(data.len() * 4);
             for f in data {
                 bytes.extend_from_slice(&f.to_le_bytes());

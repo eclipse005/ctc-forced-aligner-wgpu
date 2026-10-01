@@ -240,6 +240,7 @@ fn gpu_golden_tokens() {
     let gold_lp = load_f32(&root.join("sdpa_log_probs.bin"));
     let (mx, mn) = diff(&lp, &gold_lp);
     println!("gpu log_probs vs golden: max {mx:.6} mean {mn:.6}");
+    std::fs::create_dir_all("gpu_debug").unwrap();
     std::fs::write("gpu_debug/gpu_log_probs.bin", bytemuck::cast_slice(&lp)).unwrap();
 
     let out = aligner.align(&wav_path, text, Some(30.0), 2.0).unwrap();

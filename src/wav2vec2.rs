@@ -365,6 +365,12 @@ fn fit(v: &mut Vec<f32>, n: usize) {
 impl Model {
     pub fn load(model_dir: &std::path::Path) -> Result<Self> {
         let cfg = Wav2Vec2Config::load(model_dir)?;
+        // the K^T transpose in forward_with bands 64 channels at a time
+        anyhow::ensure!(
+            cfg.hidden_size % 64 == 0,
+            "hidden_size {} not divisible by 64 (K^T banding)",
+            cfg.hidden_size
+        );
         let tensors = crate::weights::load_tensors(model_dir)?;
 
         let mut conv = Vec::new();
@@ -742,6 +748,11 @@ impl Model {
     /// tap matrix B_tap (in, out) has element (ci, c) = w[(c·in + ci)·k + tap].
     pub fn conv_step(&self, cl: &ConvLayer, x: &[f32], t_in: usize) -> Vec<f32> {
         let (cout, cin, k, s) = (cl.out, cl.in_, cl.k, cl.stride);
+        assert!(
+            t_in >= k,
+            "conv input too short: {} frames < kernel {k}",
+            t_in
+        );
         let t_out = (t_in - k) / s + 1;
         let mut y = vec![0.0f32; t_out * cout];
         for row in y.chunks_exact_mut(cout) {
