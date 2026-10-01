@@ -87,6 +87,7 @@ fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind) -> String {
     m: u32, n: u32, k: u32,
     a_stride: u32, b_stride: u32, c_stride: u32,
     a_off: u32, b_off: u32, c_off: u32,
+    a_z: u32, b_z: u32, c_z: u32,
     scale: f32,
 }
 @group(0) @binding(0) var<storage, read> a: array<f32>;
@@ -131,6 +132,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
     let _ = writeln!(s, "    let m_full = m0 + {}u <= d.m;", t.mt);
     let _ = writeln!(s, "    let n_full = n0 + {}u <= d.n;", t.nt);
+    if matches!(kind, Kind::Gemm) {
+        // per-head batched dispatches: workgroup z picks the head, the
+        // *_z strides step a_off / b_off / c_off between heads
+        s.push_str(
+            "    let a_off = d.a_off + wid.z * d.a_z;\n    let b_off = d.b_off + wid.z * d.b_z;\n    let c_off = d.c_off + wid.z * d.c_z;\n",
+        );
+    }
     let _ = writeln!(s, "    let ktiles = (d.k + {}u - 1u) / {}u;", t.ks, t.ks);
     s.push_str("    for (var kt = 0u; kt < ktiles; kt = kt + 1u) {\n");
     let _ = writeln!(s, "        let k0 = kt * {}u;", t.ks);
@@ -157,9 +165,9 @@ fn emit_loads(s: &mut String, t: &Tile, kind: Kind) {
             emit_a_slow(s, t, a_vecs, kv);
             s.push_str("        }\n");
             s.push_str("        if (n_full && k_full) {\n");
-            emit_b_fast(s, t, b_vecs, "d.b_off + gk * d.b_stride + gn", "b");
+            emit_b_fast(s, t, b_vecs, "b_off + gk * d.b_stride + gn", "b");
             s.push_str("        } else {\n");
-            emit_b_slow(s, t, b_vecs, "d.b_off + gk * d.b_stride + gn", "b");
+            emit_b_slow(s, t, b_vecs, "b_off + gk * d.b_stride + gn", "b");
             s.push_str("        }\n");
         }
         Kind::Conv => {
@@ -180,7 +188,7 @@ fn emit_a_fast(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
     let _ = writeln!(s, "            for (var i = tid; i < {a_vecs}u; i = i + 256u) {{");
     let _ = writeln!(s, "                let rr = i / {kv}u;");
     let _ = writeln!(s, "                let kvi = i % {kv}u;");
-    s.push_str("                let base = d.a_off + (m0 + rr) * d.a_stride + (k0 + kvi * 4u);\n");
+    s.push_str("                let base = a_off + (m0 + rr) * d.a_stride + (k0 + kvi * 4u);\n");
     let _ = writeln!(
         s,
         "                sa[(rr * {}u) + kvi] = vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);",
@@ -197,10 +205,10 @@ fn emit_a_slow(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
     s.push_str("                let gk = k0 + kvi * 4u;\n");
     s.push_str("                var v = vec4<f32>(0.0);\n");
     s.push_str("                if (gm < d.m && gk + 3u < d.k) {\n");
-    s.push_str("                    let base = d.a_off + gm * d.a_stride + gk;\n");
+    s.push_str("                    let base = a_off + gm * d.a_stride + gk;\n");
     s.push_str("                    v = vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);\n");
     s.push_str("                } else if (gm < d.m && gk < d.k) {\n");
-    s.push_str("                    let base = d.a_off + gm * d.a_stride + gk;\n");
+    s.push_str("                    let base = a_off + gm * d.a_stride + gk;\n");
     s.push_str("                    v.x = a[base];\n");
     s.push_str("                    if (gk + 1u < d.k) { v.y = a[base + 1u]; }\n");
     s.push_str("                    if (gk + 2u < d.k) { v.z = a[base + 2u]; }\n");
@@ -330,7 +338,7 @@ fn emit_fma_step(s: &mut String, t: &Tile, kv: &str) {
 
 fn emit_store(s: &mut String, t: &Tile, kind: Kind) {
     let (dst, scale, base) = match kind {
-        Kind::Gemm => ("c", "d.scale", "d.c_off + gm * d.c_stride + gn"),
+        Kind::Gemm => ("c", "d.scale", "c_off + gm * d.c_stride + gn"),
         Kind::Conv => ("out", "1.0", "gm * d.n + gn"),
     };
     s.push_str("    if (m_full && n_full) {\n");

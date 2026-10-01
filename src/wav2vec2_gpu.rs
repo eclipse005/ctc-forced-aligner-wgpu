@@ -60,6 +60,9 @@ struct GemmDims {
     a_off: u32,
     b_off: u32,
     c_off: u32,
+    a_z: u32,
+    b_z: u32,
+    c_z: u32,
     scale: f32,
 }
 
@@ -107,6 +110,7 @@ struct Job {
     bg: wgpu::BindGroup,
     gx: u32,
     gy: u32,
+    gz: u32,
 }
 
 struct Pipe {
@@ -611,6 +615,44 @@ impl GpuModel {
                     bg,
                     gx: $gx,
                     gy: $gy,
+                    gz: 1,
+                });
+            }};
+        }
+
+        // Same, with a non-trivial workgroup z: one dispatch covers all
+        // per-head GEMMs (head index = wid.z, offsets step by the *_z dims).
+        macro_rules! dispatch_z {
+            ($p:expr, $dims:expr, $gx:expr, $gy:expr, $gz:expr, $($bind:expr),* $(,)?) => {{
+                let dims_owned = $dims;
+                let dims_bytes = bytemuck::bytes_of(&dims_owned);
+                let uni_off = uni.len() as u64;
+                let padded = dims_bytes.len().next_multiple_of(UNIFORM_ALIGN as usize);
+                if uni.len() + padded > uni_cap {
+                    anyhow::bail!("uniform scratch exhausted at {t} frames");
+                }
+                uni.extend_from_slice(dims_bytes);
+                uni.resize(uni.len() + padded - dims_bytes.len(), 0);
+                let mut entries: Vec<wgpu::BindGroupEntry> = vec![$($bind),*];
+                entries.push(wgpu::BindGroupEntry {
+                    binding: uni_binding($p),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &ubuf,
+                        offset: uni_off,
+                        size: Some(std::num::NonZeroU64::new(dims_bytes.len() as u64).unwrap()),
+                    }),
+                });
+                let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layouts[$p],
+                    entries: &entries,
+                });
+                batches.last_mut().unwrap().push(Job {
+                    pipe: $p,
+                    bg,
+                    gx: $gx,
+                    gy: $gy,
+                    gz: $gz,
                 });
             }};
         }
@@ -685,7 +727,7 @@ impl GpuModel {
             GemmDims {
                 m: rows as u32, n: hidden as u32, k: 512,
                 a_stride: 512, b_stride: hidden as u32, c_stride: hidden as u32,
-                a_off: 0, b_off: 0, c_off: 0, scale: 1.0,
+                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
             },
             (rows as u32).div_ceil(shaders::MT), (hidden as u32).div_ceil(shaders::NT),
             bind!(0, &cur), bind!(1, &self.fp_wt), bind!(2, &self.fp_b), bind!(3, &act.x),
@@ -741,7 +783,7 @@ impl GpuModel {
                 GemmDims {
                     m: t_rows, n: 3 * cols, k: cols,
                     a_stride: cols, b_stride: 3 * cols, c_stride: 3 * cols,
-                    a_off: 0, b_off: 0, c_off: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), (3 * cols).div_ceil(shaders::NT),
                 bind!(0, &act.t1), bind!(1, &self.qkv_wt[li]), bind!(2, &self.qkv_b[li]), bind!(3, &act.qkv),
@@ -754,22 +796,20 @@ impl GpuModel {
                 (t as u32).div_ceil(16), (hidden as u32).div_ceil(16),
                 bind!(0, &act.qkv), bind!(1, &act.kt),
             );
-            // per-head scores: qkv[q cols] x kt -> scores (heads, T, T)
-            for hh in 0..heads as u32 {
-                dispatch!(
-                    P_GEMM,
-                    GemmDims {
-                        m: t_rows, n: t_rows, k: head_dim as u32,
-                        a_stride: 3 * cols, b_stride: t as u32, c_stride: t_rows,
-                        a_off: hh * head_dim as u32,
-                        b_off: hh * head_dim as u32 * t as u32,
-                        c_off: hh * t_rows * t_rows,
-                        scale: 0.125, // head_dim^-0.5: the attention scaling
-                    },
-                    t_rows.div_ceil(shaders::MT), t_rows.div_ceil(shaders::NT),
-                    bind!(0, &act.qkv), bind!(1, &act.kt), bind!(2, &self.zeros), bind!(3, &act.scores),
-                );
-            }
+            // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z
+            dispatch_z!(
+                P_GEMM,
+                GemmDims {
+                    m: t_rows, n: t_rows, k: head_dim as u32,
+                    a_stride: 3 * cols, b_stride: t as u32, c_stride: t_rows,
+                    a_off: 0, a_z: head_dim as u32,
+                    b_off: 0, b_z: head_dim as u32 * t as u32,
+                    c_off: 0, c_z: t_rows * t_rows,
+                    scale: 0.125, // head_dim^-0.5: the attention scaling
+                },
+                t_rows.div_ceil(shaders::MT), t_rows.div_ceil(shaders::NT), heads as u32,
+                bind!(0, &act.qkv), bind!(1, &act.kt), bind!(2, &self.zeros), bind!(3, &act.scores),
+            );
             // softmax over each (head, query) row
             dispatch!(
                 P_SOFTMAX,
@@ -777,28 +817,27 @@ impl GpuModel {
                 row_grid(heads as u32 * t_rows).0, row_grid(heads as u32 * t_rows).1,
                 bind!(0, &act.scores),
             );
-            // per-head weighted V: scores_h x v_h -> attn_o (c offset h*1024)
-            for hh in 0..heads as u32 {
-                dispatch!(
-                    P_GEMM,
-                    GemmDims {
-                        m: t_rows, n: head_dim as u32, k: t_rows,
-                        a_stride: t_rows, b_stride: 3 * cols, c_stride: cols,
-                        a_off: hh * t_rows * t_rows,
-                        b_off: ((2 * hidden) as u32 + hh * head_dim as u32),
-                        c_off: hh * head_dim as u32, scale: 1.0,
-                    },
-                    t_rows.div_ceil(shaders::MT), (head_dim as u32).div_ceil(shaders::NT),
-                    bind!(0, &act.scores), bind!(1, &act.qkv), bind!(2, &self.zeros), bind!(3, &act.attn_o),
-                );
-            }
+            // per-head weighted V, z-batched: attn_h = scores_h @ v_h
+            dispatch_z!(
+                P_GEMM,
+                GemmDims {
+                    m: t_rows, n: head_dim as u32, k: t_rows,
+                    a_stride: t_rows, b_stride: 3 * cols, c_stride: cols,
+                    a_off: 0, a_z: t_rows * t_rows,
+                    b_off: (2 * hidden) as u32, b_z: head_dim as u32,
+                    c_off: 0, c_z: head_dim as u32,
+                    scale: 1.0,
+                },
+                t_rows.div_ceil(shaders::MT), (head_dim as u32).div_ceil(shaders::NT), heads as u32,
+                bind!(0, &act.scores), bind!(1, &act.qkv), bind!(2, &self.zeros), bind!(3, &act.attn_o),
+            );
             // out proj + residual
             dispatch!(
                 P_GEMM,
                 GemmDims {
                     m: t_rows, n: cols, k: cols,
                     a_stride: cols, b_stride: cols, c_stride: cols,
-                    a_off: 0, b_off: 0, c_off: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), cols.div_ceil(shaders::NT),
                 bind!(0, &act.attn_o), bind!(1, &self.out_wt[li]), bind!(2, &self.out_b[li]), bind!(3, &act.t2),
@@ -823,7 +862,7 @@ impl GpuModel {
                 GemmDims {
                     m: t_rows, n: self.cfg.intermediate_size as u32, k: cols,
                     a_stride: cols, b_stride: self.cfg.intermediate_size as u32, c_stride: self.cfg.intermediate_size as u32,
-                    a_off: 0, b_off: 0, c_off: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), (self.cfg.intermediate_size as u32).div_ceil(shaders::NT),
                 bind!(0, &act.t1), bind!(1, &self.ff1_wt[li]), bind!(2, &self.ff1_b[li]), bind!(3, &act.t2),
@@ -839,7 +878,7 @@ impl GpuModel {
                 GemmDims {
                     m: t_rows, n: cols, k: self.cfg.intermediate_size as u32,
                     a_stride: self.cfg.intermediate_size as u32, b_stride: cols, c_stride: cols,
-                    a_off: 0, b_off: 0, c_off: 0, scale: 1.0,
+                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
                 },
                 t_rows.div_ceil(shaders::MT), cols.div_ceil(shaders::NT),
                 bind!(0, &act.t2), bind!(1, &self.ff2_wt[li]), bind!(2, &self.ff2_b[li]), bind!(3, &act.t3),
@@ -865,7 +904,7 @@ impl GpuModel {
             GemmDims {
                 m: t as u32, n: vocab as u32, k: hidden as u32,
                 a_stride: hidden as u32, b_stride: vocab as u32, c_stride: vocab as u32,
-                a_off: 0, b_off: 0, c_off: 0, scale: 1.0,
+                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, scale: 1.0,
             },
             (t as u32).div_ceil(shaders::MT), (vocab as u32).div_ceil(shaders::NT),
             bind!(0, &act.x), bind!(1, &self.lm_wt), bind!(2, &self.lm_b), bind!(3, &act.logits),
@@ -933,7 +972,7 @@ impl GpuModel {
                     });
                     pass.set_pipeline(pipes[job.pipe]);
                     pass.set_bind_group(0, &job.bg, &[]);
-                    pass.dispatch_workgroups(job.gx, job.gy, 1);
+                    pass.dispatch_workgroups(job.gx, job.gy, job.gz);
                     drop(pass);
                     qi += 2;
                 }
@@ -955,7 +994,7 @@ impl GpuModel {
                     for job in batch {
                         pass.set_pipeline(pipes[job.pipe]);
                         pass.set_bind_group(0, &job.bg, &[]);
-                        pass.dispatch_workgroups(job.gx, job.gy, 1);
+                        pass.dispatch_workgroups(job.gx, job.gy, job.gz);
                     }
                 }
                 gpu.queue.submit([enc.finish()]);
