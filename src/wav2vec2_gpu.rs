@@ -116,6 +116,7 @@ struct Pipe {
     conv0: wgpu::ComputePipeline,
     pos_conv: wgpu::ComputePipeline,
     ln: wgpu::ComputePipeline,
+    ln_sd: wgpu::ComputePipeline,
     gelu: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
@@ -128,18 +129,19 @@ const P_CONV_GEMM: usize = 1;
 const P_CONV0: usize = 2;
 const P_POS: usize = 3;
 const P_LN: usize = 4;
-const P_GELU: usize = 5;
-const P_ADD: usize = 6;
-const P_SOFTMAX: usize = 7;
-const P_LOGSOFTMAX: usize = 8;
-const P_TRANSPOSE: usize = 9;
-const P_COPY: usize = 10;
+const P_LN_SD: usize = 5;
+const P_GELU: usize = 6;
+const P_ADD: usize = 7;
+const P_SOFTMAX: usize = 8;
+const P_LOGSOFTMAX: usize = 9;
+const P_TRANSPOSE: usize = 10;
+const P_COPY: usize = 11;
 
 /// The uniform binding index of each pipeline, and whether its uniform buffer
 /// is shared (one big buffer + per-dispatch offsets).
 fn uni_binding(p: usize) -> u32 {
     match p {
-        P_GEMM | P_CONV_GEMM | P_CONV0 | P_POS => 4,
+        P_GEMM | P_CONV_GEMM | P_CONV0 | P_POS | P_LN_SD => 4,
         P_LN | P_ADD => 3,
         P_GELU | P_SOFTMAX | P_LOGSOFTMAX => 1,
         P_TRANSPOSE => 2,
@@ -410,7 +412,8 @@ impl GpuModel {
             conv_gemm: mk_gemm(&shaders::conv_gemm(), "conv_gemm")?,
             conv0: mk(&shaders::conv0(), "conv0")?,
             pos_conv: mk_gemm(&shaders::pos_conv(), "pos_conv")?,
-            ln: mk(&shaders::layernorm(), "layernorm")?,
+            ln: mk(&shaders::layernorm(), "ln")?,
+            ln_sd: mk(&shaders::layernorm_sd(), "ln_sd")?,
             gelu: mk(&shaders::gelu(), "gelu")?,
             add: mk(&shaders::add(), "add")?,
             softmax: mk(&shaders::softmax(), "softmax")?,
@@ -558,12 +561,13 @@ impl GpuModel {
         // on this wgpu version, and a per-dispatch pass + poll blows the
         // Windows TDR budget in the other direction. One pass per 8 encoder
         // layers stays under ~2 s on Pascal and still retires in order.
-        let pipes: [&wgpu::ComputePipeline; 11] = [
+        let pipes: [&wgpu::ComputePipeline; 12] = [
             &self.pipes.gemm,
             &self.pipes.conv_gemm,
             &self.pipes.conv0,
             &self.pipes.pos_conv,
             &self.pipes.ln,
+            &self.pipes.ln_sd,
             &self.pipes.gelu,
             &self.pipes.add,
             &self.pipes.softmax,
@@ -724,18 +728,12 @@ impl GpuModel {
                 kick!();
             }
             let (t_rows, cols) = (t as u32, hidden as u32);
-            // t1 = LN(x)  (x preserved as residual)
+            // t1 = LN(x): src/dst LN, x stays untouched as the residual
             dispatch!(
-                P_COPY,
-                Cfg4 { a: (t * hidden) as u32, b: 0, c: 0, d: 0 },
-                ((t * hidden) as u32).div_ceil(WG), 1,
-                bind!(0, &act.x), bind!(1, &act.t1),
-            );
-            dispatch!(
-                P_LN,
+                P_LN_SD,
                 Cfg4 { a: t_rows, b: cols, c: 10, d: 0 },
                 row_grid(t_rows).0, row_grid(t_rows).1,
-                bind!(0, &act.t1), bind!(1, &self.ln1_w[li]), bind!(2, &self.ln1_b[li]),
+                bind!(0, &act.x), bind!(1, &act.t1), bind!(2, &self.ln1_w[li]), bind!(3, &self.ln1_b[li]),
             );
             // qkv
             dispatch!(
@@ -813,17 +811,12 @@ impl GpuModel {
             );
             // FFN: t3 is the new residual; swap x <-> t3
             std::mem::swap(&mut act.x, &mut act.t3);
+            // t1 = LN(x) — again src/dst, no staging copy
             dispatch!(
-                P_COPY,
-                Cfg4 { a: (t * hidden) as u32, b: 0, c: 0, d: 0 },
-                ((t * hidden) as u32).div_ceil(WG), 1,
-                bind!(0, &act.x), bind!(1, &act.t1),
-            );
-            dispatch!(
-                P_LN,
+                P_LN_SD,
                 Cfg4 { a: t_rows, b: cols, c: 10, d: 0 },
                 row_grid(t_rows).0, row_grid(t_rows).1,
-                bind!(0, &act.t1), bind!(1, &self.ln2_w[li]), bind!(2, &self.ln2_b[li]),
+                bind!(0, &act.x), bind!(1, &act.t1), bind!(2, &self.ln2_w[li]), bind!(3, &self.ln2_b[li]),
             );
             dispatch!(
                 P_GEMM,
@@ -979,11 +972,11 @@ impl GpuModel {
             let ticks: &[u64] = bytemuck::cast_slice(&bytes);
             let period = gpu.queue.get_timestamp_period() as f64;
             let names = [
-                "gemm", "conv_gemm", "conv0", "pos", "ln", "gelu", "add", "softmax", "logsoftmax",
-                "transpose", "copy", "  scores", "  pv", "  gemm-main",
+                "gemm", "conv_gemm", "conv0", "pos", "ln", "ln_sd", "gelu", "add", "softmax",
+                "logsoftmax", "transpose", "copy", "  scores", "  pv", "  gemm-main",
             ];
-            let mut acc = [0f64; 14];
-            let mut cnt = [0u32; 14];
+            let mut acc = [0f64; 15];
+            let mut cnt = [0u32; 15];
             for (i, &(p, gy)) in job_meta.iter().enumerate() {
                 let dt = ticks[i * 2 + 1].saturating_sub(ticks[i * 2]) as f64 * period / 1e6;
                 if p < acc.len() {
@@ -992,11 +985,11 @@ impl GpuModel {
                     let mut b = p;
                     if p == P_GEMM {
                         b = if gy == 1 {
-                            12
-                        } else if gy == (t as u32).div_ceil(shaders::NT) {
-                            11
-                        } else {
                             13
+                        } else if gy == (t as u32).div_ceil(shaders::NT) {
+                            12
+                        } else {
+                            14
                         };
                     }
                     acc[b] += dt;

@@ -17,66 +17,50 @@ pub use gemm_kernel::{
 };
 
 /// Row LayerNorm over `cols` (affine, biased variance, eps inside sqrt) then
-/// gelu when `do_gelu` is 1.  One workgroup per row, 256 threads.
+/// gelu when `do_gelu` is 1.  256 threads per row; the row lives in registers
+/// as one `vec4` per thread (cols is 512 or 1024), and the mean / variance
+/// reductions are tree-shaped — the previous serial 256-step loop by thread 0
+/// was why this kernel ran at 14 GB/s.
+///
+/// Two shaders: [`layernorm`] normalises in place (conv stack, feature
+/// projection, final LN); [`layernorm_sd`] reads `src` and writes `dst`,
+/// which lets the encoder layers LN the residual stream without a staging
+/// copy.
 pub fn layernorm() -> String {
-    r#"
-struct Cfg { rows: u32, cols: u32, eps_x_1e6: u32, do_gelu: u32 }
-@group(0) @binding(0) var<storage, read_write> h: array<f32>;
-@group(0) @binding(1) var<storage, read> w: array<f32>;
-@group(0) @binding(2) var<storage, read> b: array<f32>;
-@group(0) @binding(3) var<uniform> cfg: Cfg;
-
-// red[0..256) = per-thread partials; red[256] = row sum; red[257] = row
-// sum of squares.  Distinct slots: no write-after-read races on the scalars.
-var<workgroup> red: array<f32, 258u>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
-    // y stacks past the 65535 workgroup limit (conv0 of a 34 s chunk is ~1e5 rows).
-    let row = wid.x + wid.y * 65535u;
-    if (row >= cfg.rows) { return; }
-    let cols = cfg.cols;
-    let base = row * cols;
-    var sum = 0.0;
-    var sq = 0.0;
-    for (var i = lid.x; i < cols; i = i + 256u) {
-        let v = h[base + i];
-        sum = sum + v;
-        sq = sq + v * v;
-    }
-    red[lid.x] = sum;
-    workgroupBarrier();
-    if (lid.x == 0u) {
-        var s = 0.0;
-        for (var i = 0u; i < 256u; i = i + 1u) { s = s + red[i]; }
-        red[256] = s;
-    }
-    workgroupBarrier();
-    let mean = red[256] / f32(cols);
-    red[lid.x] = sq;
-    workgroupBarrier();
-    if (lid.x == 0u) {
-        var s = 0.0;
-        for (var i = 0u; i < 256u; i = i + 1u) { s = s + red[i]; }
-        red[257] = s;
-    }
-    workgroupBarrier();
-    // biased variance: E[x^2] - mean^2
-    let varian = red[257] / f32(cols) - mean * mean;
-    let eps = f32(cfg.eps_x_1e6) * 1e-6;
-    let inv = 1.0 / sqrt(varian + eps);
-    for (var i = lid.x; i < cols; i = i + 256u) {
-        var v = (h[base + i] - mean) * inv * w[i] + b[i];
-        if (cfg.do_gelu == 1u) {
-            v = 0.5 * v * (1.0 + erf(v / 1.4142135623730951));
-        }
-        h[base + i] = v;
-    }
+    emit_ln(
+        "
+@group(0) @binding(0) var<storage, read_write> h: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> b4: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform> cfg: Cfg;",
+        "h[idx]",
+        "h[idx]",
+    )
 }
 
-// wgsl has no erf; a rational approximation (Abramowitz & Stegun 7.1.26, |e|<1.5e-7)
-// keeps the gelu inside fp32 noise of the reference for these magnitudes.
+/// Source/destination variant; uniform sits at binding 4.
+pub fn layernorm_sd() -> String {
+    emit_ln(
+        "
+@group(0) @binding(0) var<storage, read> src: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> w4: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> b4: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> cfg: Cfg;",
+        "src[idx]",
+        "dst[idx]",
+    )
+}
+
+fn emit_ln(bindings: &str, load: &str, store: &str) -> String {
+    let mut s = String::from("struct Cfg { rows: u32, cols: u32, eps_x_1e6: u32, do_gelu: u32 }
+");
+    s.push_str(bindings);
+    s.push_str(
+        r#"
+
+var<workgroup> red: array<f32, 256u>;
+
 fn erf(x: f32) -> f32 {
     let s = sign(x);
     let a = abs(x);
@@ -85,8 +69,54 @@ fn erf(x: f32) -> f32 {
         + 0.254829592) * t * exp(-a * a);
     return s * y;
 }
-"#
-    .to_string()
+
+fn gelu(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + erf(x / 1.4142135623730951));
+}
+
+fn gelu4(v: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(gelu(v.x), gelu(v.y), gelu(v.z), gelu(v.w));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    // y stacks past the 65535 workgroup limit (conv0 of a 34 s chunk is ~1e5 rows).
+    let row = wid.x + wid.y * 65535u;
+    if (row >= cfg.rows) { return; }
+    let cv = cfg.cols / 4u;
+    let idx = row * cv + lid.x;
+    var v = vec4<f32>(0.0);
+    if (lid.x < cv) { v = @LOAD@; }
+    // ---- mean: tree-reduce 256 partials (8 shared-memory steps)
+    red[lid.x] = v.x + v.y + v.z + v.w;
+    workgroupBarrier();
+    for (var st = 128u; st >= 1u; st = st >> 1u) {
+        if (lid.x < st) { red[lid.x] = red[lid.x] + red[lid.x + st]; }
+        workgroupBarrier();
+    }
+    let mean = red[0] / f32(cfg.cols);
+    // barrier: every thread has read red[0] before it is overwritten below
+    workgroupBarrier();
+    // ---- biased variance: E[x^2] - mean^2
+    red[lid.x] = dot(v, v);
+    workgroupBarrier();
+    for (var st = 128u; st >= 1u; st = st >> 1u) {
+        if (lid.x < st) { red[lid.x] = red[lid.x] + red[lid.x + st]; }
+        workgroupBarrier();
+    }
+    let varian = red[0] / f32(cfg.cols) - mean * mean;
+    let eps = f32(cfg.eps_x_1e6) * 1e-6;
+    let inv = 1.0 / sqrt(varian + eps);
+    if (lid.x < cv) {
+        var o = (v - vec4<f32>(mean)) * inv * w4[lid.x] + b4[lid.x];
+        if (cfg.do_gelu == 1u) { o = gelu4(o); }
+        @STORE@ = o;
+    }
+}
+"#,
+    );
+    s.replace("@LOAD@", load).replace("@STORE@", store)
 }
 
 /// Elementwise gelu over n elements.
@@ -207,13 +237,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         mx = max(mx, x7);
         red[lid.x] = mx;
         workgroupBarrier();
-        if (lid.x == 0u) {
-            var m = -3.4e38;
-            for (var i = 0u; i < 256u; i = i + 1u) { m = max(m, red[i]); }
-            red[0] = m;
+        for (var st = 128u; st >= 1u; st = st >> 1u) {
+            if (lid.x < st) { red[lid.x] = max(red[lid.x], red[lid.x + st]); }
+            workgroupBarrier();
         }
-        workgroupBarrier();
         let m = red[0];
+        // barrier: red[0] is read above and overwritten in the sum step below
+        workgroupBarrier();
         var e0 = 0.0;
         var e1 = 0.0;
         var e2 = 0.0;
@@ -240,13 +270,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         sum = sum + e7;
         red[lid.x] = sum;
         workgroupBarrier();
-        if (lid.x == 0u) {
-            var s = 0.0;
-            for (var i = 0u; i < 256u; i = i + 1u) { s = s + red[i]; }
-            red[1] = s;
+        for (var st = 128u; st >= 1u; st = st >> 1u) {
+            if (lid.x < st) { red[lid.x] = red[lid.x] + red[lid.x + st]; }
+            workgroupBarrier();
         }
-        workgroupBarrier();
-        let inv = 1.0 / red[1];
+        let inv = 1.0 / red[0];
         if (i0 < cols) { h[base + i0] = e0 * inv; }
         if (i1 < cols) { h[base + i1] = e1 * inv; }
         if (i2 < cols) { h[base + i2] = e2 * inv; }
@@ -262,13 +290,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         }
         red[lid.x] = mx;
         workgroupBarrier();
-        if (lid.x == 0u) {
-            var m = -3.4e38;
-            for (var i = 0u; i < 256u; i = i + 1u) { m = max(m, red[i]); }
-            red[0] = m;
+        for (var st = 128u; st >= 1u; st = st >> 1u) {
+            if (lid.x < st) { red[lid.x] = max(red[lid.x], red[lid.x + st]); }
+            workgroupBarrier();
         }
-        workgroupBarrier();
         let m = red[0];
+        // barrier: red[0] is read above and overwritten in the sum step below
+        workgroupBarrier();
         var sum = 0.0;
         for (var i = lid.x; i < cols; i = i + 256u) {
             let e = exp(h[base + i] - m);
@@ -277,13 +305,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         }
         red[lid.x] = sum;
         workgroupBarrier();
-        if (lid.x == 0u) {
-            var s = 0.0;
-            for (var i = 0u; i < 256u; i = i + 1u) { s = s + red[i]; }
-            red[1] = s;
+        for (var st = 128u; st >= 1u; st = st >> 1u) {
+            if (lid.x < st) { red[lid.x] = red[lid.x] + red[lid.x + st]; }
+            workgroupBarrier();
         }
-        workgroupBarrier();
-        let inv = 1.0 / red[1];
+        let inv = 1.0 / red[0];
         for (var i = lid.x; i < cols; i = i + 256u) {
             h[base + i] = h[base + i] * inv;
         }
@@ -315,26 +341,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
     red[lid.x] = mx;
     workgroupBarrier();
-    if (lid.x == 0u) {
-        var m = -3.4e38;
-        for (var i = 0u; i < 256u; i = i + 1u) { m = max(m, red[i]); }
-        red[0] = m;
+    for (var st = 128u; st >= 1u; st = st >> 1u) {
+        if (lid.x < st) { red[lid.x] = max(red[lid.x], red[lid.x + st]); }
+        workgroupBarrier();
     }
-    workgroupBarrier();
     let m = red[0];
+    // barrier: red[0] is read above and overwritten in the sum step below
+    workgroupBarrier();
     var sum = 0.0;
     for (var i = lid.x; i < cols; i = i + 256u) {
         sum = sum + exp(h[base + i] - m);
     }
     red[lid.x] = sum;
     workgroupBarrier();
-    if (lid.x == 0u) {
-        var s = 0.0;
-        for (var i = 0u; i < 256u; i = i + 1u) { s = s + red[i]; }
-        red[1] = s;
+    for (var st = 128u; st >= 1u; st = st >> 1u) {
+        if (lid.x < st) { red[lid.x] = red[lid.x] + red[lid.x + st]; }
+        workgroupBarrier();
     }
-    workgroupBarrier();
-    let lsum = log(red[1]);
+    let lsum = log(red[0]);
     for (var i = lid.x; i < cols; i = i + 256u) {
         h[base + i] = h[base + i] - m - lsum;
     }
