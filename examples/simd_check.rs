@@ -71,15 +71,14 @@ fn main() {
     let mut r1 = row.clone();
     let mut r2 = row.clone();
     unsafe { avx2::softmax_inplace(&mut r1) };
-    let max_s = {
+    {
         let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0;
-        let e: Vec<f32> = row.iter().map(|x| (x - m).exp()).collect();
-        for v in &e { sum += v; }
-        e.iter().map(|v| v / sum).collect::<Vec<_>>()
-    };
+        for x in &row { sum += (x - m).exp(); }
+        for (x, y) in r2.iter_mut().zip(&row) { *x = (y - m).exp() / sum; }
+    }
     let mut d = 0.0f32;
-    for (a, b) in r1.iter().zip(&max_s) { d = d.max((a - b).abs()); }
+    for (a, b) in r1.iter().zip(&r2) { d = d.max((a - b).abs()); }
     println!("softmax max abs diff vs std exp: {d:.3e}");
 
     // log_softmax row: avx2 vs scalar

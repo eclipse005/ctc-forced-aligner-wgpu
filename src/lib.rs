@@ -13,9 +13,10 @@
 //! Python; `tests/golden.rs` diffs every stage and the final token timestamps.
 //!
 //! Layout: [`gpu`] is device plumbing, [`weights`] checkpoint access,
-//! [`audio`] decoding + resampling + chunking, [`wav2vec2`] the model (CPU /
-//! GPU twin towers, like the reference project), [`viterbi`] the aligner,
-//! [`spans`] the aggregation, [`align_inference`] the entry point.
+//! [`audio`] decoding + resampling + chunking, [`wav2vec2`] the CPU model
+//! (types + checkpoint load + forward), [`wav2vec2_gpu`] its GPU twin,
+//! [`viterbi`] the aligner, [`spans`] the aggregation, [`align_inference`]
+//! the entry point.
 
 pub mod align_inference;
 pub mod fix_timestamp;

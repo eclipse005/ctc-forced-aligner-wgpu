@@ -28,6 +28,7 @@ fn bench(name: &str, m: usize, n: usize, k: usize, par: Parallelism) {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
     let m_scale: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
     let m = 1700 * m_scale;
     let shapes = [
@@ -37,7 +38,6 @@ fn main() {
         ("scores", m, m, 64),
         ("pv", m, 64, m),
     ];
-    let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("rayon");
     let par = match mode {
         "none" => Parallelism::None,
