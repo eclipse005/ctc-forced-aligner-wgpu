@@ -126,6 +126,7 @@ struct Pipe {
     softmax: wgpu::ComputePipeline,
     log_softmax: wgpu::ComputePipeline,
     transpose: wgpu::ComputePipeline,
+    gather: wgpu::ComputePipeline,
 }
 
 const P_GEMM: usize = 0;
@@ -140,6 +141,7 @@ const P_SOFTMAX: usize = 8;
 const P_LOGSOFTMAX: usize = 9;
 const P_TRANSPOSE: usize = 10;
 const P_COPY: usize = 11;
+const P_GATHER: usize = 12;
 
 /// The uniform binding index of each pipeline, and whether its uniform buffer
 /// is shared (one big buffer + per-dispatch offsets).
@@ -150,6 +152,7 @@ fn uni_binding(p: usize) -> u32 {
         P_GELU | P_SOFTMAX | P_LOGSOFTMAX => 1,
         P_TRANSPOSE => 2,
         P_COPY => 2,
+        P_GATHER => 3,
         _ => unreachable!(),
     }
 }
@@ -186,6 +189,8 @@ pub struct GpuModel {
     lm_wt: wgpu::Buffer,
     lm_b: wgpu::Buffer,
     zeros: wgpu::Buffer,
+    /// Expanded trellis labels for the gathered alignment readback.
+    labels: wgpu::Buffer,
     /// Activation workspace reused across chunks of the same length.
     scratch: std::sync::Mutex<Option<Scratch>>,
 }
@@ -403,6 +408,7 @@ impl GpuModel {
         let zeros = put(&mut up, &vec![0.0f32; 4096], "zeros");
         up.finish()?;
 
+        let labels_buf = gpu.storage("trellis-labels", 65536 * 4);
         let mk = |src: &str, entry: &str| -> Result<wgpu::ComputePipeline> {
             gpu.pipeline(entry, src, "main", None)
         };
@@ -424,6 +430,7 @@ impl GpuModel {
             log_softmax: mk(&shaders::log_softmax(), "log_softmax")?,
             transpose: mk(&shaders::transpose(), "transpose")?,
             copy: mk(&shaders::copy(), "copy")?,
+            gather: mk(&shaders::gather(), "gather")?,
         };
 
         Ok(Self {
@@ -458,6 +465,7 @@ impl GpuModel {
             lm_wt: lm_wt_b,
             lm_b: lm_b_b,
             zeros,
+            labels: labels_buf,
             scratch: std::sync::Mutex::new(None),
         })
     }
@@ -472,6 +480,18 @@ impl GpuModel {
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
+        self.forward_impl(input, None)
+    }
+
+    /// Same forward, but instead of the whole (T, V) log-prob matrix only
+    /// the expanded trellis labels' values come back: (T, S), S =
+    /// expanded.len().  The alignment Viterbi reads nothing else, and the
+    /// 70 MB download of a 34 s chunk shrinks to ~30 KB.
+    pub fn forward_gathered(&self, input: &[f32], expanded: &[u32]) -> Result<Vec<f32>> {
+        self.forward_impl(input, Some(expanded))
+    }
+
+    fn forward_impl(&self, input: &[f32], gather: Option<&[u32]>) -> Result<Vec<f32>> {
         let gpu = &self.gpu;
         let hidden = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -565,7 +585,7 @@ impl GpuModel {
         // on this wgpu version, and a per-dispatch pass + poll blows the
         // Windows TDR budget in the other direction. One pass per 8 encoder
         // layers stays under ~2 s on Pascal and still retires in order.
-        let pipes: [&wgpu::ComputePipeline; 12] = [
+        let pipes: [&wgpu::ComputePipeline; 13] = [
             &self.pipes.gemm,
             &self.pipes.conv_gemm,
             &self.pipes.conv0,
@@ -578,6 +598,7 @@ impl GpuModel {
             &self.pipes.log_softmax,
             &self.pipes.transpose,
             &self.pipes.copy,
+            &self.pipes.gather,
         ];
         let layouts: Vec<wgpu::BindGroupLayout> =
             pipes.iter().map(|p| p.get_bind_group_layout(0)).collect();
@@ -924,6 +945,22 @@ impl GpuModel {
         }
         }
 
+        // gathered alignment: one dispatch collecting the trellis labels'
+        // log-probs, so the readback below is (T, S) instead of (T, V)
+        let gather_out = match gather {
+            Some(expanded) => {
+                let buf = gpu.storage("gather-out", (t * expanded.len() * 4) as u64);
+                dispatch!(
+                    P_GATHER,
+                    Cfg4 { a: (t * expanded.len()) as u32, b: expanded.len() as u32, c: vocab as u32, d: 0 },
+                    ((t * expanded.len()) as u32).div_ceil(WG), 1,
+                    bind!(0, &act.logits), bind!(1, &self.labels), bind!(2, &buf),
+                );
+                Some(buf)
+            }
+            None => None,
+        };
+
         let prof_mode = std::env::var("CTC_PROFILE").ok();
         let prof = prof_mode.as_deref() == Some("1");
         // CTC_PROFILE=2 timestamps every dispatch of the first forward so the
@@ -937,6 +974,10 @@ impl GpuModel {
         // The three layer-groups are queued back to back; each buffer stays
         // under the Windows TDR window, and one wait keeps the GPU busy.
         gpu.upload(&x_in, bytemuck::cast_slice(input));
+        if let Some(expanded) = gather {
+            anyhow::ensure!(expanded.len() <= 65536, "transcript too long for the labels buffer");
+            gpu.upload(&self.labels, bytemuck::cast_slice(expanded));
+        }
         if !uni.is_empty() {
             gpu.queue.write_buffer(&ubuf, 0, &uni);
         }
@@ -1012,10 +1053,10 @@ impl GpuModel {
             let period = gpu.queue.get_timestamp_period() as f64;
             let names = [
                 "gemm", "conv_gemm", "conv0", "pos", "ln", "ln_sd", "gelu", "add", "softmax",
-                "logsoftmax", "transpose", "copy", "  scores", "  pv", "  gemm-main",
+                "logsoftmax", "transpose", "copy", "gather", "  scores", "  pv", "  gemm-main",
             ];
-            let mut acc = [0f64; 15];
-            let mut cnt = [0u32; 15];
+            let mut acc = [0f64; 16];
+            let mut cnt = [0u32; 16];
             for (i, &(p, gy)) in job_meta.iter().enumerate() {
                 let dt = ticks[i * 2 + 1].saturating_sub(ticks[i * 2]) as f64 * period / 1e6;
                 if p < acc.len() {
@@ -1053,12 +1094,18 @@ impl GpuModel {
         }
         // One copy and one map. Chunked 8 MB maps were a driver workaround
         // that cost a full poll per piece (~70 MB of logits).
+        if let Some(expanded) = gather {
+            let bytes = gpu.readback(gather_out.as_ref().unwrap(), (t * expanded.len() * 4) as u64)?;
+            return Ok(bytemuck::cast_slice(&bytes).to_vec());
+        }
         let nbytes = f32s(t * vocab);
+        let t_rb = std::time::Instant::now();
         {
             let mut enc2 = gpu.device.create_command_encoder(&Default::default());
             enc2.copy_buffer_to_buffer(&act.logits, 0, &staging, 0, nbytes);
             gpu.queue.submit([enc2.finish()]);
         }
+        let t_copy = t_rb.elapsed();
         let slice = staging.slice(..nbytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -1067,12 +1114,16 @@ impl GpuModel {
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| anyhow::anyhow!("poll for readback: {e}"))?;
+        let t_poll = t_rb.elapsed();
         rx.recv().context("map callback dropped")??;
         let mapped = slice.get_mapped_range()?;
         let mut out = vec![0.0f32; t * vocab];
         out.copy_from_slice(bytemuck::cast_slice(&mapped));
         drop(mapped);
         staging.unmap();
+        if prof {
+            eprintln!("[fwd] T={t} readback: copy_submit {:?} poll {:?} map+memcpy {:?}", t_copy, t_poll, t_rb.elapsed());
+        }
         Ok(out)
     }
 }

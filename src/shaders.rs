@@ -367,6 +367,30 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     .to_string()
 }
 
+/// Gather the expanded trellis labels' log-probs: out[t * S + s] =
+/// lp[t * V + labels[s]].  The forced-alignment Viterbi only ever reads
+/// those T*S values, so the GPU downloads ~30 KB instead of the whole
+/// T*10288 matrix (70 MB for a 34 s chunk).
+pub fn gather() -> String {
+    r#"
+struct Cfg { total: u32, s: u32, v: u32, _p0: u32 }
+@group(0) @binding(0) var<storage, read> lp: array<f32>;
+@group(0) @binding(1) var<storage, read> labels: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> cfg: Cfg;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < cfg.total) {
+        let t = i / cfg.s;
+        out[i] = lp[t * cfg.v + labels[i % cfg.s]];
+    }
+}
+"#
+    .to_string()
+}
+
 /// (rows, cols) -> (cols, rows)
 pub fn transpose() -> String {
     r#"

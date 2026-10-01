@@ -164,6 +164,55 @@ pub fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec<usize>
     out
 }
 
+/// Per-frame emission scores for the trellis. Two sources: the full
+/// (T, V) log-prob matrix gathered through the expanded labels, and a
+/// pre-gathered (T, S) matrix (the GPU gather kernel's output). Both
+/// yield bit-identical f32 values, so the DP — and the timestamps — are
+/// identical either way.
+trait Emissions {
+    /// Fill `emit[0..num_states]` with frame `t`'s state scores.
+    fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]);
+    /// Score of expanded state `st` at frame `t` (frame_scores, collapse).
+    fn score(&self, t: usize, st: usize) -> f32;
+}
+
+struct FullRows<'a> {
+    log_probs: &'a [f32],
+    vocab: usize,
+    labels: &'a [usize],
+    blank_id: usize,
+}
+
+impl Emissions for FullRows<'_> {
+    fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]) {
+        let row = &self.log_probs[t * self.vocab..(t + 1) * self.vocab];
+        emit.fill(row[self.blank_id] as f64);
+        for (i, &tok) in token_ids.iter().enumerate() {
+            emit[2 * i + 1] = row[tok] as f64;
+        }
+    }
+    fn score(&self, t: usize, st: usize) -> f32 {
+        self.log_probs[t * self.vocab + self.labels[st]]
+    }
+}
+
+struct GatheredRows<'a> {
+    gathered: &'a [f32],
+    num_states: usize,
+}
+
+impl Emissions for GatheredRows<'_> {
+    fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
+        let row = &self.gathered[t * self.num_states..(t + 1) * self.num_states];
+        for (e, &v) in emit.iter_mut().zip(row) {
+            *e = v as f64;
+        }
+    }
+    fn score(&self, t: usize, st: usize) -> f32 {
+        self.gathered[t * self.num_states + st]
+    }
+}
+
 /// Force-align `token_ids` against `log_probs` ((T, V) row-major, f32).
 #[allow(clippy::too_many_arguments)]
 pub fn ctc_forced_align(
@@ -176,8 +225,56 @@ pub fn ctc_forced_align(
     pieces: Option<&[String]>,
     return_path: bool,
 ) -> anyhow::Result<AlignmentResult> {
-    let t_len = num_frames;
+    let labels = build_expanded_labels(token_ids, blank_id);
+    let em = FullRows { log_probs, vocab, labels: &labels, blank_id };
+    align(em, num_frames, &labels, blank_id, token_ids, frame_rate, pieces, return_path)
+}
+
+/// Force-align against a pre-gathered (T, S) score matrix with
+/// S = 2·L+1 states in the expanded-label order: even states are the
+/// blank, odd state 2i+1 emits `token_ids[i]`. `gathered[t * S + st]`
+/// must equal the full matrix's `log_probs[t * V + labels[st]]`.
+pub fn ctc_forced_align_gathered(
+    gathered: &[f32],
+    num_frames: usize,
+    num_states: usize,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+) -> anyhow::Result<AlignmentResult> {
+    anyhow::ensure!(
+        num_states == 2 * token_ids.len() + 1,
+        "gathered states {num_states} != 2·{}+1",
+        token_ids.len()
+    );
+    anyhow::ensure!(
+        gathered.len() == num_frames * num_states,
+        "gathered matrix is {} values, expected {num_frames}×{num_states}",
+        gathered.len()
+    );
+    // expanded-label structure: even states are blanks, odd states tokens;
+    // a skip arc is illegal when it would repeat the same emission.  The
+    // blank shows up as the usize::MAX sentinel, so blank_id = usize::MAX
+    // makes the shared skip_dead rule fire on even states.
+    let labels: Vec<usize> = (0..num_states)
+        .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
+        .collect();
+    let em = GatheredRows { gathered, num_states };
+    align(em, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
+}
+
+fn align(
+    em: impl Emissions,
+    t_len: usize,
+    labels: &[usize],
+    blank_id: usize,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+    return_path: bool,
+) -> anyhow::Result<AlignmentResult> {
     let l = token_ids.len();
+    let s = labels.len();
     if l == 0 {
         return Ok(AlignmentResult {
             tokens: vec![],
@@ -188,8 +285,6 @@ pub fn ctc_forced_align(
             frame_scores: vec![],
         });
     }
-    let labels = build_expanded_labels(token_ids, blank_id);
-    let s = labels.len();
     if t_len < l {
         anyhow::bail!(
             "Audio too short: {t_len} frames cannot hold {l} tokens."
@@ -201,10 +296,9 @@ pub fn ctc_forced_align(
     // all emit the blank and odd states emit token_ids in order.
     let mut prev = vec![f64::NEG_INFINITY; s];
     {
-        let lp0 = &log_probs[..vocab];
-        prev[0] = lp0[blank_id] as f64;
+        prev[0] = em.score(0, 0) as f64;
         if s > 1 {
-            prev[1] = lp0[token_ids[0]] as f64;
+            prev[1] = em.score(0, 1) as f64;
         }
     }
 
@@ -230,11 +324,7 @@ pub fn ctc_forced_align(
     #[cfg(target_arch = "x86_64")]
     let use_avx2 = std::is_x86_feature_detected!("avx2");
     for t in 1..t_len {
-        let lp_row = &log_probs[t * vocab..(t + 1) * vocab];
-        emit.fill(lp_row[blank_id] as f64);
-        for (i, &tok) in token_ids.iter().enumerate() {
-            emit[2 * i + 1] = lp_row[tok] as f64;
-        }
+        em.fill_emit(t, &mut emit, token_ids);
         let back_row = &mut back[t * s..(t + 1) * s];
         #[cfg(target_arch = "x86_64")]
         if use_avx2 {
@@ -265,9 +355,9 @@ pub fn ctc_forced_align(
     }
 
     let frame_scores: Vec<f64> = (0..t_len)
-        .map(|t| log_probs[t * vocab + labels[states[t] as usize]] as f64)
+        .map(|t| em.score(t, states[t] as usize) as f64)
         .collect();
-    let tokens = collapse(&states, &labels, log_probs, vocab, token_ids, pieces, frame_rate);
+    let tokens = collapse(&states, &em, token_ids, pieces, frame_rate);
 
     Ok(AlignmentResult {
         tokens,
@@ -282,9 +372,7 @@ pub fn ctc_forced_align(
 #[allow(clippy::too_many_arguments)]
 fn collapse(
     states: &[i32],
-    labels: &[usize],
-    log_probs: &[f32],
-    vocab: usize,
+    em: &impl Emissions,
     token_ids: &[usize],
     pieces: Option<&[String]>,
     frame_rate: f64,
@@ -306,7 +394,7 @@ fn collapse(
             starts[i] = t as i64;
         }
         ends[i] = t as i64;
-        sums[i] += log_probs[t * vocab + labels[st]] as f64;
+        sums[i] += em.score(t, st) as f64;
         counts[i] += 1;
     }
 
@@ -420,6 +508,47 @@ mod tests {
                 n1[i],
                 n2[i]
             );
+        }
+    }
+
+    /// The gathered matrix path must produce bit-identical alignments to
+    /// the full (T, V) path — the GPU gather kernel relies on this.
+    #[test]
+    fn gathered_matches_full_matrix() {
+        let (t, v, l) = (97usize, 40usize, 11usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = (1..=l).map(|i| (i * 3) % v).collect();
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let log_probs: Vec<f32> = (0..t * v)
+            .map(|i| -((i % 89) as f32) * 0.11 - ((i / v) as f32 % 7.0) * 0.05)
+            .collect();
+
+        let want = ctc_forced_align(
+            &log_probs, t, v, &token_ids, blank, 50.0, Some(&pieces), false,
+        )
+        .unwrap();
+
+        let labels = build_expanded_labels(&token_ids, blank);
+        let s = labels.len();
+        let mut gathered = Vec::with_capacity(t * s);
+        for f in 0..t {
+            for &st in &labels {
+                gathered.push(log_probs[f * v + st]);
+            }
+        }
+        let got = ctc_forced_align_gathered(
+            &gathered, t, s, &token_ids, 50.0, Some(&pieces),
+        )
+        .unwrap();
+
+        assert_eq!(got.tokens.len(), want.tokens.len());
+        for (g, w) in got.tokens.iter().zip(&want.tokens) {
+            assert_eq!((g.start_frame, g.end_frame), (w.start_frame, w.end_frame));
+            assert_eq!(g.score.to_bits(), w.score.to_bits(), "token score bits");
+        }
+        assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
+        for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
+            assert_eq!(a.to_bits(), b.to_bits());
         }
     }
 }

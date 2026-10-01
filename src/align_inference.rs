@@ -11,7 +11,7 @@ use crate::fix_timestamp::fix_timestamp;
 use crate::config::Wav2Vec2Config;
 use crate::gpu::DeviceSelector;
 use crate::spans::{build_segments, build_words};
-use crate::viterbi::{ctc_forced_align, TokenAlignment};
+use crate::viterbi::{build_expanded_labels, ctc_forced_align_gathered, TokenAlignment};
 use crate::views::skipped_chars;
 use crate::vocab::Vocab;
 use crate::wav2vec2::Model;
@@ -155,20 +155,23 @@ impl Aligner {
         anyhow::ensure!(sr == TARGET_SR, "expected {TARGET_SR} Hz after decoding");
         let duration = waveform.len() as f64 / sr as f64;
 
+        // Both towers gather the trellis labels' log-probs (T, S) instead of
+        // handing the whole (T, V) matrix to the CPU — the GPU readback of a
+        // 34 s chunk drops from ~70 MB to ~30 KB.  The gathered values are
+        // the same f32s the full path would read, so the DP is unchanged.
+        let expanded = build_expanded_labels(&ids, BLANK_ID);
         let t_enc = std::time::Instant::now();
-        let log_probs = self.log_probs(&waveform, window_sec, context_sec)?;
+        let gathered = self.log_probs_gathered(&waveform, window_sec, context_sec, &expanded)?;
         let encode_s = t_enc.elapsed().as_secs_f64();
-        let vocab = self.config().vocab_size;
         let t_al = std::time::Instant::now();
-        let mut res = ctc_forced_align(
-            &log_probs,
-            log_probs.len() / vocab,
-            vocab,
+        let states = expanded.len();
+        let mut res = ctc_forced_align_gathered(
+            &gathered,
+            gathered.len() / states,
+            states,
             &ids,
-            BLANK_ID,
             FRAME_RATE,
             Some(&pieces),
-            false,
         )?;
         let align_s = t_al.elapsed().as_secs_f64();
 
@@ -239,29 +242,73 @@ impl Aligner {
         })
     }
 
-    /// Frame log-probabilities for a raw (un-normalised) waveform.
-    fn log_probs(&self, waveform: &[f32], window_sec: Option<f64>, context_sec: f64) -> Result<Vec<f32>> {
+    /// Trellis-label log-probabilities for a raw (un-normalised) waveform:
+    /// (frames, expanded.len()) row-major.
+    fn log_probs_gathered(
+        &self,
+        waveform: &[f32],
+        window_sec: Option<f64>,
+        context_sec: f64,
+        expanded: &[usize],
+    ) -> Result<Vec<f32>> {
         let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
         match win {
             None => {
                 let mut input = waveform.to_vec();
                 znorm(&mut input);
-                self.forward(&input)
+                self.forward_gathered(&input, expanded, &mut crate::wav2vec2::Scratch::default())
             }
-            Some(win) => self.log_probs_chunked(waveform, win, context_sec),
+            Some(win) => self.log_probs_chunked_gathered(waveform, win, context_sec, expanded),
         }
     }
 
-    /// Windowed encoding (port of `backend.log_probs_chunked`): chunks of
-    /// `win` samples carry `ctx` real samples on both sides; only the middle
-    /// `win` frames of each chunk are kept, so the stream tiles the audio
-    /// exactly.  Normalisation is per chunk, as the Python path does.
-    fn log_probs_chunked(&self, waveform: &[f32], win: usize, ctx_sec: f64) -> Result<Vec<f32>> {
+    /// Gathered scores of one z-normalised chunk; the CPU tower gathers from
+    /// the full matrix, the GPU tower gathers on-device before readback.
+    fn forward_gathered(
+        &self,
+        input: &[f32],
+        expanded: &[usize],
+        scratch: &mut crate::wav2vec2::Scratch,
+    ) -> Result<Vec<f32>> {
+        match &self.tower {
+            Tower::Cpu(m) => {
+                let (log_probs, _) = m.forward_with(input, &Default::default(), scratch)?;
+                let v = self.config().vocab_size;
+                let frames = log_probs.len() / v;
+                let mut g = Vec::with_capacity(frames * expanded.len());
+                for f in 0..frames {
+                    let row = &log_probs[f * v..(f + 1) * v];
+                    for &st in expanded {
+                        g.push(row[st]);
+                    }
+                }
+                Ok(g)
+            }
+            Tower::Gpu(gpu_model) => {
+                let exp32: Vec<u32> = expanded.iter().map(|&x| x as u32).collect();
+                gpu_model.forward_gathered(input, &exp32)
+            }
+        }
+    }
+
+    /// Windowed encoding, gathered (port of `backend.log_probs_chunked`):
+    /// chunks of `win` samples carry `ctx` real samples on both sides; only
+    /// the middle `win` frames of each chunk are kept, so the stream tiles
+    /// the audio exactly.  Normalisation is per chunk, as the Python path
+    /// does; the gather is applied per chunk before readback.
+    fn log_probs_chunked_gathered(
+        &self,
+        waveform: &[f32],
+        win: usize,
+        ctx_sec: f64,
+        expanded: &[usize],
+    ) -> Result<Vec<f32>> {
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
+        let states = expanded.len();
         if waveform.len() < win {
             let mut input = waveform.to_vec();
             znorm(&mut input);
-            return self.forward(&input);
+            return self.forward_gathered(&input, expanded, &mut crate::wav2vec2::Scratch::default());
         }
         let ctx_frames = ctx / SUBSAMPLING;
         let win_frames = win / SUBSAMPLING;
@@ -290,24 +337,21 @@ impl Aligner {
             start += win;
         }
 
-        let vocab = self.config().vocab_size;
-        let mut encoded = Vec::with_capacity(chunks.len());
-        // one scratch for the whole file: no per-chunk buffer churn
         let mut scratch = crate::wav2vec2::Scratch::default();
-        for chunk in &chunks {
-            encoded.push(self.forward_scratch(chunk, &mut scratch)?);
-        }
+        // one scratch for the whole file: no per-chunk buffer churn
         let mut out: Vec<f32> = Vec::new();
-        for lp in &encoded {
-            let keep_lo = ctx_frames;
-            let keep_hi = (ctx_frames + win_frames).min(lp.len() / vocab);
-            out.extend_from_slice(&lp[keep_lo * vocab..keep_hi * vocab]);
+        for chunk in &chunks {
+            let g = self.forward_gathered(chunk, expanded, &mut scratch)?;
+            let rows = g.len() / states;
+            let keep_lo = (ctx_frames * states).min(g.len());
+            let keep_hi = ((ctx_frames + win_frames).min(rows)) * states;
+            out.extend_from_slice(&g[keep_lo..keep_hi]);
         }
 
         // drop the frames the tail padding contributed
         let ext_frames = ((extension as f64 / TARGET_SR as f64 * FRAME_RATE).ceil()) as usize;
-        if ext_frames > 0 && out.len() >= ext_frames * vocab {
-            let keep = out.len() - ext_frames * vocab;
+        if ext_frames > 0 && out.len() >= ext_frames * states {
+            let keep = out.len() - ext_frames * states;
             out.truncate(keep);
         }
         Ok(out)
