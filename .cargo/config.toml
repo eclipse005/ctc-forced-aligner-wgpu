@@ -1,0 +1,5 @@
+# CPU inference kernels (gelu/LayerNorm/softmax elementwise loops) rely on
+# AVX2+FMA codegen.  Every x86-64 CPU since Haswell (2013) has these, so the
+# binary stays portable across modern x86-64 machines.
+[build]
+rustflags = ["-C", "target-feature=+avx2,+fma"]

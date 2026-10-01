@@ -117,8 +117,17 @@ impl Aligner {
     }
 
     fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
+        self.forward_scratch(input, &mut crate::wav2vec2::Scratch::default())
+    }
+
+    /// Same, reusing the CPU tower's scratch buffers across calls.
+    fn forward_scratch(
+        &self,
+        input: &[f32],
+        scratch: &mut crate::wav2vec2::Scratch,
+    ) -> Result<Vec<f32>> {
         match &self.tower {
-            Tower::Cpu(m) => Ok(m.forward(input, &Default::default())?.0),
+            Tower::Cpu(m) => Ok(m.forward_with(input, &Default::default(), scratch)?.0),
             Tower::Gpu(g) => g.forward(input),
         }
     }
@@ -283,8 +292,10 @@ impl Aligner {
 
         let vocab = self.config().vocab_size;
         let mut encoded = Vec::with_capacity(chunks.len());
+        // one scratch for the whole file: no per-chunk buffer churn
+        let mut scratch = crate::wav2vec2::Scratch::default();
         for chunk in &chunks {
-            encoded.push(self.forward(chunk)?);
+            encoded.push(self.forward_scratch(chunk, &mut scratch)?);
         }
         let mut out: Vec<f32> = Vec::new();
         for lp in &encoded {

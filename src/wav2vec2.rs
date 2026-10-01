@@ -11,11 +11,16 @@
 //!   LayerNorm(1024) → lm_head(1024→10288) → log_softmax
 //! ```
 //!
-//! The only free choices are GEMM accumulation orders; every op matches the
-//! reference math (erf gelu, biased LN variance with eps inside the sqrt,
-//! fp32 attention with 1/8 scaling).
+//! Every matmul (linears, attention QK^T / PV, conv taps, pos-conv taps)
+//! goes through the `gemm` crate (packed kernels, FMA, rayon).  The only
+//! free choices are accumulation orders; every op matches the reference
+//! math (erf gelu, biased LN variance with eps inside the sqrt, fp32
+//! attention with 1/8 scaling).  `fast_exp` / `fast_erf` are ~1e-7
+//! accurate, the same class as libm, and the golden test pins the final
+//! token timestamps to the Python reference.
 
 use anyhow::{Context, Result};
+use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 
 use crate::config::Wav2Vec2Config;
@@ -47,9 +52,8 @@ pub struct ConvLayer {
 }
 
 pub struct EncoderLayer {
-    pub q: Linear,
-    pub k: Linear,
-    pub v: Linear,
+    /// Fused q/k/v projection: rows `0..hidden` are Q, then K, then V.
+    pub qkv: Linear,
     pub out_proj: Linear,
     pub ln1: LayerNorm,
     pub ff1: Linear,
@@ -94,51 +98,267 @@ pub struct Stages {
     pub enc_final: Vec<f32>,
 }
 
-fn gelu(x: &mut [f32]) {
-    for v in x.iter_mut() {
-        // exact gelu: 0.5*x*(1+erf(x/sqrt(2)))
-        *v = 0.5 * *v * (1.0 + libm::erff(*v / std::f32::consts::SQRT_2));
+// ---------------------------------------------------------------------------
+// fast exp / erf
+//
+// exp(x) = 2^(x·log2e): split into k = round(x·log2e) and f ∈ [-0.5, 0.5),
+// 2^k via exponent bits and 2^f via a degree-7 Taylor series (rel err
+// ~5e-9, below the f32 rounding).  All call sites pass x <= 0, so only
+// the underflow side needs care.
+// ---------------------------------------------------------------------------
+
+const LOG2_E: f32 = 1.4426950408889634;
+const LN2: f64 = 0.6931471805599453;
+const E1: f32 = LN2 as f32;
+const E2: f32 = (LN2 * LN2 / 2.0) as f32;
+const E3: f32 = (LN2 * LN2 * LN2 / 6.0) as f32;
+const E4: f32 = (LN2 * LN2 * LN2 * LN2 / 24.0) as f32;
+const E5: f32 = (LN2 * LN2 * LN2 * LN2 * LN2 / 120.0) as f32;
+const E6: f32 = (LN2 * LN2 * LN2 * LN2 * LN2 * LN2 / 720.0) as f32;
+const E7: f32 = (LN2 * LN2 * LN2 * LN2 * LN2 * LN2 * LN2 / 5040.0) as f32;
+
+#[inline]
+pub(crate) fn fast_exp(x: f32) -> f32 {
+    let xf = x * LOG2_E;
+    // round to nearest integer via the 1.5·2^23 magic number
+    let k = (xf + 12582912.0) - 12582912.0;
+    if k < -126.0 {
+        return 0.0; // true result is subnormal; the sum is unaffected
+    }
+    let f = xf - k;
+    let p = E7 * f + E6;
+    let p = p * f + E5;
+    let p = p * f + E4;
+    let p = p * f + E3;
+    let p = p * f + E2;
+    let p = p * f + E1;
+    let p = p * f + 1.0;
+    let scale = f32::from_bits((((k + 127.0) as i32) as u32) << 23);
+    scale * p
+}
+
+/// Abramowitz & Stegun 7.1.26 (max abs err 1.5e-7, same class as libm erff).
+#[inline]
+pub(crate) fn fast_erf(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax > 5.0 {
+        // exp(-25) = 1.4e-11: erf is ±1 to f32 precision
+        return if x < 0.0 { -1.0 } else { 1.0 };
+    }
+    let t = 1.0 / (1.0 + 0.327_591_1 * ax);
+    let y = 1.0
+        - (((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t)
+            * fast_exp(-ax * ax);
+    if x < 0.0 {
+        -y
+    } else {
+        y
     }
 }
 
-impl LayerNorm {
-    fn apply(&self, h: &mut [f32], cols: usize) {
-        // h is (rows, cols); normalise each row over cols
-        for row in h.chunks_exact_mut(cols) {
-            let n = cols as f32;
-            let mean = row.iter().sum::<f32>() / n;
-            let var = row.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
-            let inv = ((var as f64 + self.eps).sqrt()) as f32;
-            for (x, (w, b)) in row.iter_mut().zip(self.w.iter().zip(&self.b)) {
-                *x = (*x - mean) / inv * w + b;
-            }
+fn gelu(x: &mut [f32]) {
+    // AVX2 path: erf via polynomial, 8 lanes per iteration.  The feature
+    // probe is a cached atomic read; hoisting it per chunk is plenty.
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = crate::simd::avx2::have_avx2_fma();
+    #[cfg(target_arch = "x86_64")]
+    if use_avx2 {
+        return x.par_chunks_mut(1 << 14).for_each(|chunk| {
+            unsafe { crate::simd::avx2::gelu_inplace(chunk) };
+        });
+    }
+    x.par_chunks_mut(1 << 14).for_each(|chunk| {
+        for v in chunk.iter_mut() {
+            // exact gelu: 0.5*x*(1+erf(x/sqrt(2)))
+            *v = 0.5 * *v * (1.0 + fast_erf(*v / std::f32::consts::SQRT_2));
         }
+    });
+}
+
+/// dst += src, parallel over blocks.
+fn add_par(dst: &mut [f32], src: &[f32]) {
+    dst.par_chunks_mut(1 << 15)
+        .zip(src.par_chunks(1 << 15))
+        .for_each(|(d, s)| {
+            for (a, b) in d.iter_mut().zip(s) {
+                *a += b;
+            }
+        });
+}
+
+/// Softmax one row in place (`fast_exp` under the hood).
+#[inline]
+fn softmax_row(row: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2::have_avx2_fma() {
+        unsafe { crate::simd::avx2::softmax_inplace(row) };
+        return;
+    }
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for sc in row.iter_mut() {
+        *sc = fast_exp(*sc - max);
+        sum += *sc;
+    }
+    let inv = 1.0 / sum;
+    for sc in row.iter_mut() {
+        *sc *= inv;
+    }
+}
+
+/// log_softmax one row in place: x - max - ln(sum(exp(x - max))).
+#[inline]
+fn log_softmax_row(row: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::avx2::have_avx2_fma() {
+        unsafe { crate::simd::avx2::log_softmax_inplace(row) };
+        return;
+    }
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for x in row.iter() {
+        sum += fast_exp(*x - max);
+    }
+    let lsum = sum.ln();
+    for x in row.iter_mut() {
+        *x = *x - max - lsum;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GEMM wrappers
+//
+// gemm computes dst = alpha·dst + beta·lhs·rhs; when `read_dst` is false
+// the crate zeroes alpha, so dst is never read.  Strides are (cs, rs) =
+// (column step, row step).
+// ---------------------------------------------------------------------------
+
+/// y (rows, out) = x (rows, in) @ w^T + b, with w stored `[out, in]`.
+fn linear_gemm(y: &mut [f32], x: &[f32], rows: usize, w: &[f32], b: &[f32], out: usize, in_: usize) {
+    for row in y[..rows * out].chunks_exact_mut(out) {
+        row.copy_from_slice(b);
+    }
+    unsafe {
+        gemm::<f32>(
+            rows,
+            out,
+            in_,
+            y.as_mut_ptr(),
+            1,
+            out as isize,
+            true, // read dst (the prefilled bias)
+            x.as_ptr(),
+            1,
+            in_ as isize,
+            w.as_ptr(),
+            in_ as isize,
+            1,
+            1.0,
+            1.0,
+            false,
+            false,
+            false,
+            Parallelism::Rayon(0),
+        );
     }
 }
 
 impl Linear {
-    fn apply(&self, x: &[f32], rows: usize) -> Vec<f32> {
-        // x: (rows, in) row-major; w: (out, in); y: (rows, out)
-        let n = self.out;
-        let k = self.in_;
-        let mut y = vec![0.0f32; rows * n];
-        y.par_chunks_mut(n).enumerate().for_each(|(r, yrow)| {
-            let xrow = &x[r * k..(r + 1) * k];
-            // broadcast rows of w^T: accumulate per input element
-            for (xi, xv) in xrow.iter().enumerate() {
-                if *xv == 0.0 {
-                    continue;
-                }
-                let wcol = &self.w[xi..]; // w[o][xi] sits at self.w[o * in_ + xi]
-                for (o, yv) in yrow.iter_mut().enumerate() {
-                    *yv += xv * wcol[o * k];
+    pub fn apply_into(&self, x: &[f32], rows: usize, y: &mut [f32]) {
+        linear_gemm(y, x, rows, &self.w, &self.b, self.out, self.in_);
+    }
+
+    pub fn apply(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let mut y = vec![0.0f32; rows * self.out];
+        self.apply_into(x, rows, &mut y);
+        y
+    }
+}
+
+impl LayerNorm {
+    pub fn apply(&self, h: &mut [f32], cols: usize) {
+        // h is (rows, cols); normalise each row over cols.  The reductions
+        // use 8 independent lanes so the compiler emits vaddps instead of a
+        // serial FADD chain.
+        let w = &self.w;
+        let b = &self.b;
+        let eps = self.eps;
+        h.par_chunks_exact_mut(cols).for_each(|row| {
+            let n = cols as f32;
+            let mut acc = [0.0f32; 8];
+            let mut chunks = row.chunks_exact(8);
+            for c in chunks.by_ref() {
+                for i in 0..8 {
+                    acc[i] += c[i];
                 }
             }
-            for (yv, bv) in yrow.iter_mut().zip(&self.b) {
-                *yv += bv;
+            let mut sum = 0.0f32;
+            for v in chunks.remainder() {
+                sum += *v;
+            }
+            for a in acc {
+                sum += a;
+            }
+            let mean = sum / n;
+            let mut acc2 = [0.0f32; 8];
+            let mut chunks = row.chunks_exact(8);
+            for c in chunks.by_ref() {
+                for i in 0..8 {
+                    let d = c[i] - mean;
+                    acc2[i] += d * d;
+                }
+            }
+            let mut var = 0.0f32;
+            for v in chunks.remainder() {
+                let d = *v - mean;
+                var += d * d;
+            }
+            for a in acc2 {
+                var += a;
+            }
+            var /= n;
+            let inv = ((var as f64 + eps).sqrt()) as f32;
+            for (x, (w, b)) in row.iter_mut().zip(w.iter().zip(b.iter())) {
+                *x = (*x - mean) / inv * w + b;
             }
         });
-        y
+    }
+}
+
+/// Raw pointer wrapper so the pos-conv group loop can share the output
+/// buffer across rayon tasks; each group writes a disjoint column strip.
+struct SendPtr(*mut f32);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+impl SendPtr {
+    fn add(&self, n: usize) -> *mut f32 {
+        unsafe { self.0.add(n) }
+    }
+}
+
+/// Transient forward buffers.  `forward_with` reuses them across calls so the
+/// chunked encoder does not re-allocate (and re-fault) ~90 MB per chunk;
+/// every buffer is fully overwritten before it is read, so stale contents
+/// from a previous (longer) forward are harmless.
+#[derive(Default)]
+pub struct Scratch {
+    ln: Vec<f32>,
+    qkv: Vec<f32>,
+    kt: Vec<f32>,
+    attn: Vec<f32>,
+    proj: Vec<f32>,
+    h: Vec<f32>,
+    h2: Vec<f32>,
+    ff: Vec<f32>,
+    ff2: Vec<f32>,
+    scores: Vec<f32>,
+}
+
+fn fit(v: &mut Vec<f32>, n: usize) {
+    if v.len() < n {
+        v.resize(n, 0.0);
     }
 }
 
@@ -208,6 +428,7 @@ impl Model {
             }
         }
 
+        let hidden = cfg.hidden_size;
         let mut layers = Vec::new();
         for i in 0..cfg.num_hidden_layers {
             let base = |sub: &str| format!("wav2vec2.encoder.layers.{i}.{sub}");
@@ -217,22 +438,32 @@ impl Model {
                 anyhow::ensure!(w.1 == vec![out, inp], "{name} {:?}", w.1);
                 Ok(Linear { w: w.0, b: b.0, out, in_: inp })
             };
+            // fuse q/k/v into one (3*hidden, hidden) projection
+            let qw = get_f32(&tensors, &base("attention.q_proj.weight"))?;
+            let qb = get_f32(&tensors, &base("attention.q_proj.bias"))?;
+            let kw = get_f32(&tensors, &base("attention.k_proj.weight"))?;
+            let kb = get_f32(&tensors, &base("attention.k_proj.bias"))?;
+            let vw = get_f32(&tensors, &base("attention.v_proj.weight"))?;
+            let vb = get_f32(&tensors, &base("attention.v_proj.bias"))?;
+            let mut qkv_w = qw.0;
+            qkv_w.extend_from_slice(&kw.0);
+            qkv_w.extend_from_slice(&vw.0);
+            let mut qkv_b = qb.0;
+            qkv_b.extend_from_slice(&kb.0);
+            qkv_b.extend_from_slice(&vb.0);
             layers.push(EncoderLayer {
-                q: lin(base("attention.q_proj"), cfg.hidden_size, cfg.hidden_size)?,
-                k: lin(base("attention.k_proj"), cfg.hidden_size, cfg.hidden_size)?,
-                v: lin(base("attention.v_proj"), cfg.hidden_size, cfg.hidden_size)?,
-                out_proj: lin(base("attention.out_proj"), cfg.hidden_size, cfg.hidden_size)?,
-                ln1: get_ln(&tensors, base("layer_norm"), cfg.hidden_size)?,
-                ff1: lin(base("feed_forward.intermediate_dense"), cfg.intermediate_size, cfg.hidden_size)?,
-                ff2: lin(base("feed_forward.output_dense"), cfg.hidden_size, cfg.intermediate_size)?,
-                ln2: get_ln(&tensors, base("final_layer_norm"), cfg.hidden_size)?,
+                qkv: Linear { w: qkv_w, b: qkv_b, out: 3 * hidden, in_: hidden },
+                out_proj: lin(base("attention.out_proj"), hidden, hidden)?,
+                ln1: get_ln(&tensors, base("layer_norm"), hidden)?,
+                ff1: lin(base("feed_forward.intermediate_dense"), cfg.intermediate_size, hidden)?,
+                ff2: lin(base("feed_forward.output_dense"), hidden, cfg.intermediate_size)?,
+                ln2: get_ln(&tensors, base("final_layer_norm"), hidden)?,
             });
         }
 
-        let hidden_size = cfg.hidden_size;
         let lhw = get_f32(&tensors, "lm_head.weight")?;
         let lhb = get_f32(&tensors, "lm_head.bias")?;
-        let lm_head = Linear { w: lhw.0, b: lhb.0, out: cfg.vocab_size, in_: cfg.hidden_size };
+        let lm_head = Linear { w: lhw.0, b: lhb.0, out: cfg.vocab_size, in_: hidden };
 
         // vocab: char -> id, from vocab.json; blank = 0 (<s>), unk = <unk>
         let vocab_raw: serde_json::Value = serde_json::from_str(
@@ -262,7 +493,7 @@ impl Model {
             pos_conv_weight: pos_w,
             pos_conv_bias: pb.0,
             layers,
-            final_ln: get_ln(&tensors, "wav2vec2.encoder.layer_norm".into(), hidden_size)?,
+            final_ln: get_ln(&tensors, "wav2vec2.encoder.layer_norm".into(), hidden)?,
             lm_head,
             vocab,
             char_to_id,
@@ -289,204 +520,314 @@ impl Model {
 
     /// Full forward on one z-normalised waveform. Returns log_probs (T, V).
     pub fn forward(&self, input: &[f32], stages: &StageSet) -> Result<(Vec<f32>, Stages)> {
+        let mut scratch = Scratch::default();
+        self.forward_with(input, stages, &mut scratch)
+    }
+
+    /// Same forward, reusing scratch buffers across calls: `forward` allocates
+    /// ~90 MB of transient buffers per invocation, which the chunked encoder
+    /// pays once per chunk.  Every buffer is fully overwritten before use, so
+    /// stale contents are harmless.
+    pub fn forward_with(
+        &self,
+        input: &[f32],
+        stages: &StageSet,
+        scratch: &mut Scratch,
+    ) -> Result<(Vec<f32>, Stages)> {
         let mut out_stages = Stages::default();
 
         // ---- conv stack: activations stay (T, C) row-major after each conv
-        let mut cur: Vec<f32>;
-        {
-            // layer 0: in = 1 channel (the raw waveform)
-            let c0 = &self.conv[0];
-            let t_out = (input.len() - c0.k) / c0.stride + 1;
-            cur = vec![0.0f32; t_out * c0.out];
-            cur.par_chunks_mut(c0.out).enumerate().for_each(|(j, row)| {
-                let base = j * c0.stride;
-                for (c, o) in row.iter_mut().enumerate() {
-                    let w = &c0.weight[c * c0.k..(c + 1) * c0.k];
-                    let mut acc = c0.bias[c];
-                    for (t, wt) in w.iter().enumerate() {
-                        acc += input[base + t] * wt;
-                    }
-                    *o = acc;
-                }
-            });
-            c0.ln.apply(&mut cur, c0.out);
-            gelu(&mut cur);
-            if stages.conv {
-                out_stages.conv.push(cur.clone());
-            }
+        let mut cur = self.conv_step(&self.conv[0], input, input.len());
+        if stages.conv {
+            out_stages.conv.push(cur.clone());
         }
-        for (_li, cl) in self.conv.iter().enumerate().skip(1) {
+        for cl in self.conv.iter().skip(1) {
             let t_in = cur.len() / cl.in_;
-            let t_out = (t_in - cl.k) / cl.stride + 1;
-            let mut next = vec![0.0f32; t_out * cl.out];
-            // weight is [out, in, k]: element (c, ci, t) at (c*in + ci)*k + t
-            next.par_chunks_mut(cl.out).enumerate().for_each(|(j, row)| {
-                let base = j * cl.stride;
-                for (c, o) in row.iter_mut().enumerate() {
-                    let w = &cl.weight[c * cl.k * cl.in_..(c + 1) * cl.k * cl.in_];
-                    let mut acc = cl.bias[c];
-                    for ci in 0..cl.in_ {
-                        let w_ci = &w[ci * cl.k..(ci + 1) * cl.k];
-                        for (t, wv) in w_ci.iter().enumerate() {
-                            acc += cur[(base + t) * cl.in_ + ci] * wv;
-                        }
-                    }
-                    *o = acc;
-                }
-            });
-            cl.ln.apply(&mut next, cl.out);
-            gelu(&mut next);
-            cur = next;
+            cur = self.conv_step(cl, &cur, t_in);
             if stages.conv {
                 out_stages.conv.push(cur.clone());
             }
         }
 
         let t = cur.len() / 512;
-        let mut h = cur; // (T, 512)
 
-        // ---- feature projection: LN -> linear
-        self.feat_proj_ln.apply(&mut h, 512);
-        h = self.feat_proj.apply(&h, t);
-        if stages.proj {
-            out_stages.proj = h.clone();
-        }
-
-        // ---- positional conv: depthwise, groups=16, k=128, pad 64, drop last
-        let pos = self.pos_conv(&h, t);
-        if stages.pos_conv {
-            out_stages.pos_conv = pos.clone();
-        }
-        for (a, b) in h.iter_mut().zip(&pos) {
-            *a += b;
-        }
-        if stages.enc_in {
-            out_stages.enc_in = h.clone();
-        }
-
-        // ---- encoder layers (pre-LN)
+        // ---- encoder-layer scratch: fit to this forward's shapes and split
+        // into disjoint slices (buffers are fully overwritten before read)
         let hidden = self.cfg.hidden_size;
         let heads = self.cfg.num_attention_heads;
         let head_dim = hidden / heads;
+        let intermediate = self.cfg.intermediate_size;
         let collect_layers = stages.layers.clone().unwrap_or_default();
+        let q_block = t.min(2048);
+        for buf in [
+            &mut scratch.ln,
+            &mut scratch.attn,
+            &mut scratch.proj,
+            &mut scratch.h,
+            &mut scratch.h2,
+            &mut scratch.ff2,
+        ] {
+            fit(buf, t * hidden);
+        }
+        fit(&mut scratch.qkv, t * 3 * hidden);
+        fit(&mut scratch.kt, hidden * t);
+        fit(&mut scratch.ff, t * intermediate);
+        fit(&mut scratch.scores, q_block * t);
+        let Scratch {
+            ln,
+            qkv,
+            kt,
+            attn,
+            proj,
+            h: h_buf,
+            h2: h2_buf,
+            ff,
+            ff2,
+            scores: sc,
+        } = &mut *scratch;
+        let ln_buf = &mut ln[..t * hidden];
+        let qkv_buf = &mut qkv[..t * 3 * hidden];
+        let kt_buf = &mut kt[..hidden * t];
+        let attn_buf = &mut attn[..t * hidden];
+        let proj_buf = &mut proj[..t * hidden];
+        let ff_buf = &mut ff[..t * intermediate];
+        let ff2_buf = &mut ff2[..t * hidden];
+        let scores = &mut sc[..q_block * t];
+
+        // ---- feature projection: LN -> linear (residual stream in scratch)
+        self.feat_proj_ln.apply(&mut cur, 512);
+        let mut h: &mut [f32] = &mut h_buf[..t * hidden];
+        let mut h_next: &mut [f32] = &mut h2_buf[..t * hidden];
+        self.feat_proj.apply_into(&cur, t, h);
+        if stages.proj {
+            out_stages.proj = h.to_vec();
+        }
+
+        // ---- positional conv: depthwise, groups=16, k=128, pad 64, drop last
+        let pos = self.pos_conv(h, t);
+        if stages.pos_conv {
+            out_stages.pos_conv = pos.clone();
+        }
+        add_par(h, &pos);
+        if stages.enc_in {
+            out_stages.enc_in = h.to_vec();
+        }
+
+        // scratch buffers reused across layers: attention scores are blocked
+        // over queries (max 2048 rows) so memory stays O(t) for long inputs
+
         for (li, layer) in self.layers.iter().enumerate() {
-            let residual = h.clone();
-            let mut ln1 = h.clone();
-            layer.ln1.apply(&mut ln1, hidden);
-
-            let q = layer.q.apply(&ln1, t);
-            let k = layer.k.apply(&ln1, t);
-            let v = layer.v.apply(&ln1, t);
-
-            let mut attn = vec![0.0f32; t * hidden];
-            attn.par_chunks_mut(hidden).enumerate().for_each(|(t1, orow)| {
-                let mut acc = vec![0.0f32; hidden];
-                for head in 0..heads {
-                    let off = head * head_dim;
-                    // scores over all t2
-                    let mut scores = vec![0.0f32; t];
-                    let qrow = &q[t1 * hidden + off..t1 * hidden + off + head_dim];
-                    for (t2, sc) in scores.iter_mut().enumerate() {
-                        let krow = &k[t2 * hidden + off..t2 * hidden + off + head_dim];
-                        let mut d = 0.0f32;
-                        for (a, b) in qrow.iter().zip(krow) {
-                            d += a * b;
+            // attention block: h_next = h + out_proj(attn(LN(h)))
+            ln_buf.copy_from_slice(h);
+            layer.ln1.apply(ln_buf, hidden);
+            layer.qkv.apply_into(ln_buf, t, qkv_buf);
+            // qkv_buf is (T, 3·hidden) row-major: Q in columns 0..hidden, K in
+            // hidden..2·hidden, V in 2·hidden..3·hidden (strided views below).
+            // K is transposed once per layer into a contiguous (hidden, T)
+            // buffer so the scores gemm packs each head's K^T rows sequentially
+            // instead of gathering them from a 3·hidden-strided view.
+            kt_buf
+                .par_chunks_mut(64 * t)
+                .enumerate()
+                .for_each(|(band, chunk)| {
+                    let i0 = band * 64;
+                    for j in 0..t {
+                        let src = &qkv_buf[j * 3 * hidden + hidden + i0..j * 3 * hidden + hidden + i0 + 64];
+                        for (ii, v) in src.iter().enumerate() {
+                            chunk[ii * t + j] = *v;
                         }
-                        *sc = d * 0.125;
                     }
-                    // softmax
-                    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for sc in scores.iter_mut() {
-                        *sc = (*sc - max).exp();
-                        sum += *sc;
+                });
+
+            for head in 0..heads {
+                let off = head * head_dim;
+                // block over queries so the score matrix stays small
+                for q0 in (0..t).step_by(q_block) {
+                    let qb = q_block.min(t - q0);
+                    let sptr = scores.as_mut_ptr();
+                    // scores (qb, t) = q_h (qb, 64) @ k_h^T (64, t), scaled 1/8
+                    // lhs: Q rows q0.. (element (j, d) = buf[(q0+j)·3h + off + d])
+                    // rhs: contiguous K^T rows [off .. off+64)
+                    unsafe {
+                        gemm::<f32>(
+                            qb,
+                            t,
+                            head_dim,
+                            sptr,
+                            1,
+                            t as isize,
+                            false,
+                            qkv_buf.as_ptr().add(q0 * 3 * hidden + off),
+                            1,
+                            (3 * hidden) as isize,
+                            kt_buf.as_ptr().add(off * t),
+                            1,
+                            t as isize,
+                            1.0,
+                            0.125,
+                            false,
+                            false,
+                            false,
+                            Parallelism::Rayon(0),
+                        );
                     }
-                    let inv = 1.0 / sum;
-                    for (t2, p) in scores.iter().enumerate() {
-                        let vrow = &v[t2 * hidden + off..t2 * hidden + off + head_dim];
-                        for (d, vv) in vrow.iter().enumerate() {
-                            acc[off + d] += p * inv * vv;
-                        }
+                    scores[..qb * t].par_chunks_exact_mut(t).for_each(softmax_row);
+                    // attn rows (qb, 64) = scores (qb, t) @ v_h (t, 64)
+                    // rhs: V (element (i, d) = buf[i·3h + 2h + off + d], rs=3h, cs=1)
+                    unsafe {
+                        gemm::<f32>(
+                            qb,
+                            head_dim,
+                            t,
+                            attn_buf.as_mut_ptr().add(q0 * hidden + off),
+                            1,
+                            hidden as isize,
+                            false,
+                            scores.as_ptr(),
+                            1,
+                            t as isize,
+                            qkv_buf.as_ptr().add(2 * hidden + off),
+                            1,
+                            (3 * hidden) as isize,
+                            1.0,
+                            1.0,
+                            false,
+                            false,
+                            false,
+                            Parallelism::Rayon(0),
+                        );
                     }
                 }
-                orow.copy_from_slice(&acc);
-            });
-            let mut attn_out = layer.out_proj.apply(&attn, t);
-            for (r, a) in residual.iter().zip(attn_out.iter_mut()) {
-                *a += r;
             }
+            layer.out_proj.apply_into(attn_buf, t, proj_buf);
+            h_next.copy_from_slice(h);
+            add_par(h_next, proj_buf);
             if collect_layers.contains(&li) {
-                out_stages.attn_out.insert(li, attn_out.clone());
+                out_stages.attn_out.insert(li, h_next.to_vec());
             }
-            // residual is the pre-LN attention output; the FFN input is its LN
-            let mut ln2 = attn_out.clone();
-            layer.ln2.apply(&mut ln2, hidden);
-            let mut ff = layer.ff1.apply(&ln2, t);
-            gelu(&mut ff);
-            let ff = layer.ff2.apply(&ff, t);
-            for (a, b) in attn_out.iter_mut().zip(&ff) {
-                *a += b;
-            }
-            h = attn_out;
+
+            // FFN block: h = h_next + ff2(gelu(ff1(LN(h_next))))
+            ln_buf.copy_from_slice(h_next);
+            layer.ln2.apply(ln_buf, hidden);
+            layer.ff1.apply_into(ln_buf, t, ff_buf);
+            gelu(ff_buf);
+            layer.ff2.apply_into(ff_buf, t, ff2_buf);
+            add_par(h_next, ff2_buf);
+            std::mem::swap(&mut h, &mut h_next);
             if collect_layers.contains(&li) {
-                out_stages.layer_out.insert(li, h.clone());
+                out_stages.layer_out.insert(li, h.to_vec());
             }
         }
 
-        self.final_ln.apply(&mut h, hidden);
+        self.final_ln.apply(h, hidden);
         if stages.enc_final {
-            out_stages.enc_final = h.clone();
+            out_stages.enc_final = h.to_vec();
         }
 
         // ---- lm head + log softmax
-        let logits = self.lm_head.apply(&h, t);
+        // log_probs = logits - max - ln(sum(exp(logits - max))): the exp is
+        // needed only for the row sum, so there is no per-element ln.
+        let logits = self.lm_head.apply(h, t);
         let mut log_probs = logits;
-        for row in log_probs.chunks_mut(self.cfg.vocab_size) {
-            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for x in row.iter_mut() {
-                *x = (*x - max).exp();
-                sum += *x;
-            }
-            let lsum = sum.ln();
-            for x in row.iter_mut() {
-                *x = x.ln() - lsum;
-            }
-        }
+        let vocab = self.cfg.vocab_size;
+        log_probs.par_chunks_exact_mut(vocab).for_each(log_softmax_row);
 
         Ok((log_probs, out_stages))
     }
 
-    fn pos_conv(&self, h: &[f32], t: usize) -> Vec<f32> {
-        // h: (T, 1024) row-major; depthwise conv over T with groups=16
+    /// One conv layer: y = bias + Σ_tap x_shifted @ w_tap, then LN + gelu.
+    ///
+    /// The k-tap sum is k GEMMs against shifted strided views of x, so the
+    /// `[out, in, k]` weight is consumed directly through strides:
+    /// tap matrix B_tap (in, out) has element (ci, c) = w[(c·in + ci)·k + tap].
+    pub fn conv_step(&self, cl: &ConvLayer, x: &[f32], t_in: usize) -> Vec<f32> {
+        let (cout, cin, k, s) = (cl.out, cl.in_, cl.k, cl.stride);
+        let t_out = (t_in - k) / s + 1;
+        let mut y = vec![0.0f32; t_out * cout];
+        for row in y.chunks_exact_mut(cout) {
+            row.copy_from_slice(&cl.bias);
+        }
+        for kt in 0..k {
+            // A_tap (t_out, cin): element (j, ci) = x[(j·s + tap)·cin + ci]
+            unsafe {
+                gemm::<f32>(
+                    t_out,
+                    cout,
+                    cin,
+                    y.as_mut_ptr(),
+                    1,
+                    cout as isize,
+                    true,
+                    x.as_ptr().add(kt * cin),
+                    1,
+                    (s * cin) as isize,
+                    cl.weight.as_ptr().add(kt),
+                    (cin * k) as isize,
+                    k as isize,
+                    1.0,
+                    1.0,
+                    false,
+                    false,
+                    false,
+                    Parallelism::Rayon(0),
+                );
+            }
+        }
+        cl.ln.apply(&mut y, cout);
+        gelu(&mut y);
+        y
+    }
+
+    pub fn pos_conv(&self, h: &[f32], t: usize) -> Vec<f32> {
+        // h: (T, 1024) row-major; depthwise conv over T with groups=16.
+        // Pad the input with k/2 zero rows so every tap is a clean shifted
+        // view, then each (group, tap) pair is one small GEMM accumulated
+        // into this group's column strip of the output.
         let hidden = self.cfg.hidden_size;
         let k = self.cfg.num_conv_pos_embeddings;
         let groups = self.cfg.num_conv_pos_embedding_groups;
         let in_pg = hidden / groups;
         let pad = k / 2;
-        let t_out = t + pad * 2 - k + 1; // t + 1
-        let mut out = vec![0.0f32; (t_out - 1) * hidden]; // drop the last frame
 
-        // weight [1024, in_pg, k] is depthwise per group: out channel c reads
-        // in channels (c / in_pg) * in_pg .. +in_pg
-        out.par_chunks_mut(hidden).enumerate().for_each(|(j, orow)| {
-            for (c, o) in orow.iter_mut().enumerate() {
-                let g = c / in_pg;
-                let ci0 = g * in_pg;
-                let w = &self.pos_conv_weight[c * in_pg * k..(c + 1) * in_pg * k];
-                let mut acc = self.pos_conv_bias[c];
-                for tk in 0..k {
-                    let src = j as i64 + tk as i64 - pad as i64;
-                    if src < 0 || src >= t as i64 {
-                        continue; // zero padding
-                    }
-                    let inrow = &h[src as usize * hidden + ci0..src as usize * hidden + ci0 + in_pg];
-                    // weight [c][ci][tk] at (c*in_pg + ci)*k + tk: stride-k gather
-                    for (ci, xv) in inrow.iter().enumerate() {
-                        acc += xv * w[ci * k + tk];
-                    }
+        let mut hp = vec![0.0f32; (t + 2 * pad) * hidden];
+        hp[pad * hidden..pad * hidden + t * hidden].copy_from_slice(h);
+
+        let mut out = vec![0.0f32; t * hidden]; // drop the last frame
+        for row in out.chunks_exact_mut(hidden) {
+            row.copy_from_slice(&self.pos_conv_bias);
+        }
+
+        let out_ptr = SendPtr(out.as_mut_ptr());
+        (0..groups).into_par_iter().for_each(move |g| {
+            // SAFETY: each group writes a disjoint 64-column strip of `out`.
+            let dst = out_ptr.add(g * in_pg);
+            for tk in 0..k {
+                // A (t, in_pg): hp rows [tap .. tap+t), columns of this group
+                // B (in_pg, in_pg): element (ci, oc) =
+                //     w[((g·in_pg + oc)·in_pg + ci)·k + tap]
+                unsafe {
+                    gemm::<f32>(
+                        t,
+                        in_pg,
+                        in_pg,
+                        dst,
+                        1,
+                        hidden as isize,
+                        true,
+                        hp.as_ptr().add(tk * hidden + g * in_pg),
+                        1,
+                        hidden as isize,
+                        self.pos_conv_weight.as_ptr().add(g * in_pg * in_pg * k + tk),
+                        (in_pg * k) as isize,
+                        k as isize,
+                        1.0,
+                        1.0,
+                        false,
+                        false,
+                        false,
+                        Parallelism::None,
+                    );
                 }
-                *o = acc;
             }
         });
         // gelu applied by caller order: conv -> pad-remove -> activation
@@ -494,4 +835,3 @@ impl Model {
         out
     }
 }
-

@@ -24,6 +24,7 @@ pub mod config;
 pub mod gpu;
 pub mod resample_sinc;
 pub mod shaders;
+pub mod simd;
 pub mod spans;
 pub mod viterbi;
 pub mod views;
