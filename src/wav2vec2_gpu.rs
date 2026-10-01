@@ -909,7 +909,7 @@ impl GpuModel {
             gpu.queue.write_buffer(&ubuf, 0, &uni);
         }
         let guard = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let mut split: Option<(wgpu::QuerySet, wgpu::Buffer, u32, Vec<usize>)> = None;
+        let mut split: Option<(wgpu::QuerySet, wgpu::Buffer, u32, Vec<(usize, u32)>)> = None;
         if do_split {
             let n_jobs: u32 = batches.iter().map(|b| b.len() as u32).sum();
             let qcount = n_jobs * 2;
@@ -925,11 +925,11 @@ impl GpuModel {
                 mapped_at_creation: false,
             });
             let mut enc = gpu.device.create_command_encoder(&Default::default());
-            let mut job_pipes = Vec::with_capacity(n_jobs as usize);
+            let mut job_meta = Vec::with_capacity(n_jobs as usize);
             let mut qi = 0u32;
             for batch in &batches {
                 for job in batch {
-                    job_pipes.push(job.pipe);
+                    job_meta.push((job.pipe, job.gy));
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: None,
                         timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
@@ -947,7 +947,7 @@ impl GpuModel {
             }
             enc.resolve_query_set(&qs, 0..qcount, &qbuf, 0);
             gpu.queue.submit([enc.finish()]);
-            split = Some((qs, qbuf, qcount, job_pipes));
+            split = Some((qs, qbuf, qcount, job_meta));
         } else {
             for batch in &batches {
                 if batch.is_empty() {
@@ -974,21 +974,33 @@ impl GpuModel {
         if let Some(e) = pollster::block_on(guard.pop()) {
             anyhow::bail!("gpu validation: {e}");
         }
-        if let Some((_qs, qbuf, qcount, job_pipes)) = split {
+        if let Some((_qs, qbuf, qcount, job_meta)) = split {
             let bytes = gpu.readback(&qbuf, qcount as u64 * 8)?;
             let ticks: &[u64] = bytemuck::cast_slice(&bytes);
             let period = gpu.queue.get_timestamp_period() as f64;
             let names = [
                 "gemm", "conv_gemm", "conv0", "pos", "ln", "gelu", "add", "softmax", "logsoftmax",
-                "transpose", "copy",
+                "transpose", "copy", "  scores", "  pv", "  gemm-main",
             ];
-            let mut acc = [0f64; 11];
-            let mut cnt = [0u32; 11];
-            for (i, &p) in job_pipes.iter().enumerate() {
+            let mut acc = [0f64; 14];
+            let mut cnt = [0u32; 14];
+            for (i, &(p, gy)) in job_meta.iter().enumerate() {
                 let dt = ticks[i * 2 + 1].saturating_sub(ticks[i * 2]) as f64 * period / 1e6;
                 if p < acc.len() {
-                    acc[p] += dt;
-                    cnt[p] += 1;
+                    // split the gemm pipeline by dispatch shape: pv is n=64
+                    // (gy=1), scores is n=t, everything else is a main GEMM
+                    let mut b = p;
+                    if p == P_GEMM {
+                        b = if gy == 1 {
+                            12
+                        } else if gy == (t as u32).div_ceil(shaders::NT) {
+                            11
+                        } else {
+                            13
+                        };
+                    }
+                    acc[b] += dt;
+                    cnt[b] += 1;
                 }
             }
             let total: f64 = acc.iter().sum();
