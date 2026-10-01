@@ -60,25 +60,65 @@ impl AlignmentResult {
 /// One trellis row. `skip_dead[st] == u64::MAX` forbids the skip arc.
 /// Tie-break matches numpy `argmax` over `[stay, advance, skip]`: the first
 /// maximum wins, so stay beats advance beats skip.
+///
+/// `back_row` holds that row's backpointers **2 bits per state** (stay 0,
+/// advance 1, skip 2), four states to a byte — the packing the reference C++
+/// aligner uses.  It is the one structure that grows with the audio *and* with
+/// the transcript (T×(2·tokens+1)), so the 4x is what keeps an hour of audio
+/// inside RAM: 15 m goes 1.44 GB → 360 MB.
+#[inline]
+fn put_back(row: &mut [u8], st: usize, choice: u8) {
+    let i = st >> 2;
+    let sh = (st & 3) * 2;
+    row[i] = (row[i] & !(0b11u8 << sh)) | (choice << sh);
+}
+
+/// Store a whole packed byte — four states' choices at once.
+///
+/// Nothing here reads the buffer first: the DP fills a row before the
+/// traceback reads it, and every byte the traceback can reach is written
+/// wholesale (the vector loop by four states, the 0..3 and tail groups
+/// below), so the allocation can stay uninitialised instead of costing a
+/// 360 MB memset on the 15 m fixture.
+#[inline]
+fn put_back_byte(row: &mut [u8], byte_index: usize, byte: u8) {
+    row[byte_index] = byte;
+}
+
+/// The backpointer choice recorded for `(t, st)`.
+#[inline]
+fn get_back(row: &[u8], st: usize) -> usize {
+    ((row[st >> 2] >> ((st & 3) * 2)) & 0b11u8) as usize
+}
+
+/// Bytes one row of `states` states occupies in the packed store.
+#[inline]
+fn row_bytes(states: usize) -> usize {
+    states.div_ceil(4)
+}
+
+/// Move each of the low four bits to bit `2·i`, so a movemask's four lanes
+/// land in four 2-bit fields of one byte.
+#[inline]
+fn spread2(x: u8) -> u8 {
+    let x = x & 0x0f;
+    let x = (x | (x << 2)) & 0x33;
+    (x | (x << 1)) & 0x55
+}
+
 fn dp_row_scalar(prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [f64], back: &mut [u8]) {
     let s = prev.len();
-    for st in 0..s {
-        let stay = prev[st];
-        let adv = if st >= 1 { prev[st - 1] } else { f64::NEG_INFINITY };
-        let skip = if st >= 2 && skip_dead[st] == 0 {
-            prev[st - 2]
-        } else {
-            f64::NEG_INFINITY
-        };
-        let (choice, best) = if stay >= adv && stay >= skip {
-            (0u8, stay)
-        } else if adv >= skip {
-            (1, adv)
-        } else {
-            (2, skip)
-        };
-        back[st] = choice;
-        next[st] = best + emit[st];
+    let mut st = 0;
+    while st < s {
+        let mut byte = 0u8;
+        for k in 0..4 {
+            if st + k >= s {
+                break;
+            }
+            byte |= dp_one(st + k, prev, emit, skip_dead, next) << (k * 2);
+        }
+        put_back_byte(back, st >> 2, byte);
+        st += 4;
     }
 }
 
@@ -91,15 +131,17 @@ unsafe fn dp_row_avx2(prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut 
         _CMP_GE_OQ,
     };
     let s = prev.len();
-    // States 0 and 1 have no legal skip; the vector loop starts where st-2 is in range.
+    // states 0..3 fill byte 0 (the vector loop needs st-2 in range, so it can
+    // only start at 4 — which is also the first group that owns a whole byte)
     if s > 0 {
-        dp_one(0, prev, emit, skip_dead, next, back);
-    }
-    if s > 1 {
-        dp_one(1, prev, emit, skip_dead, next, back);
+        let mut byte = 0u8;
+        for k in 0..s.min(4) {
+            byte |= dp_one(k, prev, emit, skip_dead, next) << (k * 2);
+        }
+        put_back_byte(back, 0, byte);
     }
     let neginf = _mm256_set1_pd(f64::NEG_INFINITY);
-    let mut st = 2;
+    let mut st = 4;
     while st + 4 <= s {
         let stay = _mm256_loadu_pd(prev.as_ptr().add(st));
         let adv = _mm256_loadu_pd(prev.as_ptr().add(st - 1));
@@ -114,27 +156,33 @@ unsafe fn dp_row_avx2(prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut 
         let best = _mm256_blendv_pd(adv_or_skip, stay, stay_wins);
         let out = _mm256_add_pd(best, _mm256_loadu_pd(emit.as_ptr().add(st)));
         _mm256_storeu_pd(next.as_mut_ptr().add(st), out);
-        let stay_mask = _mm256_movemask_pd(stay_wins);
-        let adv_mask = _mm256_movemask_pd(adv_ge_skip);
-        for lane in 0..4 {
-            let bit = 1 << lane;
-            back[st + lane] = if stay_mask & bit != 0 {
-                0
-            } else if adv_mask & bit != 0 {
-                1
-            } else {
-                2
-            };
-        }
+        // 2 bits per state, four states to a byte: stay = 0b00, advance = 0b01,
+        // skip = 0b10.  The high bit of a field is the skip bit, the low one
+        // the advance bit; `adv_ge_skip` is also true when stay wins (the
+        // scalar tie-break checks stay first), so it only counts when stay
+        // does not.  Six branch-free ops, no per-lane loop.
+        let stay_mask = _mm256_movemask_pd(stay_wins) as u8 & 0x0f;
+        let adv_mask = _mm256_movemask_pd(adv_ge_skip) as u8 & 0x0f;
+        let skip_mask = !(stay_mask | adv_mask) & 0x0f;
+        let adv_only = adv_mask & !stay_mask & 0x0f;
+        // spread each lane's two bits into its own 2-bit field (lane L ->
+        // bits 2L, 2L+1) before combining
+        back[st >> 2] = (spread2(skip_mask) << 1) | spread2(adv_only);
         st += 4;
     }
-    while st < s {
-        dp_one(st, prev, emit, skip_dead, next, back);
-        st += 1;
+    if st < s {
+        // the tail lives in the row's last byte; the states past `s` in it are
+        // never read, so the whole byte can be written without reading first
+        let mut byte = 0u8;
+        while st < s {
+            byte |= dp_one(st, prev, emit, skip_dead, next) << ((st & 3) * 2);
+            st += 1;
+        }
+        put_back_byte(back, st >> 2, byte);
     }
 }
 
-fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [f64], back: &mut [u8]) {
+fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [f64]) -> u8 {
     let stay = prev[st];
     let adv = if st >= 1 { prev[st - 1] } else { f64::NEG_INFINITY };
     let skip = if st >= 2 && skip_dead[st] == 0 {
@@ -149,8 +197,8 @@ fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [
     } else {
         (2, skip)
     };
-    back[st] = choice;
     next[st] = best + emit[st];
+    choice
 }
 
 /// `l' = [blank, t1, blank, ..., tL, blank]`
@@ -432,13 +480,17 @@ fn align(
         }
     }
 
-    // 0 = stay, 1 = from s-1, 2 = from s-2. Row 0 is never read (traceback
-    // starts at t >= 1); every later row is written in full before that.
-    let nback = t_len.checked_mul(s).context("backpointer size")?;
+    // 0 = stay, 1 = from s-1, 2 = from s-2, two bits each (see `put_back`).
+    // Row 0 is never read (traceback starts at t >= 1); every later row is
+    // written in full before that.
+    let rb = row_bytes(s);
+    let nback = t_len.checked_mul(rb).context("backpointer size")?;
     let mut back: Vec<u8> = Vec::new();
     back.try_reserve_exact(nback).context("backpointer alloc")?;
-    // SAFETY: u8 has no destructor and no invalid bit patterns. Traceback
-    // reads only rows t >= 1, and the DP writes each of those rows completely.
+    // SAFETY: u8 has no destructor and no invalid bit patterns. Row 0 is never
+    // read (the traceback starts at t >= 1), and every later row is written
+    // whole — `put_back_byte` stores bytes without reading them first — before
+    // the traceback touches that row.
     unsafe { back.set_len(nback) };
 
     // All-ones lane => skip is illegal (force -inf). Zero => skip is allowed.
@@ -455,7 +507,7 @@ fn align(
     let use_avx2 = std::is_x86_feature_detected!("avx2");
     for t in 1..t_len {
         em.fill_emit(t, &mut emit, token_ids);
-        let back_row = &mut back[t * s..(t + 1) * s];
+        let back_row = &mut back[t * rb..(t + 1) * rb];
         #[cfg(target_arch = "x86_64")]
         if use_avx2 {
             // SAFETY: use_avx2 is the runtime AVX2 check.
@@ -480,7 +532,7 @@ fn align(
     states[t_len - 1] = s_end as i32;
     let mut cur = s_end;
     for t in (1..t_len).rev() {
-        cur -= back[t * s + cur] as usize;
+        cur -= get_back(&back[t * rb..(t + 1) * rb], cur);
         states[t - 1] = cur as i32;
     }
 
@@ -593,28 +645,29 @@ mod tests {
         let emit = [0.0, 0.0, 0.0];
         let skip_dead = [u64::MAX, u64::MAX, 0];
         let mut next = [0.0; 3];
-        let mut back = [9u8; 3];
+        let mut back = [0xffu8; 1]; // one packed byte covers 3 states
+        let choice = |b: &[u8]| get_back(b, 2);
         // st=2: stay=prev[2], advance=prev[1], skip=prev[0]
         // stay == advance > skip -> stay
         let prev = [0.0, 1.0, 1.0];
         dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
-        assert_eq!(back[2], 0, "equal stay and advance keeps stay");
+        assert_eq!(choice(&back), 0, "equal stay and advance keeps stay");
 
         // stay < advance == skip -> advance
         let prev = [5.0, 5.0, 0.0];
         dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
-        assert_eq!(back[2], 1, "equal advance and skip keeps advance");
+        assert_eq!(choice(&back), 1, "equal advance and skip keeps advance");
 
         // stay < advance < skip -> skip
         let prev = [9.0, 4.0, 0.0];
         dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
-        assert_eq!(back[2], 2);
+        assert_eq!(choice(&back), 2);
 
         // dead skip cannot win even if prev[st-2] is larger
         let prev = [9.0, 1.0, 0.0];
         let skip_dead = [u64::MAX, u64::MAX, u64::MAX];
         dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
-        assert_eq!(back[2], 1);
+        assert_eq!(choice(&back), 1);
     }
 
     #[test]
@@ -624,14 +677,24 @@ mod tests {
             return;
         }
         let (prev, emit, skip_dead) = sample_row();
-        let mut n1 = vec![0.0; prev.len()];
-        let mut b1 = vec![9u8; prev.len()];
-        let mut n2 = vec![0.0; prev.len()];
-        let mut b2 = vec![9u8; prev.len()];
+        let s = prev.len();
+        let mut n1 = vec![0.0; s];
+        let mut b1 = vec![9u8; row_bytes(s)];
+        let mut n2 = vec![0.0; s];
+        let mut b2 = vec![9u8; row_bytes(s)];
         dp_row_scalar(&prev, &emit, &skip_dead, &mut n1, &mut b1);
         unsafe { dp_row_avx2(&prev, &emit, &skip_dead, &mut n2, &mut b2) };
-        assert_eq!(b1, b2);
-        for i in 0..prev.len() {
+        // the vector loop writes whole bytes, so compare the decoded choices
+        for i in 0..s {
+            assert_eq!(
+                get_back(&b1, i),
+                get_back(&b2, i),
+                "backpointer {i}: {:#04x} vs {:#04x}",
+                get_back(&b1, i),
+                get_back(&b2, i)
+            );
+        }
+        for i in 0..s {
             assert!(
                 n1[i] == n2[i] || (n1[i].is_nan() && n2[i].is_nan()),
                 "score {i}: {} vs {}",

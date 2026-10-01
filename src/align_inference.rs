@@ -189,6 +189,17 @@ impl Aligner {
             }
         };
         let align_s = t_al.elapsed().as_secs_f64();
+        if crate::alloc_stats::enabled() {
+            // the per-chunk prints stop at the end of the encode; the DP's
+            // backpointers are allocated after that, so the run's real high
+            // water mark only shows here
+            let (live, peak) = crate::alloc_stats::stats();
+            eprintln!(
+                "[alloc] after dp: live {live:>12} peak {peak:>12}  ({} states x {} frames)",
+                expanded.len(),
+                res.frames
+            );
+        }
 
         fix_timestamp(&mut res.tokens);
         let words = build_words(&res.tokens);
