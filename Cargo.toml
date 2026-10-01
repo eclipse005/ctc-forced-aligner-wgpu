@@ -28,6 +28,13 @@ gemm = "0.18"
 rayon = "1.10"
 libm = "0.2"
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "rtfx"
+harness = false
+
 [profile.release]
 debug = false
 codegen-units = 1
