@@ -21,7 +21,7 @@ pub struct Gpu {
     readback_staging: std::sync::Mutex<Option<(wgpu::Buffer, u64)>>,
 }
 
-/// Which device to run on: `auto`, `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, name.
+/// One device: `auto`, `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DeviceSelector {
     #[default]
@@ -45,6 +45,9 @@ impl DeviceSelector {
         let s = spec.trim();
         if s.is_empty() || s.eq_ignore_ascii_case("auto") {
             return Ok(Self::Auto);
+        }
+        if s.eq_ignore_ascii_case("dual") {
+            bail!("one device only");
         }
         if s.eq_ignore_ascii_case("cpu") {
             return Ok(Self::Cpu);
@@ -117,6 +120,27 @@ async fn adapters_for(selector: &DeviceSelector) -> Vec<wgpu::Adapter> {
         DeviceSelector::Cpu => Vec::new(),
     }
 }
+
+fn is_real_gpu(info: &wgpu::AdapterInfo) -> bool {
+    matches!(
+        info.device_type,
+        wgpu::DeviceType::DiscreteGpu
+            | wgpu::DeviceType::IntegratedGpu
+            | wgpu::DeviceType::VirtualGpu
+    )
+}
+
+/// `auto` found no GPU. The aligner then uses the host tower.
+#[derive(Debug)]
+pub struct NoGpuError;
+
+impl std::fmt::Display for NoGpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no wgpu gpu")
+    }
+}
+
+impl std::error::Error for NoGpuError {}
 
 fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
     let class = match info.device_type {
@@ -213,6 +237,9 @@ impl Gpu {
         }
         let adapters = adapters_for(&selector).await;
         if adapters.is_empty() {
+            if selector == DeviceSelector::Auto {
+                return Err(NoGpuError.into());
+            }
             bail!("no wgpu adapters found (selector {selector:?})");
         }
 
@@ -228,7 +255,11 @@ impl Gpu {
                 let mut hits: Vec<&wgpu::Adapter> = adapters
                     .iter()
                     .filter(|a| sel.matches(&a.get_info()))
+                    .filter(|a| !matches!(sel, DeviceSelector::Auto) || is_real_gpu(&a.get_info()))
                     .collect();
+                if hits.is_empty() && matches!(sel, DeviceSelector::Auto) {
+                    return Err(NoGpuError.into());
+                }
                 if hits.is_empty() {
                     bail!("no adapter (visible: {})", list_names(&adapters));
                 }
@@ -530,5 +561,21 @@ impl<'a> BulkUpload<'a> {
         }
         self.pending = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceSelector;
+
+    #[test]
+    fn one_device_only() {
+        assert!(DeviceSelector::parse("dual").is_err());
+        assert!(matches!(DeviceSelector::parse("auto").unwrap(), DeviceSelector::Auto));
+        assert!(matches!(DeviceSelector::parse("cpu").unwrap(), DeviceSelector::Cpu));
+        assert!(matches!(
+            DeviceSelector::parse("vulkan:0").unwrap(),
+            DeviceSelector::Runtime { index: 0, .. }
+        ));
     }
 }

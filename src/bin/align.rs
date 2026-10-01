@@ -17,7 +17,7 @@ usage: align --audio <wav> (--text <text|file>) [options]
   --model <dir>            model directory (default: $CTC_MODEL_DIR or the bundled checkpoint)
   --window <sec>           windowed encoding (default: 30; 0 = whole file)
   --context <sec>          context on each side of a window (default: 2)
-  --device <spec>          auto (default), cpu, vulkan[:i], dx12[:i], #n, or a name substring
+  --device <spec>          one device: auto (default, cpu if no gpu), cpu, vulkan[:i], dx12[:i], #n, or a name substring
   --format <json|spans|srt|cues>
                            json is the tight alignment (default)
   --split <word|char|sentence>
@@ -103,13 +103,9 @@ fn main() -> Result<()> {
     };
 
     let t0 = std::time::Instant::now();
-    let aligner = if device.eq_ignore_ascii_case("dual") {
-        Aligner::load_dual(&model_dir)
-    } else {
-        let selector = DeviceSelector::parse(&device)?;
-        Aligner::load_on(&model_dir, selector)
-    }
-    .with_context(|| format!("load model from {}", model_dir.display()))?;
+    let selector = DeviceSelector::parse(&device)?;
+    let aligner = Aligner::load_on(&model_dir, selector)
+        .with_context(|| format!("load model from {}", model_dir.display()))?;
     let load_s = t0.elapsed().as_secs_f64();
 
     let out = aligner.align(&audio, &text, window, context)?;

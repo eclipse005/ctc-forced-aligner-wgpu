@@ -17,13 +17,11 @@ use crate::vocab::Vocab;
 use crate::wav2vec2::Model;
 use crate::wav2vec2_gpu::GpuModel;
 
-/// The model, on either backend.  Both towers are token-identical to the
+/// The model on one backend. Both towers are token-identical to the
 /// Python reference (see tests/golden.rs).
 pub enum Tower {
     Cpu(Model),
     Gpu(GpuModel),
-    /// Two different GPUs. Chunks are paired across them.
-    Dual(GpuModel, GpuModel),
 }
 
 pub const FRAME_RATE: f64 = 50.0;
@@ -75,57 +73,27 @@ impl Aligner {
         Self::load_on(model_dir, DeviceSelector::Cpu)
     }
 
-    /// Explicit backend: `Cpu` or any wgpu selector (`auto`, `vulkan:0`, ...).
+    /// One backend. `Auto` uses a single wgpu GPU, or the CPU tower when none is present.
     pub fn load_on(model_dir: &Path, selector: DeviceSelector) -> Result<Self> {
         let tower = match selector {
             DeviceSelector::Cpu => Tower::Cpu(Model::load(model_dir)?),
-            _ => Tower::Gpu(GpuModel::load(model_dir, selector)?),
+            DeviceSelector::Auto => match GpuModel::load(model_dir, DeviceSelector::Auto) {
+                Ok(gpu) => Tower::Gpu(gpu),
+                Err(e) if e.downcast_ref::<crate::gpu::NoGpuError>().is_some() => {
+                    Tower::Cpu(Model::load(model_dir)?)
+                }
+                Err(e) => return Err(e),
+            },
+            other => Tower::Gpu(GpuModel::load(model_dir, other)?),
         };
         let vocab = Vocab::load(model_dir)?;
         Ok(Self { tower, vocab, model_dir: model_dir.to_path_buf() })
-    }
-
-    /// Vulkan device 0 and DX12 device 0, when they are different cards.
-    /// The same card exposed twice stays on the Vulkan one.
-    pub fn load_dual(model_dir: &Path) -> Result<Self> {
-        let primary = GpuModel::load(model_dir, DeviceSelector::parse("vulkan:0")?)?;
-        let secondary = match GpuModel::load(model_dir, DeviceSelector::parse("dx12:0")?) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("second gpu unavailable ({e:#}); using {}", primary.describe());
-                let vocab = Vocab::load(model_dir)?;
-                return Ok(Self {
-                    tower: Tower::Gpu(primary),
-                    vocab,
-                    model_dir: model_dir.to_path_buf(),
-                });
-            }
-        };
-        if primary.adapter_name() == secondary.adapter_name() {
-            eprintln!(
-                "vulkan:0 and dx12:0 are both {}; using one device",
-                primary.adapter_name()
-            );
-            let vocab = Vocab::load(model_dir)?;
-            return Ok(Self {
-                tower: Tower::Gpu(primary),
-                vocab,
-                model_dir: model_dir.to_path_buf(),
-            });
-        }
-        let vocab = Vocab::load(model_dir)?;
-        Ok(Self {
-            tower: Tower::Dual(primary, secondary),
-            vocab,
-            model_dir: model_dir.to_path_buf(),
-        })
     }
 
     pub fn backend_name(&self) -> &'static str {
         match self.tower {
             Tower::Cpu(_) => "cpu",
             Tower::Gpu(_) => "wgpu",
-            Tower::Dual(_, _) => "dual",
         }
     }
 
@@ -133,14 +101,13 @@ impl Aligner {
         match &self.tower {
             Tower::Cpu(_) => "cpu".to_string(),
             Tower::Gpu(g) => g.describe(),
-            Tower::Dual(a, b) => format!("{} + {}", a.describe(), b.describe()),
         }
     }
 
     pub fn config(&self) -> &Wav2Vec2Config {
         match &self.tower {
             Tower::Cpu(m) => &m.cfg,
-            Tower::Gpu(g) | Tower::Dual(g, _) => &g.cfg,
+            Tower::Gpu(g) => &g.cfg,
         }
     }
 
@@ -152,7 +119,7 @@ impl Aligner {
     fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
         match &self.tower {
             Tower::Cpu(m) => Ok(m.forward(input, &Default::default())?.0),
-            Tower::Gpu(g) | Tower::Dual(g, _) => g.forward(input),
+            Tower::Gpu(g) => g.forward(input),
         }
     }
 
@@ -315,16 +282,10 @@ impl Aligner {
         }
 
         let vocab = self.config().vocab_size;
-        let encoded = match &self.tower {
-            Tower::Dual(a, b) => forward_pair(a, b, &chunks)?,
-            _ => {
-                let mut out = Vec::with_capacity(chunks.len());
-                for chunk in &chunks {
-                    out.push(self.forward(chunk)?);
-                }
-                out
-            }
-        };
+        let mut encoded = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            encoded.push(self.forward(chunk)?);
+        }
         let mut out: Vec<f32> = Vec::new();
         for lp in &encoded {
             let keep_lo = ctx_frames;
@@ -340,30 +301,4 @@ impl Aligner {
         }
         Ok(out)
     }
-}
-
-/// One chunk on each GPU at a time. Odd tail stays on the first device.
-fn forward_pair(a: &GpuModel, b: &GpuModel, chunks: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-    let mut out = Vec::with_capacity(chunks.len());
-    let mut i = 0;
-    while i < chunks.len() {
-        if i + 1 < chunks.len() {
-            let i0 = i;
-            let (left, right) = std::thread::scope(|scope| {
-                let h0 = scope.spawn(|| a.forward(&chunks[i0]));
-                let h1 = scope.spawn(|| b.forward(&chunks[i0 + 1]));
-                (
-                    h0.join().expect("gpu thread"),
-                    h1.join().expect("gpu thread"),
-                )
-            });
-            out.push(left?);
-            out.push(right?);
-            i += 2;
-        } else {
-            out.push(a.forward(&chunks[i])?);
-            i += 1;
-        }
-    }
-    Ok(out)
 }
