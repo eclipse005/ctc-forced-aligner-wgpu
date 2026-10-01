@@ -99,64 +99,9 @@ pub struct Stages {
 }
 
 // ---------------------------------------------------------------------------
-// fast exp / erf
-//
-// exp(x) = 2^(x·log2e): split into k = round(x·log2e) and f ∈ [-0.5, 0.5),
-// 2^k via exponent bits and 2^f via a degree-7 Taylor series (rel err
-// ~5e-9, below the f32 rounding).  All call sites pass x <= 0, so only
-// the underflow side needs care.
+// fast exp / erf live in `crate::simd` next to their AVX2 twins; the scalar
+// wrappers below only route between the SIMD path and the scalar fallback.
 // ---------------------------------------------------------------------------
-
-const LOG2_E: f32 = 1.4426950408889634;
-const LN2: f64 = 0.6931471805599453;
-const E1: f32 = LN2 as f32;
-const E2: f32 = (LN2 * LN2 / 2.0) as f32;
-const E3: f32 = (LN2 * LN2 * LN2 / 6.0) as f32;
-const E4: f32 = (LN2 * LN2 * LN2 * LN2 / 24.0) as f32;
-const E5: f32 = (LN2 * LN2 * LN2 * LN2 * LN2 / 120.0) as f32;
-const E6: f32 = (LN2 * LN2 * LN2 * LN2 * LN2 * LN2 / 720.0) as f32;
-const E7: f32 = (LN2 * LN2 * LN2 * LN2 * LN2 * LN2 * LN2 / 5040.0) as f32;
-
-#[inline]
-pub(crate) fn fast_exp(x: f32) -> f32 {
-    let xf = x * LOG2_E;
-    // round to nearest integer via the 1.5·2^23 magic number
-    let k = (xf + 12582912.0) - 12582912.0;
-    if k < -126.0 {
-        return 0.0; // true result is subnormal; the sum is unaffected
-    }
-    let f = xf - k;
-    let p = E7 * f + E6;
-    let p = p * f + E5;
-    let p = p * f + E4;
-    let p = p * f + E3;
-    let p = p * f + E2;
-    let p = p * f + E1;
-    let p = p * f + 1.0;
-    let scale = f32::from_bits((((k + 127.0) as i32) as u32) << 23);
-    scale * p
-}
-
-/// Abramowitz & Stegun 7.1.26 (max abs err 1.5e-7, same class as libm erff).
-#[inline]
-pub(crate) fn fast_erf(x: f32) -> f32 {
-    let ax = x.abs();
-    if ax > 5.0 {
-        // exp(-25) = 1.4e-11: erf is ±1 to f32 precision
-        return if x < 0.0 { -1.0 } else { 1.0 };
-    }
-    let t = 1.0 / (1.0 + 0.327_591_1 * ax);
-    let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t)
-            * fast_exp(-ax * ax);
-    if x < 0.0 {
-        -y
-    } else {
-        y
-    }
-}
 
 fn gelu(x: &mut [f32]) {
     // AVX2 path: erf via polynomial, 8 lanes per iteration.  The feature
@@ -172,7 +117,7 @@ fn gelu(x: &mut [f32]) {
     x.par_chunks_mut(1 << 14).for_each(|chunk| {
         for v in chunk.iter_mut() {
             // exact gelu: 0.5*x*(1+erf(x/sqrt(2)))
-            *v = 0.5 * *v * (1.0 + fast_erf(*v / std::f32::consts::SQRT_2));
+            *v = 0.5 * *v * (1.0 + crate::simd::fast_erf(*v / std::f32::consts::SQRT_2));
         }
     });
 }
@@ -199,7 +144,7 @@ fn softmax_row(row: &mut [f32]) {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for sc in row.iter_mut() {
-        *sc = fast_exp(*sc - max);
+        *sc = crate::simd::fast_exp(*sc - max);
         sum += *sc;
     }
     let inv = 1.0 / sum;
@@ -219,7 +164,7 @@ fn log_softmax_row(row: &mut [f32]) {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for x in row.iter() {
-        sum += fast_exp(*x - max);
+        sum += crate::simd::fast_exp(*x - max);
     }
     let lsum = sum.ln();
     for x in row.iter_mut() {
