@@ -25,6 +25,7 @@
 
 mod forward;
 mod kernels;
+pub(crate) mod prof;
 
 pub use forward::Scratch;
 
@@ -110,6 +111,12 @@ impl Model {
             cfg.hidden_size % 64 == 0,
             "hidden_size {} not divisible by 64 (K^T banding)",
             cfg.hidden_size
+        );
+        // the CPU phase profiler has one slot per conv layer (CONV0..CONV6)
+        anyhow::ensure!(
+            cfg.conv_kernel.len() <= 7,
+            "conv stack has {} layers, profiler tracks 7",
+            cfg.conv_kernel.len()
         );
         let tensors = crate::weights::load_tensors(model_dir)?;
 

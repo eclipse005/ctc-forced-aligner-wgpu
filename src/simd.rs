@@ -147,6 +147,31 @@ pub mod avx2 {
     /// Softmax one row in place.
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_inplace(row: &mut [f32]) -> f32 {
+        let sum = softmax_exp_sum_inplace(row);
+        let inv = _mm256_set1_ps(1.0 / sum);
+        let mut chunks = row.chunks_exact_mut(8);
+        for chunk in chunks.by_ref() {
+            _mm256_storeu_ps(
+                chunk.as_mut_ptr(),
+                _mm256_mul_ps(_mm256_loadu_ps(chunk.as_ptr()), inv),
+            );
+        }
+        for v in chunks.into_remainder() {
+            *v *= 1.0 / sum;
+        }
+        sum
+    }
+
+    /// Softmax pass 1 only: scale by `exp(x - max)` in place and return the
+    /// row sum.  The normalisation is folded into the attention output
+    /// instead — dividing the (t, 64) attention tile rows costs 336 MB per
+    /// chunk, versus ~8.9 GB of L3 traffic for a third sweep over the
+    /// (t, t) score tiles.
+    ///
+    /// Same lane structure as [`softmax_inplace`], so the exp values and the
+    /// sum are identical.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn softmax_exp_sum_inplace(row: &mut [f32]) -> f32 {
         let mut max = f32::NEG_INFINITY;
         for v in row.iter() {
             max = max.max(*v);
@@ -166,19 +191,7 @@ pub mod avx2 {
             *v = e;
             tail_sum += e;
         }
-        let sum = reduce_sum(acc) + tail_sum;
-        let inv = _mm256_set1_ps(1.0 / sum);
-        let mut chunks = row.chunks_exact_mut(8);
-        for chunk in chunks.by_ref() {
-            _mm256_storeu_ps(
-                chunk.as_mut_ptr(),
-                _mm256_mul_ps(_mm256_loadu_ps(chunk.as_ptr()), inv),
-            );
-        }
-        for v in chunks.into_remainder() {
-            *v *= 1.0 / sum;
-        }
-        sum
+        reduce_sum(acc) + tail_sum
     }
 
     /// log_softmax one row in place: x - max - ln(sum(exp(x - max))).
@@ -210,6 +223,62 @@ pub mod avx2 {
         }
         for v in chunks.into_remainder() {
             *v -= max + lsum;
+        }
+    }
+
+    /// Fused lm-head epilogue for one row:
+    /// `out[j] = log_softmax(x + bias)[cols[j]]`.
+    ///
+    /// Same lane structure as [`log_softmax_inplace`]: serial max over the
+    /// biased row, 8-lane exp sums, `out = (x+b) - (max + ln(sum))` on the
+    /// gathered columns only.
+    ///
+    /// # Safety
+    /// `x` and `bias` must have the same length; every index in `cols` must be
+    /// in bounds for both; `out` must hold `cols.len()` floats.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn log_softmax_gather_inplace(
+        x: &[f32],
+        bias: &[f32],
+        cols: &[i32],
+        out: &mut [f32],
+    ) {
+        let mut max = f32::NEG_INFINITY;
+        for (v, b) in x.iter().zip(bias) {
+            max = max.max(*v + *b);
+        }
+        let maxv = _mm256_set1_ps(max);
+        let mut acc = _mm256_setzero_ps();
+        let mut chunks = x.chunks_exact(8);
+        let mut bchunks = bias.chunks_exact(8);
+        for (c, bc) in chunks.by_ref().zip(bchunks.by_ref()) {
+            let e = exp8(_mm256_sub_ps(
+                _mm256_add_ps(_mm256_loadu_ps(c.as_ptr()), _mm256_loadu_ps(bc.as_ptr())),
+                maxv,
+            ));
+            acc = _mm256_add_ps(acc, e);
+        }
+        let mut tail_sum = 0.0f32;
+        for (v, b) in chunks.remainder().iter().zip(bchunks.remainder().iter()) {
+            tail_sum += super::fast_exp(*v + *b - max);
+        }
+        let c = max + (reduce_sum(acc) + tail_sum).ln();
+        let cv = _mm256_set1_ps(c);
+        let mut ci = 0;
+        while ci + 8 <= cols.len() {
+            let idx = _mm256_loadu_si256(cols.as_ptr().add(ci) as *const __m256i);
+            let g = _mm256_i32gather_ps(x.as_ptr(), idx, 4);
+            let gb = _mm256_i32gather_ps(bias.as_ptr(), idx, 4);
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(ci),
+                _mm256_sub_ps(_mm256_add_ps(g, gb), cv),
+            );
+            ci += 8;
+        }
+        // scalar remainder after the 8-lane gathers
+        for j in ci..cols.len() {
+            let st = cols[j] as usize;
+            out[j] = x[st] + bias[st] - c;
         }
     }
 

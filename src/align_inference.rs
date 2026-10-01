@@ -163,6 +163,11 @@ impl Aligner {
         let t_enc = std::time::Instant::now();
         let gathered = self.log_probs_gathered(&waveform, window_sec, context_sec, &expanded)?;
         let encode_s = t_enc.elapsed().as_secs_f64();
+        crate::wav2vec2::prof::dump(&format!(
+            "{} [{}]",
+            audio_path.display(),
+            self.backend_name()
+        ));
         let t_al = std::time::Instant::now();
         let states = expanded.len();
         let mut res = ctc_forced_align_gathered(
@@ -272,16 +277,9 @@ impl Aligner {
     ) -> Result<Vec<f32>> {
         match &self.tower {
             Tower::Cpu(m) => {
-                let (log_probs, _) = m.forward_with(input, &Default::default(), scratch)?;
-                let v = self.config().vocab_size;
-                let frames = log_probs.len() / v;
-                let mut g = Vec::with_capacity(frames * expanded.len());
-                for f in 0..frames {
-                    let row = &log_probs[f * v..(f + 1) * v];
-                    for &st in expanded {
-                        g.push(row[st]);
-                    }
-                }
+                // The gathered epilogue is fused into the forward's lm head:
+                // the (t, vocab) log-prob matrix is never materialised.
+                let (g, _) = m.forward_gathered_with(input, &Default::default(), scratch, expanded)?;
                 Ok(g)
             }
             Tower::Gpu(gpu_model) => {

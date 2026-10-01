@@ -136,6 +136,35 @@ fn golden_stages_and_tokens() {
     let (ids, pieces) = aligner.vocab.tokenise(text);
     let vocab = aligner.config().vocab_size;
     let t_frames = log_probs.len() / vocab;
+
+    // gathered lm-head epilogue: the values the DP actually consumes.  The
+    // fused path must agree with a gather from the full log_probs above to
+    // within the GEMM's destination-add rounding.
+    {
+        let expanded = ctc_forced_aligner_wgpu::viterbi::build_expanded_labels(&ids, BLANK_ID);
+        let (g, _) = model
+            .forward_gathered_with(
+                &input,
+                &StageSet::default(),
+                &mut ctc_forced_aligner_wgpu::wav2vec2::Scratch::default(),
+                &expanded,
+            )
+            .unwrap();
+        assert_eq!(g.len(), t_frames * expanded.len(), "gathered shape");
+        let mut gmax = 0.0f64;
+        for f in 0..t_frames {
+            for (s, &st) in expanded.iter().enumerate() {
+                let d = (g[f * expanded.len() + s] - log_probs[f * vocab + st]).abs() as f64;
+                gmax = gmax.max(d);
+            }
+        }
+        println!(
+            "gathered epilogue vs full log_probs: max {gmax:.6} ({} states)",
+            expanded.len()
+        );
+        assert!(gmax < 1e-3, "gathered epilogue diverged: {gmax}");
+    }
+
     let res = ctc_forced_align(
         &log_probs,
         t_frames,
