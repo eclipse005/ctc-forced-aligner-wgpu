@@ -985,6 +985,18 @@ impl Emissions for LazyEmissions<'_> {
         }
     }
 
+    /// The band `[lo, hi]` only — on an hour's trellis the mid-file band is
+    /// the whole row, but the two ramps shrink the copy with it.
+    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, _token_ids: &[usize]) {
+        let s = self.blocks.num_states;
+        let (block, slice_lo, _) = self.slice_at(t);
+        let r = t % self.blocks.frames_per_chunk - slice_lo;
+        let row = &block[r * s..][..s];
+        for (e, &v) in emit[lo..=hi].iter_mut().zip(row[lo..=hi].iter()) {
+            *e = v as f64;
+        }
+    }
+
     /// One column of `t`'s row.  The slice holding `t` has to have been
     /// gathered at least once for its normaliser to exist — the DP reads frame
     /// 0's two states *before* its first `fill_emit`, so this may be what

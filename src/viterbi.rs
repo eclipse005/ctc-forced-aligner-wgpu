@@ -129,13 +129,48 @@ fn dp_row_par(
     emit: &[f64],
     skip_dead: &[u64],
     next: &mut [f64],
-    mut back: Option<&mut [u8]>,
+    back: Option<&mut [u8]>,
     use_avx2: bool,
 ) {
     let s = prev.len();
-    // states 0..head run first and serially: the vector kernel reads st-2, and
-    // 4 is also the first offset that owns a whole backpointer byte
-    let head = s.min(4);
+    dp_row_range(prev, emit, skip_dead, next, back, 0, s - 1, use_avx2)
+}
+
+/// States `[lo, hi]` of one row — the *band* the DP computes for frame `t`.
+/// The full-width driver is `dp_row_range(..., 0, s - 1, ...)`; the banded DP
+/// narrows the range to the states frame `t` can reach and that can still
+/// reach the end, which cuts the row work by ~1/3 on hour-long files while
+/// leaving every in-band value — and therefore the alignment — bit-identical.
+///
+/// `next` and `back` are the full row slices; ranges are rounded to the
+/// global 4-state byte grid, so every chunk owns whole backpointer bytes and
+/// the traceback indexes them exactly as the full-width run packed them.
+fn dp_row_range(
+    prev: &[f64],
+    emit: &[f64],
+    skip_dead: &[u64],
+    next: &mut [f64],
+    mut back: Option<&mut [u8]>,
+    lo: usize,
+    hi: usize,
+    use_avx2: bool,
+) {
+    let end = (hi + 1).min(next.len());
+    // The vector kernel reads prev[st-2] and writes whole 4-state bytes, so
+    // its ranges start on a 4-boundary.  The band may open mid-byte (the
+    // lower bound moves in steps of two from an odd state), so the first
+    // computed state rounds *down* to one: the fields below `lo` then hold
+    // garbage choices computed from stale alphas, which is safe because the
+    // traceback only ever visits in-band states.
+    let first = (lo >> 2) << 2;
+    if first >= 4 {
+        // the band opens past the row head: no scalar prologue needed
+        return dp_row_body(prev, emit, skip_dead, next, back, first, end, use_avx2);
+    }
+    // the band includes states 0..4: they run first and serially — the
+    // vector kernel reads st-2, and 4 is also the first offset that owns a
+    // whole backpointer byte
+    let head = end.min(4);
     if head > 0 {
         let mut byte = 0u8;
         for k in 0..head {
@@ -145,33 +180,49 @@ fn dp_row_par(
             put_back_byte(back, 0, byte);
         }
     }
-    if head >= s {
+    if head >= end {
         return;
     }
-    let states = &mut next[head..];
-    let bytes = back.as_deref_mut().map(|b| &mut b[1..]);
-    if s - head < PAR_ROW_MIN_STATES {
-        // too small to be worth splitting: one serial range from the head on
-        return dp_range(prev, emit, skip_dead, states, bytes, head, use_avx2);
+    dp_row_body(prev, emit, skip_dead, next, back, 4, end, use_avx2);
+}
+
+/// States `[st0, end)` of one row, split across threads when wide enough.
+fn dp_row_body(
+    prev: &[f64],
+    emit: &[f64],
+    skip_dead: &[u64],
+    next: &mut [f64],
+    back: Option<&mut [u8]>,
+    st0: usize,
+    end: usize,
+    use_avx2: bool,
+) {
+    if end - st0 < PAR_ROW_MIN_STATES {
+        // too small to be worth splitting: one serial range
+        let bytes = back.map(|b| &mut b[st0 >> 2..]);
+        return dp_range(prev, emit, skip_dead, &mut next[st0..end], bytes, st0, use_avx2);
     }
     let per = {
         // whole 4-groups, and enough of them to fill the pool
         let threads = rayon::current_num_threads().max(1);
-        (s - head).div_ceil(4).div_ceil(threads).max(1) * 4
+        (end - st0).div_ceil(4).div_ceil(threads).max(1) * 4
     };
+    let bytes = back.map(|b| &mut b[st0 >> 2..]);
     match bytes {
         // both halves are indexed by the chunk's own position; states are
         // 4-aligned, so the backpointer bytes are too
-        Some(bytes) => states
+        Some(bytes) => next[st0..end]
             .par_chunks_mut(per)
             .zip(bytes.par_chunks_mut(per / 4))
             .enumerate()
             .for_each(|(ci, (chunk, row))| {
-                dp_range(prev, emit, skip_dead, chunk, Some(row), head + ci * per, use_avx2)
+                dp_range(prev, emit, skip_dead, chunk, Some(row), st0 + ci * per, use_avx2)
             }),
-        None => states.par_chunks_mut(per).enumerate().for_each(|(ci, chunk)| {
-            dp_range(prev, emit, skip_dead, chunk, None, head + ci * per, use_avx2)
-        }),
+        None => next[st0..end].par_chunks_mut(per).enumerate().for_each(
+            |(ci, chunk)| {
+                dp_range(prev, emit, skip_dead, chunk, None, st0 + ci * per, use_avx2)
+            },
+        ),
     }
 }
 
@@ -328,6 +379,13 @@ pub fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec<usize>
 pub trait Emissions {
     /// Fill `emit[0..num_states]` with frame `t`'s state scores.
     fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]);
+    /// Fill `emit[lo..=hi]` — the band the banded DP reads.  The default
+    /// fills the whole row (of which the band is a subset); sources that pay
+    /// per-column work override it to touch the band only.
+    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, token_ids: &[usize]) {
+        let _ = (lo, hi);
+        self.fill_emit(t, emit, token_ids)
+    }
     /// Score of expanded state `st` at frame `t` (frame_scores, collapse).
     fn score(&self, t: usize, st: usize) -> f32;
     /// The path's per-frame scores, `out[t] = score(t, states[t])`.
@@ -367,6 +425,21 @@ impl Emissions for FullRows<'_> {
             emit[2 * i + 1] = row[tok] as f64;
         }
     }
+    /// Banded: blank over the band, then the token states that fall inside
+    /// it — the same values the full row holds on `[lo, hi]`.
+    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, token_ids: &[usize]) {
+        let row = &self.log_probs[t * self.vocab..(t + 1) * self.vocab];
+        emit[lo..=hi].fill(row[self.blank_id] as f64);
+        for (i, &tok) in token_ids.iter().enumerate() {
+            let st = 2 * i + 1;
+            if st > hi {
+                break;
+            }
+            if st >= lo {
+                emit[st] = row[tok] as f64;
+            }
+        }
+    }
     fn score(&self, t: usize, st: usize) -> f32 {
         self.log_probs[t * self.vocab + self.labels[st]]
     }
@@ -381,6 +454,13 @@ impl Emissions for GatheredRows<'_> {
     fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
         let row = &self.gathered[t * self.num_states..(t + 1) * self.num_states];
         for (e, &v) in emit.iter_mut().zip(row) {
+            *e = v as f64;
+        }
+    }
+    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, _token_ids: &[usize]) {
+        let s = self.num_states;
+        let row = &self.gathered[t * s..(t + 1) * s];
+        for (e, &v) in emit[lo..=hi].iter_mut().zip(row[lo..=hi].iter()) {
             *e = v as f64;
         }
     }
@@ -445,6 +525,13 @@ impl Emissions for GatheredChunks {
         let s = self.num_states;
         let row = &self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s..(t % self.frames_per_chunk + 1) * s];
         for (e, &v) in emit.iter_mut().zip(row) {
+            *e = v as f64;
+        }
+    }
+    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, _token_ids: &[usize]) {
+        let s = self.num_states;
+        let row = &self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s..(t % self.frames_per_chunk + 1) * s];
+        for (e, &v) in emit[lo..=hi].iter_mut().zip(row[lo..=hi].iter()) {
             *e = v as f64;
         }
     }
@@ -550,11 +637,21 @@ pub fn ctc_forced_align_emissions(
 /// serves the single pass and the per-segment recompute of the linear-space
 /// traceback — the two produce the same choices, since a recompute sees the
 /// same alpha it started from.
+///
+/// With `band` on, each frame computes only the states it can reach and that
+/// can still reach the end ([`Dp::band`]) — every in-band alpha, and hence
+/// every backpointer choice and the final path, is bit-identical to the
+/// full-width row, because a banded -inf sits exactly where the full row's
+/// alpha is unreachable.
 struct Dp<'a, E: Emissions + ?Sized> {
     em: &'a E,
     token_ids: &'a [usize],
     s: usize,
     rb: usize,
+    t_len: usize,
+    /// compute only each frame's reachable band (CTC_NO_BAND=1 turns it off
+    /// for A/B); the buffers stay full-length either way
+    band: bool,
     /// all-ones lane => the skip arc is illegal (forced to -inf)
     skip_dead: Vec<u64>,
     emit: Vec<f64>,
@@ -569,6 +666,7 @@ struct Dp<'a, E: Emissions + ?Sized> {
 impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
     /// `prev` starts as the alpha at frame 0: state 0 is the first blank and
     /// state 1 the first token of the expanded label sequence.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         em: &'a E,
         s: usize,
@@ -576,6 +674,8 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
         labels: &[usize],
         blank_id: usize,
         token_ids: &'a [usize],
+        t_len: usize,
+        band: bool,
     ) -> Self {
         let mut skip_dead = vec![0u64; s];
         for st in 2..s {
@@ -595,6 +695,8 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
             token_ids,
             s,
             rb,
+            t_len,
+            band,
             skip_dead,
             emit: vec![0.0f64; s],
             prev,
@@ -603,6 +705,24 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
             #[cfg(target_arch = "x86_64")]
             avx2,
         }
+    }
+
+    /// The states frame `t` can reach and that can still reach the end.
+    ///
+    /// A path starts in {0, 1} at frame 0 and gains at most 2 states per
+    /// frame (the skip arc), so nothing above `2t+1` is reachable.  It must
+    /// end at the last blank (S-1) or the last token (S-2) — whichever the
+    /// final argmax picks is unknown until the DP is done, so the lower bound
+    /// follows from the *lower* of the two: a state that cannot reach S-2
+    /// with the frames left cannot be on the path either.  (A bound derived
+    /// from S-1 alone would clip the last token off paths that skip every
+    /// remaining frame.)  Both bounds move right monotonically, which is why
+    /// `run` can keep the buffers full-length, compute less of each row, and
+    /// keep everything outside the band at -inf.
+    fn band(&self, t: usize) -> (usize, usize) {
+        let hi = (2 * t + 1).min(self.s - 1);
+        let lo = (self.s - 2).saturating_sub(2 * (self.t_len - 1 - t));
+        (lo, hi)
     }
 
     /// Frames `[t0, t1)`, writing row `t`'s backpointers at
@@ -616,7 +736,13 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
         #[cfg(not(target_arch = "x86_64"))]
         let use_avx2 = false;
         for t in t0..t1 {
-            self.em.fill_emit(t, &mut self.emit, self.token_ids);
+            let (lo, hi) = if self.band { self.band(t) } else { (0, self.s - 1) };
+            if self.band {
+                self.em
+                    .fill_emit_band(t, &mut self.emit, lo, hi, self.token_ids);
+            } else {
+                self.em.fill_emit(t, &mut self.emit, self.token_ids);
+            }
             let row = match back.as_deref_mut() {
                 Some(buf) => {
                     let at = (t - t0) * rb;
@@ -624,14 +750,35 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
                 }
                 None => None,
             };
-            dp_row_par(
-                &self.prev,
-                &self.emit,
-                &self.skip_dead,
-                &mut self.next,
-                row,
-                use_avx2,
-            );
+            if self.band {
+                dp_row_range(
+                    &self.prev,
+                    &self.emit,
+                    &self.skip_dead,
+                    &mut self.next,
+                    row,
+                    lo,
+                    hi,
+                    use_avx2,
+                );
+                // frame t+1's kernel reads up to hi+2 (the states the band
+                // grows into); what it sees there must be -inf, not the alpha
+                // this buffer held two frames ago.  Below the band nothing
+                // needs clearing: the lowest read at t+1 is exactly lo.
+                let hi_next = (hi + 2).min(self.s - 1);
+                for st in hi + 1..=hi_next {
+                    self.next[st] = f64::NEG_INFINITY;
+                }
+            } else {
+                dp_row_par(
+                    &self.prev,
+                    &self.emit,
+                    &self.skip_dead,
+                    &mut self.next,
+                    row,
+                    use_avx2,
+                );
+            }
             std::mem::swap(&mut self.prev, &mut self.next);
         }
     }
@@ -685,12 +832,14 @@ fn align(
     pieces: Option<&[String]>,
     return_path: bool,
 ) -> anyhow::Result<AlignmentResult> {
-    align_with(em, t_len, labels, blank_id, token_ids, frame_rate, pieces, return_path, None)
+    align_with(em, t_len, labels, blank_id, token_ids, frame_rate, pieces, return_path, None, None)
 }
 
 /// [`align`], with the linear-space segment length forced (`None` = the
-/// budget's choice, so `Some(t_len)` is the single pass).  The segment length
-/// must not change the answer, only the memory it takes to get there.
+/// budget's choice, so `Some(t_len)` is the single pass) and banding forced
+/// (`None` = on, unless `CTC_NO_BAND=1` — the same-binary A/B switch).  The
+/// segment length and the band must not change the answer, only the work and
+/// memory it takes to get there.
 #[allow(clippy::too_many_arguments)]
 fn align_with(
     em: &impl Emissions,
@@ -702,6 +851,7 @@ fn align_with(
     pieces: Option<&[String]>,
     return_path: bool,
     force_seg: Option<usize>,
+    force_band: Option<bool>,
 ) -> anyhow::Result<AlignmentResult> {
     let l = token_ids.len();
     let s = labels.len();
@@ -725,7 +875,10 @@ fn align_with(
     // Row 0 is never read (traceback starts at t >= 1); every later row is
     // written in full before that.
     let rb = row_bytes(s);
-    let mut dp = Dp::new(em, s, rb, labels, blank_id, token_ids);
+    let band = force_band.unwrap_or_else(|| {
+        std::env::var("CTC_NO_BAND").ok().as_deref() != Some("1")
+    });
+    let mut dp = Dp::new(em, s, rb, labels, blank_id, token_ids, t_len, band);
     let seg = force_seg.unwrap_or_else(|| segment_len(t_len, s, rb)).max(1);
 
     // Linear space: keep the alpha every `seg` frames and no backpointers at
@@ -780,7 +933,11 @@ fn align_with(
     let mut cur = s_end;
     if !linear {
         for t in (1..t_len).rev() {
-            cur -= get_back(&back[(t - 1) * rb..t * rb], cur);
+            // a feasible path's states stay inside each frame's band, so the
+            // packed field it reads was always written; `saturating` only
+            // matters for a transcript the audio cannot hold at all (the DP
+            // is all -inf and the walk degenerates) — keep it from panicking
+            cur = cur.saturating_sub(get_back(&back[(t - 1) * rb..t * rb], cur));
             states[t - 1] = cur as i32;
         }
     } else {
@@ -797,7 +954,7 @@ fn align_with(
             dp.prev.copy_from_slice(&checkpoints[k * s..(k + 1) * s]);
             dp.run(lo, hi + 1, Some(&mut seg_back));
             for t in (lo..=hi).rev() {
-                cur -= get_back(&seg_back[(t - lo) * rb..(t - lo + 1) * rb], cur);
+                cur = cur.saturating_sub(get_back(&seg_back[(t - lo) * rb..(t - lo + 1) * rb], cur));
                 states[t - 1] = cur as i32;
             }
             if b == 0 {
@@ -942,6 +1099,7 @@ mod tests {
             Some(&pieces),
             true,
             Some(t), // single pass
+            Some(true),
         )
         .unwrap();
         for seg in [1usize, 2, 3, 7, 16, 31, 48, 64, 96, 97] {
@@ -955,6 +1113,7 @@ mod tests {
                 Some(&pieces),
                 true,
                 Some(seg),
+                Some(true),
             )
             .unwrap();
             assert_eq!(
@@ -964,6 +1123,98 @@ mod tests {
             assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits(), "segment {seg}: log_prob");
             for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
                 assert_eq!(a.to_bits(), b.to_bits(), "segment {seg}: frame score");
+            }
+        }
+    }
+
+    /// The banded DP must land on the same alignment as the full-width row,
+    /// bit for bit, whatever the segment length.  The shapes ride the band
+    /// edges: `T == L` forces every transition to be a skip (the band is one
+    /// state wide and the last blank is unreachable, so the argmax over the
+    /// terminal pair sees a -inf), `T == L+1` / `L+2` add slack, the
+    /// repeated-token shape kills skip arcs, and the wide shape crosses the
+    /// parallel-split threshold with the lower band active.  (An infeasible
+    /// transcript — audio that cannot hold it through legal arcs — is
+    /// deliberately absent: the full run then walks the path through states
+    /// no banded row computed, and the two garbles are not comparable.)
+    #[test]
+    fn banded_matches_full_width() {
+        let v = 40961usize; // prime past every token index: no token is the blank
+        let blank = 0usize;
+        let step = |l: usize| (1..=l).map(|i| (i * 7) % v).collect::<Vec<usize>>();
+        let shapes: Vec<(usize, Vec<usize>)> = vec![
+            (97, step(9)),
+            (9, step(9)),
+            (10, step(9)),
+            (11, step(9)),
+            (200, step(7)),
+            (97, vec![5, 5, 10, 5, 15, 15, 20, 1, 6]),
+            // S = 16601, T - L = 8200: the band crosses PAR_ROW_MIN_STATES
+            // while the lower bound is live (it opens at state 1 mid-byte)
+            (16500, step(8300)),
+        ];
+        for (ti, (t_len, token_ids)) in shapes.into_iter().enumerate() {
+            let l = token_ids.len();
+            let labels = build_expanded_labels(&token_ids, blank);
+            let s = labels.len();
+            let log_probs: Vec<f32> = (0..t_len * v)
+                .map(|i| -((i % 89) as f32) * 0.11 - ((i / v) as f32 % 7.0) * 0.05)
+                .collect();
+            let mut gathered = Vec::with_capacity(t_len * s);
+            for f in 0..t_len {
+                for &st in &labels {
+                    gathered.push(log_probs[f * v + st]);
+                }
+            }
+            let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+
+            for seg in [t_len, 7] {
+                let em = GatheredRows { gathered: &gathered, num_states: s };
+                let full = align_with(
+                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    Some(seg), Some(false),
+                )
+                .unwrap();
+                let banded = align_with(
+                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    Some(seg), Some(true),
+                )
+                .unwrap();
+                assert_eq!(
+                    banded.frame_path, full.frame_path,
+                    "shape {ti} (T={t_len}, L={l}) seg {seg}: path differs"
+                );
+                assert_eq!(
+                    banded.log_prob.to_bits(),
+                    full.log_prob.to_bits(),
+                    "shape {ti} seg {seg}: log_prob"
+                );
+                for (a, b) in banded.frame_scores.iter().zip(&full.frame_scores) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "shape {ti} seg {seg}: frame score");
+                }
+            }
+
+            // the first shape also through the (T, V) emissions, whose banded
+            // fill blanks the band and re-pins the token columns inside it
+            if ti == 0 {
+                let em = FullRows {
+                    log_probs: &log_probs,
+                    vocab: v,
+                    labels: &labels,
+                    blank_id: blank,
+                };
+                let full = align_with(
+                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    Some(t_len), Some(false),
+                )
+                .unwrap();
+                let banded = align_with(
+                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    Some(t_len), Some(true),
+                )
+                .unwrap();
+                assert_eq!(banded.frame_path, full.frame_path, "full rows: path");
+                assert_eq!(banded.log_prob.to_bits(), full.log_prob.to_bits());
             }
         }
     }
