@@ -1,26 +1,16 @@
 # ===== build output =====
 /target/
 
-# ===== test fixtures: large model-relative binaries, not source =====
+# ===== test fixtures =====
+# Numeric baseline dumped from the Python reference.  `tests/golden.rs` reads
+# it by default ($CTC_GOLDEN_DIR), so it is needed to run `cargo test` — large
+# (575 MB) and reproducible from the reference, hence not tracked.
 /golden/
+
+# ===== GPU debug dumps =====
+# Raw device buffers from a failed run.  Regenerated on demand; only worth
+# keeping while diagnosing a specific crash.
 /gpu_debug/
 
-# ===== port working notes (local only) =====
-# Optimization log: 60 KB of RTFx round-by-round findings. Kept out of the
-# repo on purpose -- it is a record of the port process, not deliverable code.
-/RTFX_OPTIMIZATION_NOTES.md
-
-# ===== port scratch: one-off probes and harnesses (local only) =====
-# Everything under examples/ is scaffolding written to answer a single
-# question during the port (verify a WGSL kernel, dump emissions, bench one
-# stage, drive fa-bench). The evidence each one produced is already folded
-# into src/ and the commit messages, so the scripts themselves have no
-# long-term value and would be dead weight in the repo. They stay on disk
-# while the port is in flight and go away with the rest of the scratch.
-/examples/
-
-# fa-bench evaluation adapter's Rust worker lives here; the Python side
-# (recipe, aligner shim) is in the separate fa-bench checkout.
-
-# ===== editor / agent tooling =====
+# ===== agent tooling =====
 /.zcodeignore
