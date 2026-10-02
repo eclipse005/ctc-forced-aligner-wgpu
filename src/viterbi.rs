@@ -441,6 +441,133 @@ pub fn ctc_forced_align_emissions(
     align(em, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
 }
 
+/// The Viterbi recursion over one emissions source: two alpha rows, the
+/// emissions row, and the skip mask.  Split out of `align` so the same step
+/// serves the single pass and the per-segment recompute of the linear-space
+/// traceback — the two produce the same choices, since a recompute sees the
+/// same alpha it started from.
+struct Dp<'a, E: Emissions + ?Sized> {
+    em: &'a E,
+    token_ids: &'a [usize],
+    s: usize,
+    rb: usize,
+    /// all-ones lane => the skip arc is illegal (forced to -inf)
+    skip_dead: Vec<u64>,
+    emit: Vec<f64>,
+    prev: Vec<f64>,
+    next: Vec<f64>,
+    /// one row of backpointers, for the alpha-only pass that throws them away
+    scratch_row: Vec<u8>,
+    #[cfg(target_arch = "x86_64")]
+    avx2: bool,
+}
+
+impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
+    /// `prev` starts as the alpha at frame 0: state 0 is the first blank and
+    /// state 1 the first token of the expanded label sequence.
+    fn new(
+        em: &'a E,
+        s: usize,
+        rb: usize,
+        labels: &[usize],
+        blank_id: usize,
+        token_ids: &'a [usize],
+    ) -> Self {
+        let mut skip_dead = vec![0u64; s];
+        for st in 2..s {
+            if labels[st] == blank_id || labels[st] == labels[st - 2] {
+                skip_dead[st] = u64::MAX;
+            }
+        }
+        let mut prev = vec![f64::NEG_INFINITY; s];
+        prev[0] = em.score(0, 0) as f64;
+        if s > 1 {
+            prev[1] = em.score(0, 1) as f64;
+        }
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::is_x86_feature_detected!("avx2");
+        Dp {
+            em,
+            token_ids,
+            s,
+            rb,
+            skip_dead,
+            emit: vec![0.0f64; s],
+            prev,
+            next: vec![0.0f64; s],
+            scratch_row: vec![0u8; rb],
+            #[cfg(target_arch = "x86_64")]
+            avx2,
+        }
+    }
+
+    /// Frames `[t0, t1)`, writing row `t`'s backpointers at
+    /// `back[(t - t0) * rb..]`.  `None` runs the pass for its alpha only: the
+    /// linear-space forward keeps checkpoints, not choices, and the row the
+    /// kernel writes is then a scratch buffer.
+    fn run(&mut self, t0: usize, t1: usize, mut back: Option<&mut [u8]>) {
+        let rb = self.rb;
+        for t in t0..t1 {
+            self.em.fill_emit(t, &mut self.emit, self.token_ids);
+            let row = match back.as_deref_mut() {
+                Some(buf) => {
+                    let at = (t - t0) * rb;
+                    &mut buf[at..at + rb]
+                }
+                None => &mut self.scratch_row[..],
+            };
+            #[cfg(target_arch = "x86_64")]
+            if self.avx2 {
+                // SAFETY: use_avx2 is the runtime AVX2 check.
+                unsafe { dp_row_avx2(&self.prev, &self.emit, &self.skip_dead, &mut self.next, row) };
+            } else {
+                dp_row_scalar(&self.prev, &self.emit, &self.skip_dead, &mut self.next, row);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            dp_row_scalar(&self.prev, &self.emit, &self.skip_dead, &mut self.next, row);
+            std::mem::swap(&mut self.prev, &mut self.next);
+        }
+    }
+}
+
+/// Frames per linear-space segment: the largest length whose checkpoints plus
+/// segment backpointers still fit the budget, or the whole file when the
+/// backpointers fit on their own (no recompute at all) or nothing does.
+///
+/// The trade is `(t_len/seg)·S·8 + seg·S/4` bytes — U-shaped, so halving from
+/// the whole file walks down the long side to the largest segment that fits.
+/// Recomputing a segment replays the DP over every frame once whatever the
+/// segment length, so a large one only saves the per-segment overhead.
+fn segment_len(t_len: usize, s: usize, rb: usize) -> usize {
+    let budget = match std::env::var("CTC_VITERBI_BUDGET_MB").ok().as_deref().map(str::parse::<usize>)
+    {
+        Some(Ok(mb)) => mb << 20,
+        _ => 512 << 20,
+    };
+    let whole = t_len.max(1);
+    let need = |seg: usize| (t_len.div_ceil(seg) * s * 8).saturating_add(seg * rb);
+    let mut best = None;
+    let mut seg = whole;
+    loop {
+        // keep the *largest* segment that fits: halving from the whole file
+        // walks down the long side of the U, so the first hit is the best one
+        if best.is_none() && need(seg) <= budget {
+            best = Some(seg);
+        }
+        if seg <= 1 {
+            break;
+        }
+        let next = seg.div_ceil(2);
+        if next == seg {
+            break;
+        }
+        seg = next;
+    }
+    // nothing fits: keep the plain single pass, whose backpointers are the
+    // smallest of the options (a checkpoint per frame would be 8x worse)
+    best.unwrap_or(whole)
+}
+
 fn align(
     em: &impl Emissions,
     t_len: usize,
@@ -450,6 +577,24 @@ fn align(
     frame_rate: f64,
     pieces: Option<&[String]>,
     return_path: bool,
+) -> anyhow::Result<AlignmentResult> {
+    align_with(em, t_len, labels, blank_id, token_ids, frame_rate, pieces, return_path, None)
+}
+
+/// [`align`], with the linear-space segment length forced (`None` = the
+/// budget's choice, so `Some(t_len)` is the single pass).  The segment length
+/// must not change the answer, only the memory it takes to get there.
+#[allow(clippy::too_many_arguments)]
+fn align_with(
+    em: &impl Emissions,
+    t_len: usize,
+    labels: &[usize],
+    blank_id: usize,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+    return_path: bool,
+    force_seg: Option<usize>,
 ) -> anyhow::Result<AlignmentResult> {
     let l = token_ids.len();
     let s = labels.len();
@@ -469,57 +614,52 @@ fn align(
         );
     }
 
-    // state 0 = first blank, state 1 = first token.
-    // Expanded labels are [blank, tok, blank, tok, ..., blank], so even states
-    // all emit the blank and odd states emit token_ids in order.
-    let mut prev = vec![f64::NEG_INFINITY; s];
-    {
-        prev[0] = em.score(0, 0) as f64;
-        if s > 1 {
-            prev[1] = em.score(0, 1) as f64;
-        }
-    }
-
     // 0 = stay, 1 = from s-1, 2 = from s-2, two bits each (see `put_back`).
     // Row 0 is never read (traceback starts at t >= 1); every later row is
     // written in full before that.
     let rb = row_bytes(s);
-    let nback = t_len.checked_mul(rb).context("backpointer size")?;
+    let mut dp = Dp::new(em, s, rb, labels, blank_id, token_ids);
+    let seg = force_seg.unwrap_or_else(|| segment_len(t_len, s, rb)).max(1);
+
+    // Linear space: keep the alpha every `seg` frames and no backpointers at
+    // all, then walk the file backwards one segment at a time, recomputing
+    // just that segment's backpointers from its checkpoint.  Memory is
+    // (frames/seg)·S·8 + seg·S/4 instead of frames·S/2, so it stops growing
+    // with the audio — at the cost of a second DP pass.  When the whole
+    // file's backpointers fit the budget, `seg` is the file and this is the
+    // single-pass path unchanged.
+    let linear = seg < t_len;
+    let mut checkpoints: Vec<f64> = Vec::new();
     let mut back: Vec<u8> = Vec::new();
-    back.try_reserve_exact(nback).context("backpointer alloc")?;
-    // SAFETY: u8 has no destructor and no invalid bit patterns. Row 0 is never
-    // read (the traceback starts at t >= 1), and every later row is written
-    // whole — `put_back_byte` stores bytes without reading them first — before
-    // the traceback touches that row.
-    unsafe { back.set_len(nback) };
-
-    // All-ones lane => skip is illegal (force -inf). Zero => skip is allowed.
-    let mut skip_dead = vec![0u64; s];
-    for st in 2..s {
-        if labels[st] == blank_id || labels[st] == labels[st - 2] {
-            skip_dead[st] = u64::MAX;
+    if linear {
+        checkpoints.reserve((t_len / seg + 2) * s);
+        checkpoints.extend_from_slice(&dp.prev); // alpha at frame 0
+    } else {
+        // one row per frame 1..t_len (row 0 has no predecessor), each rb bytes
+        let nback = (t_len - 1).checked_mul(rb).context("backpointer size")?;
+        back.try_reserve_exact(nback).context("backpointer alloc")?;
+        // SAFETY: u8 has no destructor and no invalid bit patterns, and every
+        // row the traceback reads is written whole by the run below —
+        // `put_back_byte` stores bytes without reading them first.
+        unsafe { back.set_len(nback) };
+    }
+    // Frames 1..t_len in one call: the alpha-only run (linear space) throws
+    // the choices away and keeps only the checkpoints, the single pass keeps
+    // them all.
+    if linear {
+        for t in 1..t_len {
+            dp.run(t, t + 1, None);
+            // after the step, `prev` is the alpha *at* frame t, which is what
+            // the segment ending there resumes from
+            if t % seg == 0 {
+                checkpoints.extend_from_slice(&dp.prev);
+            }
         }
+    } else {
+        dp.run(1, t_len, Some(&mut back[..]));
     }
 
-    let mut emit = vec![0.0f64; s];
-    let mut next = vec![0.0f64; s];
-    #[cfg(target_arch = "x86_64")]
-    let use_avx2 = std::is_x86_feature_detected!("avx2");
-    for t in 1..t_len {
-        em.fill_emit(t, &mut emit, token_ids);
-        let back_row = &mut back[t * rb..(t + 1) * rb];
-        #[cfg(target_arch = "x86_64")]
-        if use_avx2 {
-            // SAFETY: use_avx2 is the runtime AVX2 check.
-            unsafe { dp_row_avx2(&prev, &emit, &skip_dead, &mut next, back_row) };
-        } else {
-            dp_row_scalar(&prev, &emit, &skip_dead, &mut next, back_row);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        dp_row_scalar(&prev, &emit, &skip_dead, &mut next, back_row);
-        std::mem::swap(&mut prev, &mut next);
-    }
-    let score = prev;
+    let score = dp.prev.clone();
 
     // termination: last blank or last token, whichever scores higher
     let mut s_end = s - 1;
@@ -531,9 +671,33 @@ fn align(
     let mut states = vec![0i32; t_len];
     states[t_len - 1] = s_end as i32;
     let mut cur = s_end;
-    for t in (1..t_len).rev() {
-        cur -= get_back(&back[t * rb..(t + 1) * rb], cur);
-        states[t - 1] = cur as i32;
+    if !linear {
+        for t in (1..t_len).rev() {
+            cur -= get_back(&back[(t - 1) * rb..t * rb], cur);
+            states[t - 1] = cur as i32;
+        }
+    } else {
+        // Segment k replays frames k·seg+1 ..= (k+1)·seg from the alpha at
+        // frame k·seg, producing rows k·seg+1 ..= (k+1)·seg — row r comes
+        // from frame r, so a segment's starting alpha is the one *before* its
+        // first row.  The last segment stops at the last frame.
+        let mut seg_back = vec![0u8; seg * rb];
+        let mut b = ((t_len - 1) / seg) * seg; // alpha frame this segment starts from
+        loop {
+            let k = b / seg;
+            let lo = b + 1; // first row of this segment
+            let hi = (b + seg).min(t_len - 1); // its last, inclusive
+            dp.prev.copy_from_slice(&checkpoints[k * s..(k + 1) * s]);
+            dp.run(lo, hi + 1, Some(&mut seg_back));
+            for t in (lo..=hi).rev() {
+                cur -= get_back(&seg_back[(t - lo) * rb..(t - lo + 1) * rb], cur);
+                states[t - 1] = cur as i32;
+            }
+            if b == 0 {
+                break;
+            }
+            b -= seg;
+        }
     }
 
     let mut frame_scores = vec![0.0f64; t_len];
@@ -640,9 +804,65 @@ mod tests {
         (prev, emit, skip_dead)
     }
 
+    /// The linear-space traceback replays each segment from its checkpoint
+    /// instead of keeping every backpointer, so the segment length must not
+    /// change the answer — only the memory it takes to get there.
     #[test]
-    fn scalar_tie_break_is_stay_then_advance() {
-        let emit = [0.0, 0.0, 0.0];
+    fn linear_space_matches_single_pass() {
+        let (t, v, l) = (97usize, 24usize, 9usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = (1..=l).map(|i| (i * 5) % v).collect();
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let log_probs: Vec<f32> = (0..t * v)
+            .map(|i| -((i % 53) as f32) * 0.13 - ((i / v) as f32 % 5.0) * 0.09)
+            .collect();
+        let labels = build_expanded_labels(&token_ids, blank);
+        let s = labels.len();
+        let mut gathered = Vec::with_capacity(t * s);
+        for f in 0..t {
+            for &st in &labels {
+                gathered.push(log_probs[f * v + st]);
+            }
+        }
+
+        let want = align_with(
+            &GatheredRows { gathered: &gathered, num_states: s },
+            t,
+            &labels,
+            blank,
+            &token_ids,
+            50.0,
+            Some(&pieces),
+            true,
+            Some(t), // single pass
+        )
+        .unwrap();
+        for seg in [1usize, 2, 3, 7, 16, 31, 48, 64, 96, 97] {
+            let got = align_with(
+                &GatheredRows { gathered: &gathered, num_states: s },
+                t,
+                &labels,
+                blank,
+                &token_ids,
+                50.0,
+                Some(&pieces),
+                true,
+                Some(seg),
+            )
+            .unwrap();
+            assert_eq!(
+                got.frame_path, want.frame_path,
+                "segment {seg}: path differs"
+            );
+            assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits(), "segment {seg}: log_prob");
+            for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
+                assert_eq!(a.to_bits(), b.to_bits(), "segment {seg}: frame score");
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_tie_break_is_stay_then_advance() {        let emit = [0.0, 0.0, 0.0];
         let skip_dead = [u64::MAX, u64::MAX, 0];
         let mut next = [0.0; 3];
         let mut back = [0xffu8; 1]; // one packed byte covers 3 states

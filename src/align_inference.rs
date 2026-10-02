@@ -726,7 +726,6 @@ impl RowGather<'_> {
             unreachable!("the GPU tower never re-runs the lm head")
         };
         let vocab = m.vocab_size();
-        let vocab = m.vocab_size();
         logits.resize(rows * vocab, 0.0);
         m.lm_head_into_logits(hidden_rows, rows, logits);
     }
