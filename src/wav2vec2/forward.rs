@@ -89,6 +89,8 @@ enum Tail<'a> {
     Gathered(&'a [usize]),
     /// `(t, vocab)` lm-head output, neither biased nor log-softmaxed.
     Logits,
+    /// `(t, hidden_size)` normalised encoder stream, lm head not run.
+    Hidden,
 }
 
 impl Model {
@@ -147,9 +149,44 @@ impl Model {
         log_softmax_gather_row_c(row, &self.lm_head.b, cols, out)
     }
 
+    /// The lm head's *input*, `(t, hidden_size)` — the normalised encoder
+    /// stream, with the lm head itself not run yet.
+    ///
+    /// The narrowest of the three things a trellis can be kept as: 4 KB per
+    /// frame against 41 KB for the logits and 41·(2·tokens+1)/10288 KB for
+    /// the gathered columns.  When even that does not fit, the aligner stores
+    /// this and re-runs the lm head on demand
+    /// ([`Model::gather_from_hidden`]) instead of holding the emissions.
+    pub fn forward_hidden(&self, input: &[f32], scratch: &mut Scratch) -> Result<Vec<f32>> {
+        Ok(self.forward_inner(input, &StageSet::default(), scratch, Tail::Hidden)?.0)
+    }
+
+    /// Re-run the lm head over a `(rows, hidden_size)` block from
+    /// [`Model::forward_hidden`], writing bias-free `(rows, vocab_size)`
+    /// logits — the same GEMM, so the values match the forward's.
+    pub fn lm_head_into_logits(&self, hidden: &[f32], rows: usize, logits: &mut [f32]) {
+        let vocab = self.cfg.vocab_size;
+        debug_assert_eq!(hidden.len(), rows * self.cfg.hidden_size);
+        debug_assert!(logits.len() >= rows * vocab);
+        self.lm_head.apply_into_nobias(hidden, rows, logits);
+    }
+
+    /// The trellis columns of one row of already-computed bias-free logits:
+    /// the same `log_softmax_gather_row` the fused epilogue runs, so the
+    /// values are bit-identical to [`Model::forward_gathered_with`].
+    /// Returns the row's log-softmax normaliser.
+    pub fn gather_lp_row(&self, logits: &[f32], cols: &[i32], out: &mut [f32]) -> f32 {
+        log_softmax_gather_row_c(logits, &self.lm_head.b, cols, out)
+    }
+
     /// The vocabulary width `forward_logits` writes.
     pub fn vocab_size(&self) -> usize {
         self.cfg.vocab_size
+    }
+
+    /// The width of one `forward_hidden` row.
+    pub fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
     }
 
     /// The lm head's bias, which [`Model::gather_logits_row`] folds into the
@@ -538,6 +575,10 @@ impl Model {
                     self.lm_head.apply_into_nobias(ln_buf, t, &mut out);
                 });
                 log_probs = out;
+            }
+            Tail::Hidden => {
+                // the caller re-runs the lm head on demand
+                log_probs = ln_buf[..t * hidden].to_vec();
             }
         }
         if enabled() {

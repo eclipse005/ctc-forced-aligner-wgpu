@@ -177,12 +177,12 @@ impl Aligner {
             Trellis::Gathered(gathered) => {
                 ctc_forced_align_gathered_chunks(&gathered, &ids, FRAME_RATE, Some(&pieces))?
             }
-            Trellis::Logits(blocks) => {
+            Trellis::Lazy(blocks) => {
                 let gather = match &self.tower {
                     Tower::Cpu(m) => RowGather::Cpu(m),
                     Tower::Gpu(_) => RowGather::Gpu,
                 };
-                let em = LogitsEmissions::new(&blocks, gather, &expanded);
+                let em = LazyEmissions::new(&blocks, gather, &expanded);
                 let frames = em.total_frames();
                 em.validate()?;
                 ctc_forced_align_emissions(&em, frames, &ids, FRAME_RATE, Some(&pieces))?
@@ -269,7 +269,7 @@ impl Aligner {
     }
 
     /// Trellis-label log-probabilities for a raw (un-normalised) waveform,
-    /// in whichever of the two equivalent storage forms is smaller.
+    /// in whichever of the equivalent storage forms fits the memory budget.
     fn log_probs_trellis(
         &self,
         waveform: &[f32],
@@ -278,17 +278,32 @@ impl Aligner {
         expanded: &[usize],
     ) -> Result<Trellis> {
         // The DP reads one f32 per (frame, expanded state), so the trellis is
-        // T×(2·tokens+1).  The alternative is the lm head's T×vocab output,
-        // and whichever is narrower wins: a short transcript's trellis
-        // (3 m: 10500×6533) is well under the 10288-wide log-prob block, a
-        // long one (15 m: 43500×31130 = 5.4 GB) is 2.8× over it.  Both hold
-        // the identical f32 values, so this is a storage decision only.
-        // `CTC_TRELLIS=auto|gathered|logits` forces either side of it.
+        // T×(2·tokens+1).  Two things can stand in for it, both holding the
+        // identical f32s: the lm head's T×vocab output, and — if even that is
+        // too much — the encoder's own T×hidden stream, from which the lm head
+        // is re-run on demand.  Whichever of the three is the narrowest one
+        // that fits, so RAM is bounded no matter how long the audio is.
+        // `CTC_TRELLIS=auto|gathered|logits|hidden` forces any of them.
         let vocab = self.vocab_size();
-        let use_logits = match std::env::var("CTC_TRELLIS").ok().as_deref() {
-            Some("gathered") => false,
-            Some("logits") => true,
-            _ => expanded.len() > vocab,
+        let hidden = self.hidden_size();
+        let states = expanded.len();
+        let frames = (waveform.len() / SUBSAMPLING).max(1);
+        let form = match std::env::var("CTC_TRELLIS").ok().as_deref() {
+            Some("gathered") => Form::Gathered,
+            Some("logits") => Form::Lazy(BlockKind::Logits { vocab }),
+            Some("hidden") => Form::Lazy(BlockKind::Hidden { hidden }),
+            _ if fits(frames, states) => Form::Gathered,
+            _ if fits(frames, vocab) => Form::Lazy(BlockKind::Logits { vocab }),
+            _ => Form::Lazy(BlockKind::Hidden { hidden }),
+        };
+        // the GPU tower reads its log-probs back from the device, and the
+        // encoder stream is not plumbed through its readback, so a forced
+        // `hidden` on the GPU falls back to what it can produce
+        let form = match (&form, &self.tower) {
+            (Form::Lazy(BlockKind::Hidden { .. }), Tower::Gpu(_)) => {
+                Form::Lazy(BlockKind::Logits { vocab })
+            }
+            _ => form,
         };
         let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
         match win {
@@ -296,28 +311,31 @@ impl Aligner {
                 let mut input = waveform.to_vec();
                 znorm(&mut input);
                 let mut scratch = crate::wav2vec2::Scratch::default();
-                Ok(if use_logits {
-                    let g = self.forward_logits(&input, &mut scratch)?;
-                    let rows = g.len() / vocab;
-                    Trellis::Logits(LogitsBlocks {
-                        blocks: vec![g],
-                        vocab,
-                        num_states: expanded.len(),
-                        row_offset: 0,
-                        frames_per_chunk: rows.max(1),
-                        spans: vec![(0usize, 0usize, rows)],
-                    })
-                } else {
-                    let g = self.forward_gathered(&input, expanded, &mut scratch)?;
-                    let frames = g.len() / expanded.len();
-                    Trellis::Gathered(GatheredChunks {
-                        chunks: vec![g],
-                        frames_per_chunk: frames.max(1),
-                        num_states: expanded.len(),
-                    })
+                Ok(match form {
+                    Form::Gathered => {
+                        let g = self.forward_gathered(&input, expanded, &mut scratch)?;
+                        let f = g.len() / states;
+                        Trellis::Gathered(GatheredChunks {
+                            chunks: vec![g],
+                            frames_per_chunk: f.max(1),
+                            num_states: states,
+                        })
+                    }
+                    Form::Lazy(kind) => {
+                        let g = self.forward_lazy(&input, kind, &mut scratch)?;
+                        let rows = g.len() / kind.width();
+                        Trellis::Lazy(LazyBlocks {
+                            blocks: vec![g],
+                            kind,
+                            num_states: states,
+                            row_offset: 0,
+                            frames_per_chunk: rows.max(1),
+                            spans: vec![(0usize, 0usize, rows)],
+                        })
+                    }
                 })
             }
-            Some(win) => self.log_probs_chunked(waveform, win, context_sec, expanded, use_logits),
+            Some(win) => self.log_probs_chunked(waveform, win, context_sec, expanded, form),
         }
     }
 
@@ -328,21 +346,30 @@ impl Aligner {
         }
     }
 
-    /// The lm head's (frames, vocab) block — what the trellis is gathered
-    /// from on demand in [`Trellis::Logits`].  The CPU tower's rows are
-    /// bias-free logits, the GPU tower's are already log-softmaxed; the
+    fn hidden_size(&self) -> usize {
+        match &self.tower {
+            Tower::Cpu(m) => m.hidden_size(),
+            // the GPU tower keeps the lm head's output resident; its readback
+            // has no equivalent of the encoder stream
+            Tower::Gpu(g) => g.vocab_size(),
+        }
+    }
+
+    /// The block a lazily gathered trellis is parked in, per
+    /// [`Trellis::Lazy`] kind: the lm head's (frames, vocab) output, or the
+    /// encoder's (frames, hidden) stream with the head not yet run.  The
     /// matching gather lives in [`RowGather`].
-    fn forward_logits(
+    fn forward_lazy(
         &self,
         input: &[f32],
+        kind: BlockKind,
         scratch: &mut crate::wav2vec2::Scratch,
     ) -> Result<Vec<f32>> {
-        match &self.tower {
-            // the gathered path reuses a scratch logits buffer; here the GEMM
-            // writes straight into the block that is kept
-            Tower::Cpu(m) => m.forward_logits(input, scratch),
+        match (&self.tower, kind) {
+            (Tower::Cpu(m), BlockKind::Logits { .. }) => m.forward_logits(input, scratch),
+            (Tower::Cpu(m), BlockKind::Hidden { .. }) => m.forward_hidden(input, scratch),
             // no gather kernel: (t, vocab) log-probs instead of (t, S) trellis
-            Tower::Gpu(g) => g.forward(input),
+            (Tower::Gpu(g), _) => g.forward(input),
         }
     }
 
@@ -376,7 +403,7 @@ impl Aligner {
     ///
     /// The trellis comes back one window at a time, so its memory commits as
     /// the file is encoded instead of doubling a single 5 GB allocation on the
-    /// way (see `GatheredChunks`), or — in `Logits` mode — never materialising
+    /// way (see `GatheredChunks`), or — in `Lazy` mode — never materialising
     /// the wide trellis at all.
     fn log_probs_chunked(
         &self,
@@ -384,34 +411,37 @@ impl Aligner {
         win: usize,
         ctx_sec: f64,
         expanded: &[usize],
-        use_logits: bool,
+        form: Form,
     ) -> Result<Trellis> {
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
         let states = expanded.len();
-        let vocab = self.vocab_size();
         if waveform.len() < win {
             let mut input = waveform.to_vec();
             znorm(&mut input);
             let mut scratch = crate::wav2vec2::Scratch::default();
-            if use_logits {
-                let g = self.forward_logits(&input, &mut scratch)?;
-                let rows = g.len() / vocab;
-                return Ok(Trellis::Logits(LogitsBlocks {
-                    blocks: vec![g],
-                    vocab,
-                    num_states: states,
-                    row_offset: 0,
-                    frames_per_chunk: rows.max(1),
-                    spans: vec![(0usize, 0usize, rows)],
-                }));
-            }
-            let g = self.forward_gathered(&input, expanded, &mut scratch)?;
-            let frames = g.len() / states;
-            return Ok(Trellis::Gathered(GatheredChunks {
-                chunks: vec![g],
-                frames_per_chunk: frames.max(1),
-                num_states: states,
-            }));
+            return Ok(match form {
+                Form::Lazy(kind) => {
+                    let g = self.forward_lazy(&input, kind, &mut scratch)?;
+                    let rows = g.len() / kind.width();
+                    Trellis::Lazy(LazyBlocks {
+                        blocks: vec![g],
+                        kind,
+                        num_states: states,
+                        row_offset: 0,
+                        frames_per_chunk: rows.max(1),
+                        spans: vec![(0usize, 0usize, rows)],
+                    })
+                }
+                Form::Gathered => {
+                    let g = self.forward_gathered(&input, expanded, &mut scratch)?;
+                    let frames = g.len() / states;
+                    Trellis::Gathered(GatheredChunks {
+                        chunks: vec![g],
+                        frames_per_chunk: frames.max(1),
+                        num_states: states,
+                    })
+                }
+            });
         }
         let ctx_frames = ctx / SUBSAMPLING;
         let win_frames = win / SUBSAMPLING;
@@ -443,16 +473,17 @@ impl Aligner {
             }
             znorm(&mut chunk);
 
-            if use_logits {
-                // keep the whole lm-head block: no per-chunk copy, and the
-                // DP gathers this window's columns when it gets there
-                let g = self.forward_logits(&chunk, &mut scratch)?;
-                let rows = g.len() / vocab;
+            if let Form::Lazy(kind) = form {
+                // keep the whole block: no per-chunk copy, and the DP gathers
+                // this window's columns a slice at a time when it gets there
+                let w = kind.width();
+                let g = self.forward_lazy(&chunk, kind, &mut scratch)?;
+                let rows = g.len() / w;
                 blocks.push(g);
                 if crate::alloc_stats::enabled() {
                     let (live, peak) = crate::alloc_stats::stats();
                     eprintln!(
-                        "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  logits {} MB, {} kept rows",
+                        "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  {kind:?} {} MB, {} kept rows",
                         blocks.len() - 1,
                         blocks[blocks.len() - 1].capacity() * 4 >> 20,
                         kept_of(rows),
@@ -482,31 +513,32 @@ impl Aligner {
         // the tail zero-padding contributed ext_frames of frames: drop them
         // from the end of the kept stream, which is the last window's last
         // rows.  (The gathered path truncates the concatenated blocks, which
-        // lands on the same rows; the logits path cannot truncate the block —
+        // lands on the same rows; a lazily gathered block cannot truncate —
         // the padding sits *before* its end, inside the kept range — so it
         // shortens the last span instead.)
         if ext_frames > 0 {
-            if use_logits {
+            if matches!(form, Form::Lazy(_)) {
                 // nothing to trim: the block keeps its context rows
             } else if let Some(last) = blocks.last_mut() {
                 let keep = last.len().saturating_sub(ext_frames * states);
                 last.truncate(keep);
             }
         }
-        if use_logits {
+        if let Form::Lazy(kind) = form {
+            let w = kind.width();
             let mut spans: Vec<(usize, usize, usize)> = blocks
                 .iter()
                 .enumerate()
-                .map(|(i, b)| (i, ctx_frames.min(b.len() / vocab), kept_of(b.len() / vocab)))
+                .map(|(i, b)| (i, ctx_frames.min(b.len() / w), kept_of(b.len() / w)))
                 .collect();
             if let Some(last) = spans.last_mut() {
                 last.2 = last.2.saturating_sub(ext_frames);
             }
-            Ok(Trellis::Logits(LogitsBlocks {
+            Ok(Trellis::Lazy(LazyBlocks {
                 frames_per_chunk: spans.first().map_or(1, |s| s.2.max(1)),
                 row_offset: spans.first().map_or(0, |s| s.1),
                 blocks,
-                vocab,
+                kind,
                 num_states: states,
                 spans,
             }))
@@ -523,24 +555,69 @@ impl Aligner {
 /// How the aligner holds one file's trellis between the forward pass and the
 /// Viterbi.  Both variants hold the same f32 values, so the alignment does
 /// not depend on which one a run picks.
+/// Which of the three equivalent trellis storage forms a run takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Form {
+    Gathered,
+    Lazy(BlockKind),
+}
+
+/// How many bytes the emissions may occupy between the forward pass and the
+/// traceback.  Above this the next-narrower form is used instead: the
+/// difference is invisible in the output (same f32s), only in what has to stay
+/// resident, and re-deriving costs one lm head per slice.
+fn emission_budget() -> usize {
+    match std::env::var("CTC_TRELLIS_BUDGET_MB").ok().as_deref().map(str::parse::<usize>) {
+        Some(Ok(mb)) => mb << 20,
+        _ => 3 << 30, // 3 GiB
+    }
+}
+
+fn fits(frames: usize, width: usize) -> bool {
+    frames.saturating_mul(width).saturating_mul(4) <= emission_budget()
+}
+
+impl std::fmt::Debug for Trellis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Trellis::Gathered(g) => f.debug_tuple("Gathered").field(&g.chunks.len()).finish(),
+            Trellis::Lazy(b) => f
+                .debug_struct("Lazy")
+                .field("kind", &b.kind)
+                .field("blocks", &b.blocks.len())
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LazyBlocks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyBlocks")
+            .field("kind", &self.kind)
+            .field("blocks", &self.blocks.len())
+            .field("frames", &self.total_frames())
+            .finish()
+    }
+}
+
 pub enum Trellis {
     /// One (kept_frames × S) block per window — used when the trellis is
     /// narrower than the vocabulary (a short transcript).
     Gathered(GatheredChunks),
-    /// The lm head's (rows × vocab) block per window, narrower than the
-    /// trellis once the transcript passes ~5 k characters (15 m: 2.2 GB of
-    /// logits against a 5.4 GB trellis).  The DP gathers each window's
-    /// columns on demand, so only one window's trellis is ever resident.
-    Logits(LogitsBlocks),
+    /// One wider (rows × width) block per window, gathered into S columns a
+    /// slice at a time: the logits (41 KB/frame) once the trellis passes
+    /// ~5 k characters, the encoder's own output (4 KB/frame) once even that
+    /// does not fit.  The DP materialises one slice at a time, so the resident
+    /// cost does not grow with the file.
+    Lazy(LazyBlocks),
 }
 
-/// Per-window lm-head blocks plus the row window the DP is allowed to read:
-/// the same kept frames the gathered path keeps, addressed inside the wider
-/// block.
-pub struct LogitsBlocks {
+/// Per-window blocks plus the row window the DP is allowed to read: the same
+/// kept frames the gathered path keeps, addressed inside the wider block.
+pub struct LazyBlocks {
     blocks: Vec<Vec<f32>>,
-    /// columns per row (the vocabulary)
-    vocab: usize,
+    /// what a row of a block is, and how wide it is
+    kind: BlockKind,
     /// columns the DP reads (S = 2·tokens+1)
     num_states: usize,
     /// kept frames per window; the last window may be shorter
@@ -552,7 +629,7 @@ pub struct LogitsBlocks {
     spans: Vec<(usize, usize, usize)>,
 }
 
-impl LogitsBlocks {
+impl LazyBlocks {
     fn total_frames(&self) -> usize {
         self.spans.iter().map(|s| s.2).sum()
     }
@@ -573,16 +650,16 @@ impl LogitsBlocks {
     /// frames from the same row offset, or the DP's arithmetic addressing
     /// would read the wrong row instead of failing.
     fn validate(&self) -> Result<()> {
-        anyhow::ensure!(self.vocab > 0 && self.num_states > 0, "empty trellis");
+        let w = self.kind.width();
+        anyhow::ensure!(w > 0 && self.num_states > 0, "empty trellis");
         anyhow::ensure!(self.frames_per_chunk > 0, "frames_per_chunk must be positive");
         let last = self.spans.len().saturating_sub(1);
         for (i, &(b, row, kept)) in self.spans.iter().enumerate() {
             anyhow::ensure!(b == i, "block span {i} out of order");
-            let rows = self.blocks.get(i).map_or(0, |x| x.len() / self.vocab);
+            let rows = self.blocks.get(i).map_or(0, |x| x.len() / w);
             anyhow::ensure!(
-                self.blocks[i].len() % self.vocab == 0,
-                "block {i} is not a whole number of {0}-column rows",
-                self.vocab
+                self.blocks[i].len() % w == 0,
+                "block {i} is not a whole number of {w}-column rows"
             );
             anyhow::ensure!(row + kept <= rows, "block {i} keeps {kept} of {rows} rows");
             if i != last {
@@ -598,68 +675,179 @@ impl LogitsBlocks {
     }
 }
 
-/// Gathers one row of an lm-head block into the trellis columns, per tower:
-/// the CPU's rows are bias-free logits, the GPU's are already log-softmaxed
-/// (its gather kernel is a plain column copy, so this reproduces it exactly).
+/// Frames per gathered slice.  The DP walks frames in order, so exactly one
+/// slice of trellis columns is resident whatever the file length — 256 rows of
+/// S columns is 127 MB at an hour-long file's 124 k states.
+const SLICE_FRAMES: usize = 256;
+
+/// What a stored per-window block holds, and how its rows become trellis
+/// columns.  All three widths produce the same f32s; they only differ in how
+/// much memory has to stay resident between the forward pass and the traceback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlockKind {
+    /// `(rows × vocab)` bias-free logits: 41 KB per frame.  The gather is a
+    /// log-softmax sweep over the row, no GEMM.
+    Logits { vocab: usize },
+    /// `(rows × hidden)` normalised encoder stream: 4 KB per frame, ~40x
+    /// smaller, and the lm head is re-run to get the columns back.
+    Hidden { hidden: usize },
+}
+
+impl BlockKind {
+    fn width(&self) -> usize {
+        match self {
+            BlockKind::Logits { vocab } => *vocab,
+            BlockKind::Hidden { hidden } => *hidden,
+        }
+    }
+}
+
+/// Turns a stored block's rows into trellis columns, per tower: the CPU tower
+/// sweeps the row (or re-runs the lm head), the GPU tower's rows are already
+/// log-softmaxed (its gather kernel is a plain column copy, so this reproduces
+/// it exactly).
 enum RowGather<'a> {
     Cpu(&'a Model),
     Gpu,
 }
 
 impl RowGather<'_> {
-    /// Fill `dst` with the trellis columns of `src`, returning the row's
-    /// log-softmax normaliser (`0` on the GPU tower, whose rows are already
-    /// log-probs).
-    fn row(&self, src: &[f32], cols: &[i32], dst: &mut [f32]) -> f32 {
-        match self {
-            RowGather::Cpu(m) => m.gather_logits_row(src, cols, dst),
-            RowGather::Gpu => {
-                for (j, &c) in cols.iter().enumerate() {
-                    dst[j] = src[c as usize];
-                }
-                0.0
+    /// The `Hidden` kind's re-run of the lm head, over a whole window at
+    /// once: the GEMM wants a few thousand rows to reach full throughput, so
+    /// slicing the *gathered* columns (not the GEMM) is what keeps the buffer
+    /// bounded.  One window's logits is 61 MB and lives in `logits`.
+    fn window_logits(
+        &self,
+        hidden_rows: &[f32],
+        rows: usize,
+        logits: &mut Vec<f32>,
+    ) {
+        let RowGather::Cpu(m) = self else {
+            unreachable!("the GPU tower never re-runs the lm head")
+        };
+        let vocab = m.vocab_size();
+        let vocab = m.vocab_size();
+        logits.resize(rows * vocab, 0.0);
+        m.lm_head_into_logits(hidden_rows, rows, logits);
+    }
+
+    /// `rows` trellis columns starting at `block_row_lo` of `src` (whose width
+    /// the kind gives), with each row's log-softmax normaliser (0 on the GPU
+    /// tower, and for the `Hidden` kind, whose rows are pre-lm-head).
+    /// `window_logits` is the lazily recomputed `(kept × vocab)` block for that
+    /// kind, indexed from the first *kept* row — hence the separate
+    /// `window_row_lo`.
+    fn slice(
+        &self,
+        kind: BlockKind,
+        src: &[f32],
+        block_row_lo: usize,
+        window_row_lo: usize,
+        rows: usize,
+        window_logits: &[f32],
+        cols: &[i32],
+        out: &mut [f32],
+        norm: &mut [f32],
+    ) {
+        let s = cols.len();
+        match (self, kind) {
+            (RowGather::Gpu, _) => {
+                let w = kind.width();
+                src[block_row_lo * w..][..rows * w]
+                    .par_chunks_exact(w)
+                    .zip(out.par_chunks_mut(s))
+                    .for_each(|(row, dst)| {
+                        for (j, &c) in cols.iter().enumerate() {
+                            dst[j] = row[c as usize];
+                        }
+                    });
+                norm.fill(0.0);
+            }
+            (RowGather::Cpu(m), BlockKind::Logits { vocab }) => {
+                src[block_row_lo * vocab..][..rows * vocab]
+                    .par_chunks_exact(vocab)
+                    .zip(out.par_chunks_mut(s))
+                    .zip(norm.par_iter_mut())
+                    .for_each(|((row, dst), c)| *c = m.gather_logits_row(row, cols, dst));
+            }
+            (RowGather::Cpu(m), BlockKind::Hidden { .. }) => {
+                let vocab = m.vocab_size();
+                window_logits[window_row_lo * vocab..][..rows * vocab]
+                    .par_chunks_exact(vocab)
+                    .zip(out.par_chunks_mut(s))
+                    .zip(norm.par_iter_mut())
+                    .for_each(|((x, dst), c)| *c = m.gather_lp_row(x, cols, dst));
             }
         }
     }
 
-    /// One trellis column of `src`, reusing a normaliser a previous pass
-    /// recorded.  Bit-identical to the `row` call that produced it: same
-    /// operands, same `x + bias - c` arithmetic.
-    fn value(&self, src: &[f32], col: usize, c: f32) -> f32 {
+    /// Width of a computed lm-head logit row (the vocabulary), which is what
+    /// `window_logits` holds — not `BlockKind::width`, which is the width of
+    /// the *stored* block and is the encoder stream for `Hidden`.
+    fn logits_width(&self) -> usize {
         match self {
-            RowGather::Cpu(m) => src[col] + m.lm_bias()[col] - c,
-            RowGather::Gpu => src[col],
+            RowGather::Cpu(m) => m.vocab_size(),
+            RowGather::Gpu => 0,
+        }
+    }
+
+    /// One trellis column of a computed lm-head logit row, reusing a
+    /// normaliser a previous pass recorded.  Bit-identical to the `slice`
+    /// call that produced it: same operands, same `x + bias - c` arithmetic.
+    fn lp_value(&self, logits: &[f32], col: usize, c: f32) -> f32 {
+        match self {
+            RowGather::Cpu(m) => logits[col] + m.lm_bias()[col] - c,
+            RowGather::Gpu => logits[col],
+        }
+    }
+
+    /// One trellis column of a stored `src` row, reusing a normaliser a
+    /// previous pass recorded.  Only available when the stored rows *are* the
+    /// logit row.
+    fn value(&self, kind: BlockKind, src: &[f32], col: usize, c: f32) -> f32 {
+        match (self, kind) {
+            (RowGather::Cpu(m), BlockKind::Logits { .. }) => src[col] + m.lm_bias()[col] - c,
+            (RowGather::Gpu, _) => src[col],
+            // hidden rows are pre-lm-head: the column only exists once gathered
+            (RowGather::Cpu(_), BlockKind::Hidden { .. }) => f32::NAN,
         }
     }
 }
 
-/// [`Emissions`] over [`Trellis::Logits`]: the DP walks forward, so each
-/// window's columns are gathered the first time a frame inside it is reached
-/// and dropped when the walk moves past it.  Peak cost is one window's
-/// trellis (t×S) on top of the stored logits, not the whole file's.
-struct LogitsEmissions<'a> {
-    blocks: &'a LogitsBlocks,
+/// [`Emissions`] over a lazily gathered trellis ([`Trellis::Logits`] /
+/// [`Trellis::Hidden`]): the DP walks forward, so each slice of trellis columns
+/// is gathered the first time a frame inside it is reached and dropped when
+/// the walk moves past it.  Peak cost is one slice, not the file's.
+struct LazyEmissions<'a> {
+    blocks: &'a LazyBlocks,
+    kind: BlockKind,
     gather: RowGather<'a>,
     /// the expanded labels, as the gather kernel wants them
     cols: Vec<i32>,
-    /// (block index, its trellis block), the one window currently gathered
-    cache: std::cell::RefCell<Option<(usize, Vec<f32>)>>,
+    /// (window, first row, rows) of the one slice currently gathered
+    cache: std::cell::RefCell<Option<(usize, usize, usize, Vec<f32>)>>,
+    /// the `Hidden` kind's recomputed lm-head logits for the window in flight
+    /// — one window, never the file, because the GEMM wants thousands of rows
+    /// to be worth running and the gather is what gets sliced.
+    window_logits: std::cell::RefCell<Option<(usize, Vec<f32>)>>,
     /// per frame, the log-softmax normaliser recorded while the DP gathered
-    /// its window (0 on the GPU tower, whose blocks are already log-probs).
-    /// This is what lets the post-traceback pass read the path's column
-    /// straight out of the stored logits instead of gathering every window a
-    /// second time — 46 k reads instead of 5.8 GB of writes.
+    /// its slice (0 on the GPU tower, whose blocks are already log-probs).
+    /// This is what lets the post-traceback pass read the path's column out of
+    /// the stored rows instead of gathering every slice a second time — 46 k
+    /// reads instead of 5.8 GB of writes.
     norm: std::cell::RefCell<Vec<f32>>,
 }
 
-impl<'a> LogitsEmissions<'a> {
-    fn new(blocks: &'a LogitsBlocks, gather: RowGather<'a>, expanded: &[usize]) -> Self {
+impl<'a> LazyEmissions<'a> {
+    fn new(blocks: &'a LazyBlocks, gather: RowGather<'a>, expanded: &[usize]) -> Self {
         let frames = blocks.total_frames();
-        LogitsEmissions {
+        LazyEmissions {
             blocks,
+            kind: blocks.kind,
             gather,
             cols: expanded.iter().map(|&x| x as i32).collect(),
             cache: std::cell::RefCell::new(None),
+            window_logits: std::cell::RefCell::new(None),
             norm: std::cell::RefCell::new(vec![0.0; frames]),
         }
     }
@@ -678,87 +866,167 @@ impl<'a> LogitsEmissions<'a> {
         self.blocks.validate()
     }
 
-    /// One window's trellis block, gathered on first use and then replaced as
-    /// the DP walks into the next window.  The buffer is reused across windows
-    /// (only the last one is shorter), so the 187 MB is faulted in once.
-    fn window(&self, b: usize) -> std::cell::RefMut<'_, [f32]> {
+    /// The window's recomputed logits, running the lm head if this window is
+    /// not the one in flight.  One window, never the file.
+    fn window_logits_for(&self, b: usize) -> std::cell::RefMut<'_, [f32]> {
         use std::cell::RefMut;
-        let mut cache = self.cache.borrow_mut();
-        let stale = cache.as_ref().map(|(i, _)| *i != b).unwrap_or(true);
-        if stale {
-            let s = self.blocks.num_states;
-            let (_, row_offset, kept) = self.blocks.spans[b];
-            let vocab = self.blocks.vocab;
-            // slice to the kept rows first: same shape as the forward's fused
-            // gather, and no `skip` adaptor in the parallel iterator
-            let src = &self.blocks.blocks[b][row_offset * vocab..][..kept * vocab];
-            let need = kept * s;
-            let out = match cache.as_mut() {
-                Some((_, buf)) if buf.len() == need => buf,
-                _ => {
-                    cache.replace((b, vec![0.0f32; need]));
-                    &mut cache.as_mut().expect("just filled").1
+        let blocks = self.blocks;
+        let w = self.kind.width();
+        let (_, row0, kept) = blocks.spans[b];
+        let mut wl = self.window_logits.borrow_mut();
+        if wl.as_ref().map(|(wb, _)| *wb != b).unwrap_or(true) {
+            let src = &blocks.blocks[b][row0 * w..][..kept * w];
+            match &mut *wl {
+                // the buffer is reused between windows, but the index has to
+                // follow it or every frame re-runs the head
+                Some((wb, buf)) => {
+                    self.gather.window_logits(src, kept, buf);
+                    *wb = b;
                 }
-            };
-            let gather = &self.gather;
-            let cols = &self.cols;
-            let t0 = b * self.blocks.frames_per_chunk;
-            // record each row's normaliser so the post-traceback pass never
-            // has to gather this window again
-            let mut norm = self.norm.borrow_mut();
-            let norm_row = &mut norm[t0..t0 + kept];
-            src.par_chunks_exact(vocab)
-                .zip(out.par_chunks_mut(s))
-                .zip(norm_row.par_iter_mut())
-                .for_each(|((row, dst), c)| *c = gather.row(row, cols, dst));
-            drop(norm);
-            cache.as_mut().expect("just filled").0 = b;
+                None => {
+                    let mut buf = Vec::new();
+                    self.gather.window_logits(src, kept, &mut buf);
+                    *wl = Some((b, buf));
+                }
+            }
         }
-        RefMut::map(cache, |c: &mut Option<(usize, Vec<f32>)>| {
+        RefMut::map(wl, |c: &mut Option<(usize, Vec<f32>)>| {
             c.as_mut().expect("just filled").1.as_mut_slice()
         })
     }
+
+    /// Gather the slice of trellis columns `[row0+lo, +rows)` of window
+    /// `block` unless it is already the cached one.  `window_logits` is the
+    /// `Hidden` kind's recomputed logit rows (empty for the other kinds,
+    /// which read their stored block instead).
+    fn fill_slice(&self, block: usize, row0: usize, lo: usize, rows: usize, window_logits: &[f32]) {
+        let b = self.blocks;
+        let s = b.num_states;
+        let need = rows * s;
+        let t0 = b.frame_base(block) + lo;
+        let mut cache = self.cache.borrow_mut();
+        let fresh = match cache.as_mut() {
+            Some((cb, cl, cr, buf)) => {
+                if *cb == block && *cl == row0 + lo && *cr == rows && buf.len() == need {
+                    false
+                } else {
+                    cache.replace((block, row0 + lo, rows, vec![0.0f32; need]));
+                    true
+                }
+            }
+            None => {
+                cache.replace((block, row0 + lo, rows, vec![0.0f32; need]));
+                true
+            }
+        };
+        if !fresh {
+            return;
+        }
+        let out = &mut cache.as_mut().expect("just filled").3;
+        let mut norm = self.norm.borrow_mut();
+        self.gather.slice(
+            self.kind,
+            &b.blocks[block],
+            row0 + lo,
+            lo,
+            rows,
+            window_logits,
+            &self.cols,
+            out,
+            &mut norm[t0..t0 + rows],
+        );
+    }
+
+    /// The gathered trellis slice holding frame `t`, as (buffer, first row of
+    /// the slice within the window, rows in it).  Gathers on first use;
+    /// consecutive frames of the same slice are then a borrow, and the buffer
+    /// is reused across slices.
+    fn slice_at(&self, t: usize) -> (std::cell::RefMut<'_, [f32]>, usize, usize) {
+        use std::cell::RefMut;
+        let b = self.blocks;
+        let (block, row0, kept) = b.span_of(t);
+        let r = t - b.frame_base(block);
+        let lo = (r / SLICE_FRAMES) * SLICE_FRAMES;
+        let rows = (kept - lo).min(SLICE_FRAMES);
+        if matches!(self.kind, BlockKind::Hidden { .. }) {
+            let wl = self.window_logits_for(block);
+            self.fill_slice(block, row0, lo, rows, wl.as_ref());
+        } else {
+            self.fill_slice(block, row0, lo, rows, &[]);
+        }
+        let mut cache = self.cache.borrow_mut();
+        (
+            RefMut::map(cache, |c: &mut Option<(usize, usize, usize, Vec<f32>)>| {
+                c.as_mut().expect("just filled").3.as_mut_slice()
+            }),
+            lo,
+            rows,
+        )
+    }
 }
 
-impl Emissions for LogitsEmissions<'_> {
+impl Emissions for LazyEmissions<'_> {
     fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
         let s = self.blocks.num_states;
-        let fpc = self.blocks.frames_per_chunk;
-        let block = self.window(t / fpc);
-        let row = &block[(t % fpc) * s..][..s];
+        let (block, lo, _) = self.slice_at(t);
+        let r = t % self.blocks.frames_per_chunk - lo;
+        let row = &block[r * s..][..s];
         for (e, &v) in emit.iter_mut().zip(row) {
             *e = v as f64;
         }
     }
 
-    /// One column of `t`'s row, straight from the stored logits.  The window
-    /// holding `t` has to have been gathered at least once for its
-    /// normaliser to exist — the DP reads frame 0's two states *before* its
-    /// first `fill_emit`, so this may be what triggers the gather.  After the
-    /// DP, every window is normalised and this is a single indexed read.
+    /// One column of `t`'s row.  The slice holding `t` has to have been
+    /// gathered at least once for its normaliser to exist — the DP reads frame
+    /// 0's two states *before* its first `fill_emit`, so this may be what
+    /// triggers the gather.  After the DP every slice is normalised, and for
+    /// the `Logits` kind this is then a single indexed read out of the stored
+    /// rows — no second gather of the whole file.
     fn score(&self, t: usize, st: usize) -> f32 {
         let b = self.blocks;
-        let (block, row, kept) = b.span_of(t);
-        let _ = self.window(block); // records this row's normaliser
+        if matches!(self.kind, BlockKind::Hidden { .. }) {
+            // pre-lm-head rows: the column only exists in the gathered slice
+            let (block, lo, _) = self.slice_at(t);
+            let s = b.num_states;
+            return block[(t % b.frames_per_chunk - lo) * s + st];
+        }
         let col = self.cols[st] as usize;
+        let (block, row, kept) = b.span_of(t);
+        let _ = self.slice_at(t); // records this row's normaliser
+        let w = b.kind.width();
         let r = t - b.frame_base(block);
         debug_assert!(r < kept);
-        let src = &b.blocks[block][(row + r) * b.vocab..][..b.vocab];
-        self.gather.value(src, col, self.norm.borrow()[t])
+        let src = &b.blocks[block][(row + r) * w..][..w];
+        self.gather.value(self.kind, src, col, self.norm.borrow()[t])
     }
 
-    /// The path's per-frame scores, window by window, without re-gathering:
-    /// `score_path` is only reached after the DP has normalised every row.
+    /// The path's per-frame scores, window by window, without re-gathering a
+    /// window's S columns: both lazily stored forms still have the logit row
+    /// at hand once the window's normalisers are known (`Hidden` by re-running
+    /// the head, `Logits` from the stored block), so this is one indexed read
+    /// per frame.
     fn score_path(&self, states: &[i32], out: &mut [f64]) {
         let b = self.blocks;
+        let fpc = b.frames_per_chunk;
         let norm = self.norm.borrow();
         for (bi, &(_, row, kept)) in b.spans.iter().enumerate() {
-            let base = bi * b.frames_per_chunk;
-            let src = &b.blocks[bi][row * b.vocab..][..kept * b.vocab];
-            for r in 0..kept {
-                let t = base + r;
-                let col = self.cols[states[t] as usize] as usize;
-                out[t] = self.gather.value(&src[r * b.vocab..][..b.vocab], col, norm[t]) as f64;
+            let base = bi * fpc;
+            if matches!(self.kind, BlockKind::Hidden { .. }) {
+                let wl = self.window_logits_for(bi);
+                let vocab = self.gather.logits_width();
+                for r in 0..kept {
+                    let t = base + r;
+                    let col = self.cols[states[t] as usize] as usize;
+                    out[t] = self.gather.lp_value(&wl[r * vocab..][..vocab], col, norm[t]) as f64;
+                }
+            } else {
+                let w = b.kind.width();
+                let src = &b.blocks[bi][row * w..][..kept * w];
+                for r in 0..kept {
+                    let t = base + r;
+                    let col = self.cols[states[t] as usize] as usize;
+                    out[t] = self.gather.value(self.kind, &src[r * w..][..w], col, norm[t]) as f64;
+                }
             }
         }
     }
@@ -805,9 +1073,9 @@ mod tests {
             );
             spans.push((i, row_offset, kept));
         }
-        let lb = LogitsBlocks {
+        let lb = LazyBlocks {
             blocks,
-            vocab,
+            kind: BlockKind::Logits { vocab },
             num_states: s,
             frames_per_chunk: per,
             row_offset,
@@ -831,7 +1099,7 @@ mod tests {
         };
         gc.validate().unwrap();
 
-        let em = LogitsEmissions::new(&lb, RowGather::Gpu, &expanded);
+        let em = LazyEmissions::new(&lb, RowGather::Gpu, &expanded);
         em.validate().unwrap();
         assert_eq!(em.total_frames(), total_kept);
         assert_eq!(gc.total_frames(), total_kept);
