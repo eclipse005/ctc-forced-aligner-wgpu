@@ -10,6 +10,7 @@
 //! Graves et al., *Connectionist Temporal Classification* (2006), Sec. 4.1.
 
 use anyhow::Context;
+use rayon::prelude::*;
 
 /// One aligned token and its time span.
 #[derive(Debug, Clone)]
@@ -106,43 +107,139 @@ fn spread2(x: u8) -> u8 {
     (x | (x << 1)) & 0x55
 }
 
-fn dp_row_scalar(prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [f64], back: &mut [u8]) {
+/// One DP row, split across threads by state range.
+///
+/// A row has no cross-state dependency — `next[st]` reads only `prev[st-2..=st]`
+/// and `emit[st]` — so any contiguous split gives bit-identical results to the
+/// serial version.  The row is memory-bound (a 1 h file pushes ~900 GB through
+/// it) and one core only reaches ~20 GB/s of that, which is where the
+/// parallelism pays: 4-state groups stay together, so every chunk owns whole
+/// backpointer bytes.
+///
+/// `back` is `None` on the alpha-only pass (linear space keeps checkpoints, not
+/// choices), which skips the packing work entirely.
+/// A row shorter than this stays serial: the parallel dispatch costs a few tens
+/// of microseconds whatever the row size, so splitting only pays once a row
+/// moves a few hundred KB.  Measured on this box: 3 m (S=6531) loses 26% when
+/// split, 15 m (S=31129) gains 15%, an hour (S=124519) gains 6%.
+const PAR_ROW_MIN_STATES: usize = 16_384;
+
+fn dp_row_par(
+    prev: &[f64],
+    emit: &[f64],
+    skip_dead: &[u64],
+    next: &mut [f64],
+    mut back: Option<&mut [u8]>,
+    use_avx2: bool,
+) {
     let s = prev.len();
-    let mut st = 0;
-    while st < s {
+    // states 0..head run first and serially: the vector kernel reads st-2, and
+    // 4 is also the first offset that owns a whole backpointer byte
+    let head = s.min(4);
+    if head > 0 {
+        let mut byte = 0u8;
+        for k in 0..head {
+            byte |= dp_one(k, prev, emit, skip_dead, &mut next[k..]) << (k * 2);
+        }
+        if let Some(back) = back.as_deref_mut() {
+            put_back_byte(back, 0, byte);
+        }
+    }
+    if head >= s {
+        return;
+    }
+    let states = &mut next[head..];
+    let bytes = back.as_deref_mut().map(|b| &mut b[1..]);
+    if s - head < PAR_ROW_MIN_STATES {
+        // too small to be worth splitting: one serial range from the head on
+        return dp_range(prev, emit, skip_dead, states, bytes, head, use_avx2);
+    }
+    let per = {
+        // whole 4-groups, and enough of them to fill the pool
+        let threads = rayon::current_num_threads().max(1);
+        (s - head).div_ceil(4).div_ceil(threads).max(1) * 4
+    };
+    match bytes {
+        // both halves are indexed by the chunk's own position; states are
+        // 4-aligned, so the backpointer bytes are too
+        Some(bytes) => states
+            .par_chunks_mut(per)
+            .zip(bytes.par_chunks_mut(per / 4))
+            .enumerate()
+            .for_each(|(ci, (chunk, row))| {
+                dp_range(prev, emit, skip_dead, chunk, Some(row), head + ci * per, use_avx2)
+            }),
+        None => states.par_chunks_mut(per).enumerate().for_each(|(ci, chunk)| {
+            dp_range(prev, emit, skip_dead, chunk, None, head + ci * per, use_avx2)
+        }),
+    }
+}
+
+/// States `[st0, st0 + next.len())` of one row, serial within.
+fn dp_range(
+    prev: &[f64],
+    emit: &[f64],
+    skip_dead: &[u64],
+    next: &mut [f64],
+    back: Option<&mut [u8]>,
+    st0: usize,
+    use_avx2: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if use_avx2 {
+        // SAFETY: use_avx2 is the runtime AVX2 check.
+        unsafe { dp_range_avx2(prev, emit, skip_dead, next, back, st0) };
+        return;
+    }
+    dp_range_scalar(prev, emit, skip_dead, next, back, st0);
+}
+
+fn dp_range_scalar(
+    prev: &[f64],
+    emit: &[f64],
+    skip_dead: &[u64],
+    next: &mut [f64],
+    mut back: Option<&mut [u8]>,
+    st0: usize,
+) {
+    let end = st0 + next.len();
+    let mut st = st0;
+    while st < end {
         let mut byte = 0u8;
         for k in 0..4 {
-            if st + k >= s {
+            if st + k >= end {
                 break;
             }
-            byte |= dp_one(st + k, prev, emit, skip_dead, next) << (k * 2);
+            byte |= dp_one(st + k, prev, emit, skip_dead, &mut next[st + k - st0..]) << (k * 2);
         }
-        put_back_byte(back, st >> 2, byte);
+        if let Some(row) = back.as_deref_mut() {
+            put_back_byte(row, (st - st0) >> 2, byte);
+        }
         st += 4;
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn dp_row_avx2(prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [f64], back: &mut [u8]) {
+unsafe fn dp_range_avx2(
+    prev: &[f64],
+    emit: &[f64],
+    skip_dead: &[u64],
+    next: &mut [f64],
+    mut back: Option<&mut [u8]>,
+    st0: usize,
+) {
     use std::arch::x86_64::{
         _mm256_add_pd, _mm256_and_pd, _mm256_blendv_pd, _mm256_castsi256_pd, _mm256_cmp_pd,
         _mm256_loadu_pd, _mm256_loadu_si256, _mm256_movemask_pd, _mm256_set1_pd, _mm256_storeu_pd,
         _CMP_GE_OQ,
     };
-    let s = prev.len();
-    // states 0..3 fill byte 0 (the vector loop needs st-2 in range, so it can
-    // only start at 4 — which is also the first group that owns a whole byte)
-    if s > 0 {
-        let mut byte = 0u8;
-        for k in 0..s.min(4) {
-            byte |= dp_one(k, prev, emit, skip_dead, next) << (k * 2);
-        }
-        put_back_byte(back, 0, byte);
-    }
+    let end = st0 + next.len();
+    debug_assert!(st0 >= 2, "the vector loop reads prev[st-2]; the driver starts at 4");
+    debug_assert!(st0 % 4 == 0, "chunks are 4-aligned so they own whole back bytes");
     let neginf = _mm256_set1_pd(f64::NEG_INFINITY);
-    let mut st = 4;
-    while st + 4 <= s {
+    let mut st = st0;
+    while st + 4 <= end {
         let stay = _mm256_loadu_pd(prev.as_ptr().add(st));
         let adv = _mm256_loadu_pd(prev.as_ptr().add(st - 1));
         let skip_raw = _mm256_loadu_pd(prev.as_ptr().add(st - 2));
@@ -155,33 +252,40 @@ unsafe fn dp_row_avx2(prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut 
         let adv_or_skip = _mm256_blendv_pd(skip, adv, adv_ge_skip);
         let best = _mm256_blendv_pd(adv_or_skip, stay, stay_wins);
         let out = _mm256_add_pd(best, _mm256_loadu_pd(emit.as_ptr().add(st)));
-        _mm256_storeu_pd(next.as_mut_ptr().add(st), out);
-        // 2 bits per state, four states to a byte: stay = 0b00, advance = 0b01,
-        // skip = 0b10.  The high bit of a field is the skip bit, the low one
-        // the advance bit; `adv_ge_skip` is also true when stay wins (the
-        // scalar tie-break checks stay first), so it only counts when stay
-        // does not.  Six branch-free ops, no per-lane loop.
-        let stay_mask = _mm256_movemask_pd(stay_wins) as u8 & 0x0f;
-        let adv_mask = _mm256_movemask_pd(adv_ge_skip) as u8 & 0x0f;
-        let skip_mask = !(stay_mask | adv_mask) & 0x0f;
-        let adv_only = adv_mask & !stay_mask & 0x0f;
-        // spread each lane's two bits into its own 2-bit field (lane L ->
-        // bits 2L, 2L+1) before combining
-        back[st >> 2] = (spread2(skip_mask) << 1) | spread2(adv_only);
+        _mm256_storeu_pd(next.as_mut_ptr().add(st - st0), out);
+        if let Some(row) = back.as_deref_mut() {
+            // 2 bits per state, four states to a byte: stay = 0b00, advance =
+            // 0b01, skip = 0b10.  A field's high bit is the skip bit and its low
+            // one the advance bit; `adv_ge_skip` is also true when stay wins
+            // (the scalar tie-break checks stay first), so it only counts when
+            // stay does not.
+            let stay_mask = _mm256_movemask_pd(stay_wins) as u8 & 0x0f;
+            let adv_mask = _mm256_movemask_pd(adv_ge_skip) as u8 & 0x0f;
+            let skip_mask = !(stay_mask | adv_mask) & 0x0f;
+            let adv_only = adv_mask & !stay_mask & 0x0f;
+            // spread each lane's two bits into its own 2-bit field (lane L ->
+            // bits 2L, 2L+1) before combining
+            row[(st - st0) >> 2] = (spread2(skip_mask) << 1) | spread2(adv_only);
+        }
         st += 4;
     }
-    if st < s {
-        // the tail lives in the row's last byte; the states past `s` in it are
-        // never read, so the whole byte can be written without reading first
+    if st < end {
+        // the chunk's tail: one byte, whose states past `end` are never read,
+        // so it can be written whole without reading first
         let mut byte = 0u8;
-        while st < s {
-            byte |= dp_one(st, prev, emit, skip_dead, next) << ((st & 3) * 2);
+        while st < end {
+            byte |= dp_one(st, prev, emit, skip_dead, &mut next[st - st0..]) << ((st & 3) * 2);
             st += 1;
         }
-        put_back_byte(back, st >> 2, byte);
+        if let Some(row) = back.as_deref_mut() {
+            put_back_byte(row, (st - st0) >> 2, byte);
+        }
     }
 }
 
+/// One state of the row: returns its packed choice and writes the new score
+/// to `next[0]` — callers pass the sub-slice for state `st`, which is what lets
+/// a parallel chunk own a contiguous piece of the row.
 fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [f64]) -> u8 {
     let stay = prev[st];
     let adv = if st >= 1 { prev[st - 1] } else { f64::NEG_INFINITY };
@@ -197,7 +301,7 @@ fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [
     } else {
         (2, skip)
     };
-    next[st] = best + emit[st];
+    next[0] = best + emit[st];
     choice
 }
 
@@ -456,8 +560,8 @@ struct Dp<'a, E: Emissions + ?Sized> {
     emit: Vec<f64>,
     prev: Vec<f64>,
     next: Vec<f64>,
-    /// one row of backpointers, for the alpha-only pass that throws them away
-    scratch_row: Vec<u8>,
+
+
     #[cfg(target_arch = "x86_64")]
     avx2: bool,
 }
@@ -495,7 +599,7 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
             emit: vec![0.0f64; s],
             prev,
             next: vec![0.0f64; s],
-            scratch_row: vec![0u8; rb],
+
             #[cfg(target_arch = "x86_64")]
             avx2,
         }
@@ -504,27 +608,30 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
     /// Frames `[t0, t1)`, writing row `t`'s backpointers at
     /// `back[(t - t0) * rb..]`.  `None` runs the pass for its alpha only: the
     /// linear-space forward keeps checkpoints, not choices, and the row the
-    /// kernel writes is then a scratch buffer.
+    /// kernel would write is then dropped.
     fn run(&mut self, t0: usize, t1: usize, mut back: Option<&mut [u8]>) {
         let rb = self.rb;
+        #[cfg(target_arch = "x86_64")]
+        let use_avx2 = self.avx2;
+        #[cfg(not(target_arch = "x86_64"))]
+        let use_avx2 = false;
         for t in t0..t1 {
             self.em.fill_emit(t, &mut self.emit, self.token_ids);
             let row = match back.as_deref_mut() {
                 Some(buf) => {
                     let at = (t - t0) * rb;
-                    &mut buf[at..at + rb]
+                    Some(&mut buf[at..at + rb])
                 }
-                None => &mut self.scratch_row[..],
+                None => None,
             };
-            #[cfg(target_arch = "x86_64")]
-            if self.avx2 {
-                // SAFETY: use_avx2 is the runtime AVX2 check.
-                unsafe { dp_row_avx2(&self.prev, &self.emit, &self.skip_dead, &mut self.next, row) };
-            } else {
-                dp_row_scalar(&self.prev, &self.emit, &self.skip_dead, &mut self.next, row);
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            dp_row_scalar(&self.prev, &self.emit, &self.skip_dead, &mut self.next, row);
+            dp_row_par(
+                &self.prev,
+                &self.emit,
+                &self.skip_dead,
+                &mut self.next,
+                row,
+                use_avx2,
+            );
             std::mem::swap(&mut self.prev, &mut self.next);
         }
     }
@@ -862,31 +969,32 @@ mod tests {
     }
 
     #[test]
-    fn scalar_tie_break_is_stay_then_advance() {        let emit = [0.0, 0.0, 0.0];
+    fn scalar_tie_break_is_stay_then_advance() {
+        let emit = [0.0, 0.0, 0.0];
         let skip_dead = [u64::MAX, u64::MAX, 0];
-        let mut next = [0.0; 3];
+        let mut next = [0.0f64; 3];
         let mut back = [0xffu8; 1]; // one packed byte covers 3 states
         let choice = |b: &[u8]| get_back(b, 2);
         // st=2: stay=prev[2], advance=prev[1], skip=prev[0]
         // stay == advance > skip -> stay
         let prev = [0.0, 1.0, 1.0];
-        dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
+        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 0, "equal stay and advance keeps stay");
 
         // stay < advance == skip -> advance
         let prev = [5.0, 5.0, 0.0];
-        dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
+        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 1, "equal advance and skip keeps advance");
 
         // stay < advance < skip -> skip
         let prev = [9.0, 4.0, 0.0];
-        dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
+        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 2);
 
         // dead skip cannot win even if prev[st-2] is larger
         let prev = [9.0, 1.0, 0.0];
         let skip_dead = [u64::MAX, u64::MAX, u64::MAX];
-        dp_row_scalar(&prev, &emit, &skip_dead, &mut next, &mut back);
+        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 1);
     }
 
@@ -898,12 +1006,14 @@ mod tests {
         }
         let (prev, emit, skip_dead) = sample_row();
         let s = prev.len();
-        let mut n1 = vec![0.0; s];
+        let mut n1 = vec![0.0f64; s];
         let mut b1 = vec![9u8; row_bytes(s)];
-        let mut n2 = vec![0.0; s];
+        let mut n2 = vec![0.0f64; s];
         let mut b2 = vec![9u8; row_bytes(s)];
-        dp_row_scalar(&prev, &emit, &skip_dead, &mut n1, &mut b1);
-        unsafe { dp_row_avx2(&prev, &emit, &skip_dead, &mut n2, &mut b2) };
+        // through the real driver, so the parallel split is covered too: 17
+        // states over 20 threads means four chunks
+        dp_row_par(&prev, &emit, &skip_dead, &mut n1, Some(&mut b1), false);
+        dp_row_par(&prev, &emit, &skip_dead, &mut n2, Some(&mut b2), true);
         // the vector loop writes whole bytes, so compare the decoded choices
         for i in 0..s {
             assert_eq!(
