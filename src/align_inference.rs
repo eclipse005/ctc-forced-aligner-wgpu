@@ -18,7 +18,7 @@ use crate::viterbi::{
 };
 use crate::views::skipped_chars;
 use crate::vocab::Vocab;
-use crate::wav2vec2::Model;
+use crate::wav2vec2::{LmHeadCpu, Model};
 use crate::wav2vec2_gpu::GpuModel;
 
 /// The model on one backend. Both towers are token-identical to the
@@ -36,6 +36,11 @@ pub struct Aligner {
     pub tower: Tower,
     pub vocab: Vocab,
     pub model_dir: PathBuf,
+    /// Host-side lm head weights, loaded for the GPU tower only: its hidden
+    /// form stores the encoder stream and re-runs the head per window
+    /// ([`RowGather::Head`]).  `None` on the CPU tower, which owns a full
+    /// [`Model`].
+    pub gpu_lm_head: Option<LmHeadCpu>,
 }
 
 /// One output JSON, mirroring `omni_align.cli.to_json_obj` field for field.
@@ -90,8 +95,12 @@ impl Aligner {
             },
             other => Tower::Gpu(GpuModel::load(model_dir, other)?),
         };
+        let gpu_lm_head = match tower {
+            Tower::Gpu(_) => Some(LmHeadCpu::load(model_dir)?),
+            Tower::Cpu(_) => None,
+        };
         let vocab = Vocab::load(model_dir)?;
-        Ok(Self { tower, vocab, model_dir: model_dir.to_path_buf() })
+        Ok(Self { tower, vocab, model_dir: model_dir.to_path_buf(), gpu_lm_head })
     }
 
     pub fn backend_name(&self) -> &'static str {
@@ -180,7 +189,16 @@ impl Aligner {
             Trellis::Lazy(blocks) => {
                 let gather = match &self.tower {
                     Tower::Cpu(m) => RowGather::Cpu(m),
-                    Tower::Gpu(_) => RowGather::Gpu,
+                    Tower::Gpu(_) => match blocks.kind {
+                        // the GPU tower's logits blocks are already
+                        // log-softmaxed on the device (plain column copy);
+                        // its hidden blocks need the host-side head re-run
+                        BlockKind::Hidden { .. } => RowGather::Head(self
+                            .gpu_lm_head
+                            .as_ref()
+                            .context("GPU tower is missing the host-side lm head")?),
+                        BlockKind::Logits { .. } => RowGather::Gpu,
+                    },
                 };
                 let em = LazyEmissions::new(&blocks, gather, &expanded);
                 let frames = em.total_frames();
@@ -306,16 +324,6 @@ impl Aligner {
             _ if win.is_some() => Form::Lazy(BlockKind::Hidden { hidden }),
             _ => Form::Lazy(BlockKind::Logits { vocab }),
         };
-        // the GPU tower reads its log-probs back from the device, and the
-        // encoder stream is not plumbed through its readback, so a forced
-        // `hidden` on the GPU falls back to what it can produce
-        let form = match (&form, &self.tower) {
-            (Form::Lazy(BlockKind::Hidden { .. }), Tower::Gpu(_)) => {
-                Form::Lazy(BlockKind::Logits { vocab })
-            }
-            _ => form,
-        };
-        let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
         match win {
             None => {
                 let mut input = waveform.to_vec();
@@ -359,9 +367,7 @@ impl Aligner {
     fn hidden_size(&self) -> usize {
         match &self.tower {
             Tower::Cpu(m) => m.hidden_size(),
-            // the GPU tower keeps the lm head's output resident; its readback
-            // has no equivalent of the encoder stream
-            Tower::Gpu(g) => g.vocab_size(),
+            Tower::Gpu(g) => g.hidden_size(),
         }
     }
 
@@ -378,8 +384,10 @@ impl Aligner {
         match (&self.tower, kind) {
             (Tower::Cpu(m), BlockKind::Logits { .. }) => m.forward_logits(input, scratch),
             (Tower::Cpu(m), BlockKind::Hidden { .. }) => m.forward_hidden(input, scratch),
+            // the hidden readback: post-final-LN stream, head re-run later
+            (Tower::Gpu(g), BlockKind::Hidden { .. }) => g.forward_hidden(input),
             // no gather kernel: (t, vocab) log-probs instead of (t, S) trellis
-            (Tower::Gpu(g), _) => g.forward(input),
+            (Tower::Gpu(g), BlockKind::Logits { .. }) => g.forward(input),
         }
     }
 
@@ -713,11 +721,13 @@ impl BlockKind {
 }
 
 /// Turns a stored block's rows into trellis columns, per tower: the CPU tower
-/// sweeps the row (or re-runs the lm head), the GPU tower's rows are already
-/// log-softmaxed (its gather kernel is a plain column copy, so this reproduces
-/// it exactly).
+/// sweeps the row (or re-runs the lm head), the GPU tower's logits rows are
+/// already log-softmaxed (its gather kernel is a plain column copy, so this
+/// reproduces it exactly), and the GPU tower's *hidden* rows go through the
+/// host-side lm head ([`LmHeadCpu`]) the same way the CPU tower's do.
 enum RowGather<'a> {
     Cpu(&'a Model),
+    Head(&'a LmHeadCpu),
     Gpu,
 }
 
@@ -732,12 +742,19 @@ impl RowGather<'_> {
         rows: usize,
         logits: &mut Vec<f32>,
     ) {
-        let RowGather::Cpu(m) = self else {
-            unreachable!("the GPU tower never re-runs the lm head")
-        };
-        let vocab = m.vocab_size();
-        logits.resize(rows * vocab, 0.0);
-        m.lm_head_into_logits(hidden_rows, rows, logits);
+        match self {
+            RowGather::Cpu(m) => {
+                let vocab = m.vocab_size();
+                logits.resize(rows * vocab, 0.0);
+                m.lm_head_into_logits(hidden_rows, rows, logits);
+            }
+            RowGather::Head(h) => {
+                let vocab = h.vocab();
+                logits.resize(rows * vocab, 0.0);
+                h.into_logits(hidden_rows, rows, logits);
+            }
+            RowGather::Gpu => unreachable!("the GPU tower's logits rows need no head re-run"),
+        }
     }
 
     /// `rows` trellis columns starting at `block_row_lo` of `src` (whose width
@@ -760,7 +777,9 @@ impl RowGather<'_> {
     ) {
         let s = cols.len();
         match (self, kind) {
-            (RowGather::Gpu, _) => {
+            // GPU logits rows are log-probs already: pure column copy, and the
+            // recorded normaliser stays 0 (the value path adds nothing)
+            (RowGather::Gpu, _) | (RowGather::Head(_), BlockKind::Logits { .. }) => {
                 let w = kind.width();
                 src[block_row_lo * w..][..rows * w]
                     .par_chunks_exact(w)
@@ -787,6 +806,15 @@ impl RowGather<'_> {
                     .zip(norm.par_iter_mut())
                     .for_each(|((x, dst), c)| *c = m.gather_lp_row(x, cols, dst));
             }
+            // the GPU tower's hidden rows: same gather, host-side head
+            (RowGather::Head(h), BlockKind::Hidden { .. }) => {
+                let vocab = h.vocab();
+                window_logits[window_row_lo * vocab..][..rows * vocab]
+                    .par_chunks_exact(vocab)
+                    .zip(out.par_chunks_mut(s))
+                    .zip(norm.par_iter_mut())
+                    .for_each(|((x, dst), c)| *c = h.gather_lp_row(x, cols, dst));
+            }
         }
     }
 
@@ -796,6 +824,7 @@ impl RowGather<'_> {
     fn logits_width(&self) -> usize {
         match self {
             RowGather::Cpu(m) => m.vocab_size(),
+            RowGather::Head(h) => h.vocab(),
             RowGather::Gpu => 0,
         }
     }
@@ -806,6 +835,7 @@ impl RowGather<'_> {
     fn lp_value(&self, logits: &[f32], col: usize, c: f32) -> f32 {
         match self {
             RowGather::Cpu(m) => logits[col] + m.lm_bias()[col] - c,
+            RowGather::Head(h) => logits[col] + h.bias()[col] - c,
             RowGather::Gpu => logits[col],
         }
     }
@@ -816,9 +846,13 @@ impl RowGather<'_> {
     fn value(&self, kind: BlockKind, src: &[f32], col: usize, c: f32) -> f32 {
         match (self, kind) {
             (RowGather::Cpu(m), BlockKind::Logits { .. }) => src[col] + m.lm_bias()[col] - c,
-            (RowGather::Gpu, _) => src[col],
+            // GPU-produced logits rows are log-probs already: no bias, no normaliser
+            (RowGather::Head(_), BlockKind::Logits { .. })
+            | (RowGather::Gpu, BlockKind::Logits { .. }) => src[col],
             // hidden rows are pre-lm-head: the column only exists once gathered
-            (RowGather::Cpu(_), BlockKind::Hidden { .. }) => f32::NAN,
+            (RowGather::Cpu(_), BlockKind::Hidden { .. })
+            | (RowGather::Head(_), BlockKind::Hidden { .. })
+            | (RowGather::Gpu, BlockKind::Hidden { .. }) => f32::NAN,
         }
     }
 }
@@ -1056,6 +1090,97 @@ impl Emissions for LazyEmissions<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU tower's hidden form: the stored rows are pre-lm-head, and
+    /// `RowGather::Head` re-runs the host-side head per window.  The whole
+    /// per-window machinery (context rows, short last window, one-window
+    /// logit cache, normaliser recording) must land on the trellis a direct
+    /// head re-run produces, bit for bit.  Like the test below it, this is a
+    /// pure addressing test — a synthetic head, no model needed.
+    #[test]
+    fn lazy_hidden_trellis_matches_direct_head_gather() {
+        let (hidden_dim, vocab, l) = (8usize, 23usize, 5usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = (1..=l).map(|i| 1 + (i * 4) % (vocab - 1)).collect();
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let expanded = crate::viterbi::build_expanded_labels(&token_ids, blank);
+        let s = expanded.len();
+        let cols: Vec<i32> = expanded.iter().map(|&x| x as i32).collect();
+
+        let head = crate::wav2vec2::LmHeadCpu {
+            linear: crate::wav2vec2::Linear {
+                w: (0..vocab * hidden_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect(),
+                b: (0..vocab).map(|i| -0.01 * i as f32).collect(),
+                out: vocab,
+                in_: hidden_dim,
+            },
+        };
+
+        // three windows of `per` kept rows, the last short; context rows in
+        // front of each block
+        let (row_offset, kept_last, per) = (5usize, 7usize, 13usize);
+        let rows_per = row_offset + per;
+        let block_all: Vec<f32> = (0..3 * rows_per * hidden_dim)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.11)
+            .collect();
+        let mut blocks = Vec::new();
+        let mut spans = Vec::new();
+        for i in 0..3 {
+            let kept = if i == 2 { kept_last } else { per };
+            blocks.push(
+                block_all[i * rows_per * hidden_dim..(i * rows_per + rows_per) * hidden_dim]
+                    .to_vec(),
+            );
+            spans.push((i, row_offset, kept));
+        }
+        let lb = LazyBlocks {
+            blocks,
+            kind: BlockKind::Hidden { hidden: hidden_dim },
+            num_states: s,
+            frames_per_chunk: per,
+            row_offset,
+            spans,
+        };
+
+        // reference: head over each block's kept rows, gathered straight —
+        // no windows, no slices, no caches
+        let mut flat = Vec::new();
+        for (bi, &(_, row, kept)) in lb.spans.iter().enumerate() {
+            let src = &lb.blocks[bi][row * hidden_dim..(row + kept) * hidden_dim];
+            let mut logits = vec![0f32; kept * vocab];
+            head.into_logits(src, kept, &mut logits);
+            for r in 0..kept {
+                let mut out = vec![0f32; s];
+                head.gather_lp_row(&logits[r * vocab..(r + 1) * vocab], &cols, &mut out);
+                flat.extend_from_slice(&out);
+            }
+        }
+        let gc = GatheredChunks {
+            chunks: flat.chunks(per * s).map(|c| c.to_vec()).collect(),
+            frames_per_chunk: per,
+            num_states: s,
+        };
+        gc.validate().unwrap();
+
+        let em = LazyEmissions::new(&lb, RowGather::Head(&head), &expanded);
+        em.validate().unwrap();
+        let total_kept = 2 * per + kept_last;
+        assert_eq!(em.total_frames(), total_kept);
+
+        let want = ctc_forced_align_gathered_chunks(&gc, &token_ids, 50.0, Some(&pieces)).unwrap();
+        let got =
+            ctc_forced_align_emissions(&em, total_kept, &token_ids, 50.0, Some(&pieces)).unwrap();
+
+        assert_eq!(got.tokens.len(), want.tokens.len());
+        for (g, w) in got.tokens.iter().zip(&want.tokens) {
+            assert_eq!((g.start_frame, g.end_frame), (w.start_frame, w.end_frame));
+            assert_eq!(g.score.to_bits(), w.score.to_bits(), "token score bits");
+        }
+        assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
+        for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
 
     /// The two trellis representations must be interchangeable: the lazy
     /// logits gather reads a window's columns out of the wider lm-head block,

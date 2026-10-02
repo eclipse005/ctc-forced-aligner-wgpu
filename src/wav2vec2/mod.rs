@@ -231,3 +231,52 @@ impl Model {
         })
     }
 }
+
+/// Host-side lm head only — the GPU tower's stand-in for [`Model`]'s head.
+///
+/// The GPU tower can park the encoder stream (T×hidden, 4 KB/frame) instead
+/// of the (T×vocab) logits (41 KB/frame) and re-run the head per window on
+/// demand; this holds the ~42 MB of head weights that takes, so a long
+/// transcript no longer needs a full CPU [`Model`] on the side.  Same
+/// [`Linear`], same GEMM call as the CPU tower's hidden-form path, so the
+/// recomputed logits are bit-identical given the same hidden rows.
+pub struct LmHeadCpu {
+    pub linear: Linear,
+}
+
+impl LmHeadCpu {
+    /// Load `lm_head.weight` / `lm_head.bias` (and the config for the two
+    /// dims) from the checkpoint directory.
+    pub fn load(model_dir: &std::path::Path) -> Result<Self> {
+        let cfg = Wav2Vec2Config::load(model_dir)?;
+        let tensors = crate::weights::load_tensors(model_dir)?;
+        let lhw = get_f32(&tensors, "lm_head.weight")?;
+        let lhb = get_f32(&tensors, "lm_head.bias")?;
+        Ok(Self {
+            linear: Linear { w: lhw.0, b: lhb.0, out: cfg.vocab_size, in_: cfg.hidden_size },
+        })
+    }
+
+    /// Re-run the head over a `(rows, hidden)` block, writing bias-free
+    /// `(rows, vocab)` logits — the same GEMM [`Model::lm_head_into_logits`]
+    /// runs, so the values match the CPU tower's.
+    pub fn into_logits(&self, hidden: &[f32], rows: usize, logits: &mut [f32]) {
+        debug_assert_eq!(hidden.len(), rows * self.linear.in_);
+        debug_assert!(logits.len() >= rows * self.linear.out);
+        self.linear.apply_into_nobias(hidden, rows, logits);
+    }
+
+    /// The trellis columns of one bias-free logit row (log-softmax + gather);
+    /// returns the row's normaliser.
+    pub fn gather_lp_row(&self, logits: &[f32], cols: &[i32], out: &mut [f32]) -> f32 {
+        kernels::log_softmax_gather_row_c(logits, &self.linear.b, cols, out)
+    }
+
+    pub fn bias(&self) -> &[f32] {
+        &self.linear.b
+    }
+
+    pub fn vocab(&self) -> usize {
+        self.linear.out
+    }
+}

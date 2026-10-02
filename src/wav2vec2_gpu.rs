@@ -495,7 +495,7 @@ impl GpuModel {
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
-        self.forward_impl(input, None)
+        self.forward_impl(input, None, false)
     }
 
     /// Same forward, but instead of the whole (T, V) log-prob matrix only
@@ -503,7 +503,16 @@ impl GpuModel {
     /// expanded.len().  The alignment Viterbi reads nothing else, and the
     /// 70 MB download of a 34 s chunk shrinks to ~30 KB.
     pub fn forward_gathered(&self, input: &[f32], expanded: &[u32]) -> Result<Vec<f32>> {
-        self.forward_impl(input, Some(expanded))
+        self.forward_impl(input, Some(expanded), false)
+    }
+
+    /// Same forward, but the lm head and log-softmax never run: the host gets
+    /// the post-final-LN encoder stream (T, hidden) — 7 MB a chunk against
+    /// 70 MB of logits.  The head is re-run on the host per window
+    /// ([`crate::wav2vec2::LmHeadCpu`]) when the DP needs trellis columns,
+    /// which is what keeps a long transcript's emissions out of RAM.
+    pub fn forward_hidden(&self, input: &[f32]) -> Result<Vec<f32>> {
+        self.forward_impl(input, None, true)
     }
 
     /// Columns per row of [`GpuModel::forward`]'s log-prob block.  The aligner
@@ -513,7 +522,12 @@ impl GpuModel {
         self.cfg.vocab_size
     }
 
-    fn forward_impl(&self, input: &[f32], gather: Option<&[u32]>) -> Result<Vec<f32>> {
+    /// Width of one [`GpuModel::forward_hidden`] row.
+    pub fn hidden_size(&self) -> usize {
+        self.cfg.hidden_size
+    }
+
+    fn forward_impl(&self, input: &[f32], gather: Option<&[u32]>, read_hidden: bool) -> Result<Vec<f32>> {
         let gpu = &self.gpu;
         let hidden = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
@@ -541,7 +555,9 @@ impl GpuModel {
             let gathered = gather.is_some();
             let reuse = guard
                 .as_ref()
-                .map(|s| s.n_in == input.len() && s.t == t && s.gathered == gathered)
+                .map(|s| {
+                    s.n_in == input.len() && s.t == t && s.gathered == gathered && s.hidden == read_hidden
+                })
                 .unwrap_or(false);
             if !reuse {
                 let st = |label: &str, n: usize| gpu.storage(label, f32s(n));
@@ -552,13 +568,16 @@ impl GpuModel {
                     rows = (rows - self.cfg.conv_kernel[i]) / self.cfg.conv_stride[i] + 1;
                     convs.push(st(&format!("c{i}"), rows * 512));
                 }
+                let xbuf = st("x", t * hidden);
                 *guard = Some(Scratch {
                     n_in: input.len(),
                     t,
                     gathered,
+                    hidden: read_hidden,
                     x_in: st("x_in", input.len()),
                     convs,
-                    x: st("x", t * hidden),
+                    x: xbuf.clone(),
+                    out_x: xbuf,
                     t1: st("t1", t * hidden),
                     t2: st("t2", t * hidden.max(self.cfg.intermediate_size)),
                     t3: st("t3", t * hidden),
@@ -566,12 +585,20 @@ impl GpuModel {
                     kt: st("kt", hidden * t),
                     scores: st("scores", scores_n),
                     attn_o: st("attn_o", t * hidden),
-                    logits: st("logits", t * vocab),
+                    // the hidden readback never runs the head, so its logits
+                    // buffer doubles as a (t, hidden) scratch
+                    logits: st("logits", if read_hidden { t * hidden } else { t * vocab }),
                     // the gathered readback never touches the MAP_READ staging;
                     // a 34 s chunk's full staging is 70 MB of dead VRAM there
                     staging: gpu.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("logits-staging"),
-                        size: if gathered { 16 } else { f32s(t * vocab) },
+                        size: if gathered {
+                            16
+                        } else if read_hidden {
+                            f32s(t * hidden)
+                        } else {
+                            f32s(t * vocab)
+                        },
                         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                         mapped_at_creation: false,
                     }),
@@ -923,13 +950,16 @@ impl GpuModel {
             std::mem::swap(&mut act.x, &mut act.t1);
         }
 
-        // ---- final LN, LM head, log softmax
+        // ---- final LN, LM head, log softmax.  The hidden readback stops at
+        // the LN: act.x then holds the stream the host-side head re-run
+        // consumes, and the two head dispatches stay out of the graph.
         dispatch!(
             P_LN,
             Cfg4 { a: t as u32, b: hidden as u32, c: 10, d: 0 },
             row_grid(t as u32).0, row_grid(t as u32).1,
             bind!(0, &act.x), bind!(1, &self.final_ln_w), bind!(2, &self.final_ln_b),
         );
+        if !read_hidden {
         dispatch!(
             P_GEMM,
             GemmDims {
@@ -946,11 +976,13 @@ impl GpuModel {
             row_grid(t as u32).0, row_grid(t as u32).1,
             bind!(0, &act.logits),
         );
+        }
         {
             let mut guard = self.scratch.lock().unwrap();
             if let Some(s) = guard.as_mut() {
                 s.jobs = batches.clone();
                 s.uni = uni.clone();
+                s.out_x = act.x.clone();
             }
         }
         }
@@ -1118,11 +1150,28 @@ impl GpuModel {
             let bytes = gpu.readback(gather_out.as_ref().unwrap(), (t * expanded.len() * 4) as u64)?;
             return Ok(bytemuck::cast_slice(&bytes).to_vec());
         }
-        let nbytes = f32s(t * vocab);
+        // the hidden readback needs the buffer the recorded final LN wrote —
+        // `out_x` is saved when the graph is recorded (the local `act.x` it
+        // bound stops being valid the moment the call's swap sequence is
+        // skipped on a replay), so fetch the latest saved handle here rather
+        // than the call-start snapshot
+        let (rb_src, nbytes, out_len) = if read_hidden {
+            let out_x = self
+                .scratch
+                .lock()
+                .unwrap()
+                .as_ref()
+                .context("scratch dropped before hidden readback")?
+                .out_x
+                .clone();
+            (out_x, f32s(t * hidden), t * hidden)
+        } else {
+            (act.logits.clone(), f32s(t * vocab), t * vocab)
+        };
         let t_rb = std::time::Instant::now();
         {
             let mut enc2 = gpu.device.create_command_encoder(&Default::default());
-            enc2.copy_buffer_to_buffer(&act.logits, 0, &staging, 0, nbytes);
+            enc2.copy_buffer_to_buffer(&rb_src, 0, &staging, 0, nbytes);
             gpu.queue.submit([enc2.finish()]);
         }
         let t_copy = t_rb.elapsed();
@@ -1137,7 +1186,7 @@ impl GpuModel {
         let t_poll = t_rb.elapsed();
         rx.recv().context("map callback dropped")??;
         let mapped = slice.get_mapped_range()?;
-        let mut out = vec![0.0f32; t * vocab];
+        let mut out = vec![0.0f32; out_len];
         out.copy_from_slice(bytemuck::cast_slice(&mapped));
         drop(mapped);
         staging.unmap();
@@ -1156,6 +1205,14 @@ struct Scratch {
     /// true when this scratch was built for the gathered readback (which
     /// never touches the MAP_READ staging, so it is a stub there)
     gathered: bool,
+    /// true when this scratch was built for the hidden readback: the lm head
+    /// and log-softmax dispatches are not in the recorded graph, so the
+    /// cached replay is only valid for the same mode
+    hidden: bool,
+    /// the buffer the recorded graph's final LN writes: `act.x` is a *local*
+    /// handle the recording's odd number of swaps leaves pointing at `t3`,
+    /// so a replay (whose swaps never run) must not read back through it
+    out_x: wgpu::Buffer,
     x_in: wgpu::Buffer,
     convs: Vec<wgpu::Buffer>,
     x: wgpu::Buffer,
