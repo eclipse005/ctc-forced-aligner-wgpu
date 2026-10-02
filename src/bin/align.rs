@@ -29,7 +29,7 @@ usage: align --audio <wav> (--text <text|file>) [options]
   --window <sec>           memory/throughput only; it does not move timestamps (default: 30)
   --context <sec>          encoder context each side of a window, at least 1.3 (default: 2)
   --device <spec>          one device: auto (default, cpu if no gpu), cpu, vulkan[:i], dx12[:i], #n, or a name substring
-  --format <json|srt|cues> json is the full alignment (default); srt and cues are subtitles
+  --format <json|srt>     json is the full alignment (default); srt is subtitles
   --output <path>          write here (default: print to stdout)
   --list-devices           list wgpu adapters and exit
 ";
@@ -137,30 +137,8 @@ fn main() -> Result<()> {
 fn render(out: &AlignOutput, format: &str) -> Result<String> {
     match format {
         "json" => Ok(serde_json::to_string_pretty(out)?),
-        "srt" | "cues" => {
-            let doc = views::build_cues(&out.tokens);
-            if format == "srt" {
-                Ok(views::cues_to_srt(&doc))
-            } else {
-                let cues: Vec<_> = doc
-                    .cues
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "index": c.index,
-                            "start": c.start,
-                            "end": c.end,
-                            "text": c.text,
-                        })
-                    })
-                    .collect();
-                Ok(serde_json::to_string_pretty(&serde_json::json!({
-                    "script": doc.script,
-                    "cues": cues,
-                }))?)
-            }
-        }
-        other => anyhow::bail!("unknown --format {other:?}; expected json, srt, or cues"),
+        "srt" => Ok(views::cues_to_srt(&views::build_cues(&out.tokens))),
+        other => anyhow::bail!("unknown --format {other:?}; expected json or srt"),
     }
 }
 

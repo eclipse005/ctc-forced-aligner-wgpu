@@ -86,6 +86,12 @@ pub struct AlignOutput {
     /// stretch of audio belongs to nobody. Granularity is chosen from the
     /// transcript, not asked for.
     pub spans: Vec<serde_json::Value>,
+    /// The same line-breaking the SRT writer uses -- sentence ends, pause and
+    /// duration costs, the width budget -- as data. `--format srt` renders
+    /// exactly these, so exposing them as a field rather than a second format
+    /// means one computation, one set of numbers, and no way for the two to
+    /// disagree.
+    pub cues: Vec<serde_json::Value>,
     /// Encoder time. Omitted from JSON so the schema stays the Python one.
     #[serde(skip)]
     pub encode_s: f64,
@@ -359,6 +365,19 @@ impl Aligner {
             &res.frame_scores,
             crate::views::auto_split(&text),
         );
+        let cues = crate::views::build_cues(&res.tokens);
+        let cue_rows: Vec<serde_json::Value> = cues
+            .cues
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "index": c.index,
+                    "start": c.start,
+                    "end": c.end,
+                    "text": c.text,
+                })
+            })
+            .collect();
 
         Ok(AlignOutput {
             audio: audio_path.display().to_string(),
@@ -408,6 +427,7 @@ impl Aligner {
                 })
             })
             .collect(),
+            cues: cue_rows,
             encode_s,
             align_s,
             tokens: res.tokens,

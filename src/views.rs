@@ -298,6 +298,12 @@ struct Tok {
     end: f64,
     token: String,
     space_before: bool,
+    /// Whether this token is a single character of a script that writes without
+    /// spaces, and so may be split further. Decided per token, not per file: a
+    /// file with one Han character in it was previously taken to be Chinese
+    /// throughout, and the line-breaker duly cut `alignment` into `alignm` and
+    /// `ent`.
+    splittable: bool,
 }
 
 const GRACE: f64 = 11.0;
@@ -380,70 +386,62 @@ fn discourse(word: &str) -> bool {
     )
 }
 
-fn cue_tokens(tokens: &[TokenAlignment]) -> (Vec<Tok>, bool) {
-    let cjk = tokens.iter().any(|t| t.piece.chars().any(is_cjk));
-    let mut out = Vec::new();
-    if cjk {
-        let mut pending = false;
-        for t in tokens {
-            // `<star>` is the reference's synthetic word-boundary marker, not a
-            // character of the transcript. It is the ONLY boundary signal left
-            // here: the tokenizer drops the transcript's own spaces (they are
-            // word separators, not vocabulary pieces), so without reading the
-            // star as a boundary every word would run together, and without
-            // dropping it the marker would be printed in the subtitle.
-            if t.piece == "<star>" {
-                pending = true;
-                continue;
-            }
-            if t.piece.trim().is_empty() {
-                pending = true;
-                continue;
-            }
-            out.push(Tok {
-                start: t.start,
-                end: t.end,
-                token: t.piece.clone(),
-                space_before: pending && !out.is_empty(),
-            });
-            pending = false;
-        }
-        return (merge_decimals(out), true);
-    }
+/// The line-breaking unit, decided per word.
+///
+/// A word whose characters are mostly from a script that writes without spaces
+/// is split into its characters; every other word is one unit. Deciding this
+/// per word rather than per file is what lets `你好这个` break between
+/// characters while `alignment` stays whole -- the previous one-flag-per-file
+/// test called any transcript containing a Han character Chinese throughout,
+/// and cut Latin words in half at the cue boundaries.
+fn cue_tokens(tokens: &[TokenAlignment]) -> Vec<Tok> {
+    let mut out: Vec<Tok> = Vec::new();
     let mut buf: Vec<&TokenAlignment> = Vec::new();
     let mut pending = false;
+
     let flush = |buf: &mut Vec<&TokenAlignment>, pending: &mut bool, out: &mut Vec<Tok>| {
         if buf.is_empty() {
             return;
         }
-        out.push(Tok {
-            start: buf[0].start,
-            end: buf[buf.len() - 1].end,
-            token: buf.iter().map(|t| t.piece.as_str()).collect(),
-            space_before: *pending && !out.is_empty(),
-        });
+        let text: String = buf.iter().map(|t| t.piece.as_str()).collect();
+        let letters = buf.iter().filter(|t| !t.piece.chars().all(|c| c.is_whitespace())).count();
+        let cjk = letters > 0
+            && buf.iter().filter(|t| t.piece.chars().any(is_cjk)).count() * 2 > letters;
+        let (start, end) = (buf[0].start, buf[buf.len() - 1].end);
+        let space_before = *pending && !out.is_empty();
+        if cjk {
+            // One unit per character, so the splitter can break between them.
+            for (n, t) in buf.iter().enumerate() {
+                out.push(Tok {
+                    start: t.start,
+                    end: t.end,
+                    token: t.piece.clone(),
+                    space_before: space_before && n == 0,
+                    splittable: true,
+                });
+            }
+        } else {
+            out.push(Tok { start, end, token: text, space_before, splittable: false });
+        }
         buf.clear();
         *pending = false;
     };
+
     for t in tokens {
-        // Same marker, same two jobs: end the word it follows, and never
-        // become part of one. In `edges` placement this is the leading star
-        // (an empty buffer, so nothing is flushed and nothing gets a space)
-        // and the trailing one, which closes the last word.
-        if t.piece == "<star>" {
+        // `<star>` is the reference's synthetic word-boundary marker, not a
+        // character of the transcript. It is the boundary signal that survives
+        // here: the tokenizer drops the transcript's own spaces (they are word
+        // separators, not vocabulary pieces). Reading it as a boundary keeps
+        // the words apart; keeping it would print the marker in the subtitle.
+        if t.piece == "<star>" || t.piece.trim().is_empty() {
             flush(&mut buf, &mut pending, &mut out);
             pending = true;
-            continue;
+        } else {
+            buf.push(t);
         }
-        if t.piece.trim().is_empty() {
-            flush(&mut buf, &mut pending, &mut out);
-            pending = true;
-            continue;
-        }
-        buf.push(t);
     }
     flush(&mut buf, &mut pending, &mut out);
-    (out, false)
+    merge_decimals(out)
 }
 
 fn merge_decimals(tokens: Vec<Tok>) -> Vec<Tok> {
@@ -462,6 +460,7 @@ fn merge_decimals(tokens: Vec<Tok>) -> Vec<Tok> {
                 end: tokens[i + 2].end,
                 token: format!("{}{}{}", tokens[i].token, tokens[i + 1].token, tokens[i + 2].token),
                 space_before: tokens[i].space_before,
+                splittable: false,
             });
             i += 3;
             continue;
@@ -471,6 +470,7 @@ fn merge_decimals(tokens: Vec<Tok>) -> Vec<Tok> {
             end: tokens[i].end,
             token: tokens[i].token.clone(),
             space_before: tokens[i].space_before,
+            splittable: tokens[i].splittable,
         });
         i += 1;
     }
@@ -567,14 +567,31 @@ fn boundary(words: &[Tok], i: usize) -> f64 {
     WORD_COST
 }
 
-fn units(tok: &str, cjk: bool) -> f64 {
-    let s = strip_tok(tok);
+/// Budget weight of one unit: a character of an unspaced script costs its
+/// character count, a space-delimited word costs one.
+fn units(t: &Tok) -> f64 {
+    let s = strip_tok(&t.token);
     if s.is_empty() {
         0.0
-    } else if cjk {
+    } else if t.splittable {
         s.chars().count() as f64
     } else {
         1.0
+    }
+}
+
+/// The budget a span is measured against, and the character ceiling that goes
+/// with it. A span of Chinese wants a character count and a span of Latin wants
+/// a word count; a mixed transcript has both, so the majority of the span's own
+/// units picks the budget rather than a flag decided for the whole file.
+pub fn span_budget(span: &[&Tok], latin_words: f64, latin_chars: f64, cjk_chars: f64)
+    -> (f64, Option<f64>)
+{
+    let splittable = span.iter().filter(|t| t.splittable).count();
+    if splittable * 2 > span.len() {
+        (cjk_chars, None)
+    } else {
+        (latin_words, Some(latin_chars))
     }
 }
 
@@ -586,14 +603,14 @@ fn dur(words: &[Tok], a: usize, b: usize) -> f64 {
     words[b].end - words[a].start
 }
 
-fn dp_split(words: &[Tok], target: f64, char_limit: Option<f64>, cjk: bool) -> Vec<usize> {
+fn dp_split(words: &[Tok], target: f64, char_limit: Option<f64>) -> Vec<usize> {
     let n = words.len();
     if n < 2 {
         return Vec::new();
     }
     let mut pre = vec![0.0; n + 1];
     for (k, w) in words.iter().enumerate() {
-        pre[k + 1] = pre[k] + units(&w.token, cjk);
+        pre[k + 1] = pre[k] + units(w);
     }
     let fits_chars = match char_limit {
         Some(lim) => dchars(words, 0, n - 1) as f64 <= lim,
@@ -637,7 +654,12 @@ fn dp_split(words: &[Tok], target: f64, char_limit: Option<f64>, cjk: bool) -> V
             if seg_u > 0.0 && seg_u <= 2.0 {
                 c += SHORT_PENALTY;
             }
-            let better = if cjk { c < dp[i] } else { c <= dp[i] };
+            // Ties resolve toward the later cut in Latin and toward the earlier
+            // one in Chinese, which is what the two scripts' line shapes want:
+            // Latin words are short, so an even split wins; a Han sentence has
+            // no natural break, so the greedy one that stays near the target
+            // does. `char_limit` is the signal for which regime this is.
+            let better = if char_limit.is_some() { c < dp[i] } else { c <= dp[i] };
             if better {
                 dp[i] = c;
                 prev[i] = j;
@@ -689,10 +711,10 @@ fn greedy(words: &[Tok], target: f64, char_limit: Option<f64>, pre: &[f64]) -> V
     cuts
 }
 
-fn join_seg(seg: &[Tok], cjk: bool) -> String {
-    if !cjk {
-        return seg.iter().map(|t| t.token.as_str()).collect::<Vec<_>>().join(" ");
-    }
+/// Render a segment. One rule for both scripts: a space goes where the
+/// tokenizer put a word boundary. A CJK run has none inside a word, so it
+/// renders tight; Latin words each carry one, so they render separated.
+fn join_seg(seg: &[Tok]) -> String {
     let mut s = String::new();
     for (i, t) in seg.iter().enumerate() {
         if i > 0 && t.space_before {
@@ -761,9 +783,8 @@ pub fn build_cues(tokens: &[TokenAlignment]) -> CueDoc {
     // simply many pauses, is split by those long before a length target
     // binds, so the knob chose between 54 and 53 cues and nothing more.
     let (latin_words, latin_chars, cjk_chars) = (16.0, 88.0, 22.0);
-    let (words, cjk) = cue_tokens(tokens);
-    let target = if cjk { cjk_chars } else { latin_words };
-    let char_limit = if cjk { None } else { Some(latin_chars) };
+    let words = cue_tokens(tokens);
+
     let mut spans: Vec<Vec<Tok>> = Vec::new();
     let mut cur = Vec::new();
     for i in 0..words.len() {
@@ -773,6 +794,7 @@ pub fn build_cues(tokens: &[TokenAlignment]) -> CueDoc {
             end: words[i].end,
             token: words[i].token.clone(),
             space_before: words[i].space_before,
+            splittable: words[i].splittable,
         });
         if end {
             spans.push(std::mem::take(&mut cur));
@@ -783,7 +805,9 @@ pub fn build_cues(tokens: &[TokenAlignment]) -> CueDoc {
     }
     let mut raw: Vec<(f64, f64, String)> = Vec::new();
     for span in &spans {
-        let cuts = dp_split(span, target, char_limit, cjk);
+        let refs: Vec<&Tok> = span.iter().collect();
+        let (target, char_limit) = span_budget(&refs, latin_words, latin_chars, cjk_chars);
+        let cuts = dp_split(span, target, char_limit);
         let mut bounds = vec![0];
         bounds.extend(cuts.iter().copied());
         bounds.push(span.len());
@@ -792,7 +816,7 @@ pub fn build_cues(tokens: &[TokenAlignment]) -> CueDoc {
             if seg.is_empty() {
                 continue;
             }
-            let text = join_seg(seg, cjk);
+            let text = join_seg(seg);
             let text = text.trim();
             if text.is_empty() {
                 continue;
@@ -825,7 +849,7 @@ pub fn build_cues(tokens: &[TokenAlignment]) -> CueDoc {
         })
         .collect();
     CueDoc {
-        script: if cjk { "cjk" } else { "latin" }.to_string(),
+        script: if words.iter().any(|t| t.splittable) { "cjk" } else { "latin" }.to_string(),
         cues,
     }
 }
@@ -882,7 +906,6 @@ mod tests {
         let pieces = ["达", "到", "2", ".", "5", "。"];
         let tokens: Vec<_> = pieces.iter().enumerate().map(|(i, p)| tok(i, p, 10 + i as i64, 10 + i as i64)).collect();
         let doc = build_cues(&tokens);
-        assert_eq!(doc.script, "cjk");
         assert_eq!(doc.cues.len(), 1);
         assert_eq!(doc.cues[0].text, "达到2.5。");
     }
@@ -989,8 +1012,8 @@ mod tests {
             .enumerate()
             .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
             .collect();
-        let (words, cjk) = cue_tokens(&tokens);
-        assert!(cjk);
+        let words = cue_tokens(&tokens);
+        assert!(words.iter().all(|w| w.splittable));
         let text: String = words.iter().map(|w| w.token.as_str()).collect();
         assert!(!text.contains("<star>"), "marker leaked into {text:?}");
         assert_eq!(text, "你好世界");
@@ -998,7 +1021,7 @@ mod tests {
         assert!(!words[1].space_before, "no boundary inside a word");
         assert!(words[2].space_before, "the inter-word star is a boundary");
         assert!(!words[3].space_before, "no boundary inside a word");
-        // rendered the way join_seg renders a cjk cue
+        // rendered the way join_seg renders a cue
         let mut s = String::new();
         for (i, w) in words.iter().enumerate() {
             if i > 0 && w.space_before {
@@ -1007,6 +1030,86 @@ mod tests {
             s.push_str(&w.token);
         }
         assert_eq!(s, "你好 世界");
+    }
+
+    /// A transcript that mixes scripts: the unit is decided per word, so the
+    /// Han run breaks between characters and the Latin words stay whole.
+    ///
+    /// This is the case a single file-wide flag got wrong. Any file containing
+    /// one Han character was taken to be Chinese throughout, and the
+    /// line-breaker duly cut `alignment` into `alignm` and `ent`.
+    #[test]
+    fn mixed_script_breaks_between_characters_and_never_inside_a_word() {
+        let names = [
+            "<star>", "你", "好", "这", "个", "<star>", "a", "l", "i", "g", "n", "<star>",
+            "工", "具", "<star>",
+        ];
+        let tokens: Vec<TokenAlignment> = names
+            .iter()
+            .enumerate()
+            .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
+            .collect();
+        let words = cue_tokens(&tokens);
+        let text: String = join_seg(&words);
+        assert_eq!(text, "你好这个 align 工具");
+        assert!(!text.contains("<star>"));
+
+        let han: Vec<&Tok> = words.iter().filter(|t| t.splittable).collect();
+        let latin: Vec<&Tok> = words.iter().filter(|t| !t.splittable).collect();
+        assert_eq!(han.len(), 6, "the Han words are one unit per character");
+        assert_eq!(latin.len(), 1, "the Latin word is a single unit");
+        assert_eq!(latin[0].token, "align");
+
+        // The budget follows the span, not the file: a mostly-Han span is
+        // measured in characters, a mostly-Latin one in words.
+        let all: Vec<&Tok> = words.iter().collect();
+        let (t, lim) = span_budget(&all, 16.0, 88.0, 22.0);
+        assert_eq!((t, lim), (22.0, None));
+        let only_latin: Vec<&Tok> = words.iter().filter(|t| !t.splittable).collect();
+        let (t2, lim2) = span_budget(&only_latin, 16.0, 88.0, 22.0);
+        assert_eq!((t2, lim2), (16.0, Some(88.0)));
+    }
+
+    /// End to end: the line-breaker must not split a Latin word even when the
+    /// budget forces a cut nearby.
+    #[test]
+    fn cue_cutting_leaves_latin_words_intact() {
+        // One very long Latin sentence: the splitter has to break it somewhere,
+        // and every break must land between words.
+        let sentence = "the quick brown fox jumps over the lazy dog and then it keeps running \
+                        for a while until somebody finally calls it back to the yard again";
+        let words: Vec<String> = sentence.split_whitespace().map(String::from).collect();
+        let mut names: Vec<String> = vec!["<star>".to_string()];
+        let mut chars = 0usize;
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 {
+                names.push("<star>".to_string());
+            }
+            names.extend(w.chars().map(|c| c.to_string()));
+            chars += w.chars().count();
+        }
+        names.push("<star>".to_string());
+        let tokens: Vec<TokenAlignment> = names
+            .iter()
+            .enumerate()
+            .map(|(i, p)| tok(i, p, 10 + 2 * i as i64, 12 + 2 * i as i64))
+            .collect();
+        let doc = build_cues(&tokens);
+        assert!(doc.cues.len() > 1, "a long sentence must be cut");
+        let mut rejoined = String::new();
+        for (i, c) in doc.cues.iter().enumerate() {
+            if i > 0 {
+                rejoined.push(' ');
+            }
+            rejoined.push_str(&c.text.replace('\n', " "));
+        }
+        for w in &words {
+            assert!(
+                rejoined.contains(w.as_str()),
+                "cue text lost the word {w:?}: {rejoined:?}"
+            );
+        }
+        assert!(chars > 0);
     }
 
     #[test]
@@ -1018,11 +1121,11 @@ mod tests {
             .enumerate()
             .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
             .collect();
-        let (words, cjk) = cue_tokens(&tokens);
-        assert!(!cjk);
+        let words = cue_tokens(&tokens);
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].token, "hi");
         assert!(!words[0].space_before);
+        assert!(!words[0].splittable, "a Latin word is one unit");
     }
 
     #[test]
