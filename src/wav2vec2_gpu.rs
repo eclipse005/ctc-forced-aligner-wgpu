@@ -130,13 +130,11 @@ struct Job {
 
 struct Pipe {
     gemm: wgpu::ComputePipeline,
-    copy: wgpu::ComputePipeline,
     conv_gemm: wgpu::ComputePipeline,
     conv0: wgpu::ComputePipeline,
     pos_conv: wgpu::ComputePipeline,
     ln: wgpu::ComputePipeline,
     ln_sd: wgpu::ComputePipeline,
-    gelu: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
     softmax: wgpu::ComputePipeline,
     log_softmax: wgpu::ComputePipeline,
@@ -150,13 +148,11 @@ const P_CONV0: usize = 2;
 const P_POS: usize = 3;
 const P_LN: usize = 4;
 const P_LN_SD: usize = 5;
-const P_GELU: usize = 6;
-const P_ADD: usize = 7;
-const P_SOFTMAX: usize = 8;
-const P_LOGSOFTMAX: usize = 9;
-const P_TRANSPOSE: usize = 10;
-const P_COPY: usize = 11;
-const P_GATHER: usize = 12;
+const P_ADD: usize = 6;
+const P_SOFTMAX: usize = 7;
+const P_LOGSOFTMAX: usize = 8;
+const P_TRANSPOSE: usize = 9;
+const P_GATHER: usize = 10;
 
 /// The uniform binding index of each pipeline, and whether its uniform buffer
 /// is shared (one big buffer + per-dispatch offsets).
@@ -164,9 +160,8 @@ fn uni_binding(p: usize) -> u32 {
     match p {
         P_GEMM | P_CONV_GEMM | P_CONV0 | P_POS | P_LN_SD => 4,
         P_LN | P_ADD => 3,
-        P_GELU | P_SOFTMAX | P_LOGSOFTMAX => 1,
+        P_SOFTMAX | P_LOGSOFTMAX => 1,
         P_TRANSPOSE => 2,
-        P_COPY => 2,
         P_GATHER => 3,
         _ => unreachable!(),
     }
@@ -438,12 +433,10 @@ impl GpuModel {
             pos_conv: mk_gemm(&shaders::pos_conv(), "pos_conv")?,
             ln: mk(&shaders::layernorm(), "ln")?,
             ln_sd: mk(&shaders::layernorm_sd(), "ln_sd")?,
-            gelu: mk(&shaders::gelu(), "gelu")?,
             add: mk(&shaders::add(), "add")?,
             softmax: mk(&shaders::softmax(), "softmax")?,
             log_softmax: mk(&shaders::log_softmax(), "log_softmax")?,
             transpose: mk(&shaders::transpose(), "transpose")?,
-            copy: mk(&shaders::copy(), "copy")?,
             gather: mk(&shaders::gather(), "gather")?,
         };
 
@@ -637,19 +630,17 @@ impl GpuModel {
         // on this wgpu version, and a per-dispatch pass + poll blows the
         // Windows TDR budget in the other direction. One pass per 8 encoder
         // layers stays under ~2 s on Pascal and still retires in order.
-        let pipes: [&wgpu::ComputePipeline; 13] = [
+        let pipes: [&wgpu::ComputePipeline; 11] = [
             &self.pipes.gemm,
             &self.pipes.conv_gemm,
             &self.pipes.conv0,
             &self.pipes.pos_conv,
             &self.pipes.ln,
             &self.pipes.ln_sd,
-            &self.pipes.gelu,
             &self.pipes.add,
             &self.pipes.softmax,
             &self.pipes.log_softmax,
             &self.pipes.transpose,
-            &self.pipes.copy,
             &self.pipes.gather,
         ];
         let layouts: Vec<wgpu::BindGroupLayout> =
@@ -828,10 +819,16 @@ impl GpuModel {
         );
         // x = x + pos: write to scratch (a buffer cannot be read- and
         // write-bound in the same dispatch), then swap
+        //
+        // n is t*hidden, so a window past 16384 frames overflows one
+        // dimension's 65535-workgroup limit: at 20 ms per frame that is a
+        // 341 s chunk, which the unchunked path (`--window 0`) can reach.
+        // The add shader folds workgroups across x and y; see `flat_grid`.
+        let (add_x, add_y) = flat_grid((t * hidden) as u32);
         dispatch!(
             P_ADD,
             Cfg4 { a: (t * hidden) as u32, b: 0, c: 0, d: 0 },
-            ((t * hidden) as u32).div_ceil(WG), 1,
+            add_x, add_y,
             bind!(0, &act.x), bind!(1, &act.t1), bind!(2, &act.t3),
         );
         std::mem::swap(&mut act.x, &mut act.t3);

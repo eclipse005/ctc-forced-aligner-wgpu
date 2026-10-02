@@ -271,7 +271,7 @@ impl Aligner {
                         BlockKind::Logits { .. } => RowGather::Gpu,
                     },
                 };
-                let em = LazyEmissions::new(&blocks, gather, &expanded);
+                let em = LazyEmissions::new(&blocks, gather, &expanded, &star_state_idx);
                 let frames = em.total_frames();
                 em.validate()?;
                 ctc_forced_align_emissions_with_word_ids(
@@ -981,10 +981,34 @@ struct LazyEmissions<'a> {
     /// the stored rows instead of gathering every slice a second time — 46 k
     /// reads instead of 5.8 GB of writes.
     norm: std::cell::RefCell<Vec<f32>>,
+    /// the trellis **state** indices the `<star>` sentinel occupies (each
+    /// target's odd state), so both read paths can score them
+    /// [`CTC_STAR_SCORE`].  The gathered form gets this for
+    /// free (`forward_gathered` overwrites the column once, up front); a lazy
+    /// block re-derives each slice from stored rows, so without this it would
+    /// read the *blank* log-prob the star's column was gathered from — about
+    /// -0.005 against the constant's -1.0.  A path that parks on the star for
+    /// a different number of frames is a different path, and every boundary
+    /// after it moves: measured on the dub fixture, 17 token starts drifted by
+    /// up to 52 frames and the run's log_prob by 28.85.
+    ///
+    /// State indices, **not** vocabulary columns: `gather_ids` maps the star
+    /// onto `BLANK_ID`, so `cols[star_state]` is the blank's own column, and a
+    /// membership test against column ids would match every blank state as
+    /// well.  `score_path` has to test the state.
+    ///
+    /// A set, not a list: `score_path` asks once per frame per window, and a
+    /// linear scan over a few hundred stars is ~10^7 comparisons on an hour.
+    star_cols: std::collections::HashSet<usize>,
 }
 
 impl<'a> LazyEmissions<'a> {
-    fn new(blocks: &'a LazyBlocks, gather: RowGather<'a>, expanded: &[usize]) -> Self {
+    fn new(
+        blocks: &'a LazyBlocks,
+        gather: RowGather<'a>,
+        expanded: &[usize],
+        star_state_idx: &[usize],
+    ) -> Self {
         let frames = blocks.total_frames();
         LazyEmissions {
             blocks,
@@ -994,7 +1018,11 @@ impl<'a> LazyEmissions<'a> {
             cache: std::cell::RefCell::new(None),
             window_logits: std::cell::RefCell::new(None),
             norm: std::cell::RefCell::new(vec![0.0; frames]),
-        }
+            star_cols: star_state_idx
+                .iter()
+                .copied()
+                .filter(|&i| i < blocks.num_states)
+                .collect(),        }
     }
 
     fn total_frames(&self) -> usize {
@@ -1080,6 +1108,14 @@ impl<'a> LazyEmissions<'a> {
             out,
             &mut norm[t0..t0 + rows],
         );
+        // the star columns are the reference's appended zero column, not a real
+        // log-prob; `forward_gathered` stamps them once and the lazy forms have
+        // to match or the DP walks a different path (see `star_cols`).
+        for &c in &self.star_cols {
+            for row in out.chunks_exact_mut(s) {
+                row[c] = CTC_STAR_SCORE;
+            }
+        }
     }
 
     /// The gathered trellis slice holding frame `t`, as (buffer, first row of
@@ -1147,6 +1183,16 @@ impl Emissions for LazyEmissions<'_> {
             let s = b.num_states;
             return block[(t % b.frames_per_chunk - lo) * s + st];
         }
+        // The star's column was gathered from BLANK_ID, so the stored row's
+        // own value is the blank log-prob, not the reference's constant.  This
+        // read happens before the DP's first `fill_emit` (the DP seeds
+        // `prev[0]`/`prev[1]` from frame 0 through here), so without the
+        // check the first frames score the star on the blank and the path
+        // parks on it from frame 0 instead of waiting for the model to make
+        // it likely.
+        if self.star_cols.contains(&st) {
+            return CTC_STAR_SCORE;
+        }
         let col = self.cols[st] as usize;
         let (block, row, kept) = b.span_of(t);
         let _ = self.slice_at(t); // records this row's normaliser
@@ -1173,16 +1219,29 @@ impl Emissions for LazyEmissions<'_> {
                 let vocab = self.gather.logits_width();
                 for r in 0..kept {
                     let t = base + r;
-                    let col = self.cols[states[t] as usize] as usize;
-                    out[t] = self.gather.lp_value(&wl[r * vocab..][..vocab], col, norm[t]) as f64;
+                    let st = states[t] as usize;
+                    if self.star_cols.contains(&st) {
+                        // same constant `fill_slice` wrote, so the path's own
+                        // score matches what the DP saw
+                        out[t] = CTC_STAR_SCORE as f64;
+                    } else {
+                        let col = self.cols[st] as usize;
+                        out[t] =
+                            self.gather.lp_value(&wl[r * vocab..][..vocab], col, norm[t]) as f64;
+                    }
                 }
             } else {
                 let w = b.kind.width();
                 let src = &b.blocks[bi][row * w..][..kept * w];
                 for r in 0..kept {
                     let t = base + r;
-                    let col = self.cols[states[t] as usize] as usize;
-                    out[t] = self.gather.value(self.kind, &src[r * w..][..w], col, norm[t]) as f64;
+                    let st = states[t] as usize;
+                    out[t] = if self.star_cols.contains(&st) {
+                        CTC_STAR_SCORE as f64
+                    } else {
+                        let col = self.cols[st] as usize;
+                        self.gather.value(self.kind, &src[r * w..][..w], col, norm[t]) as f64
+                    };
                 }
             }
         }
@@ -1264,7 +1323,7 @@ mod tests {
         };
         gc.validate().unwrap();
 
-        let em = LazyEmissions::new(&lb, RowGather::Head(&head), &expanded);
+        let em = LazyEmissions::new(&lb, RowGather::Head(&head), &expanded, &[]);
         em.validate().unwrap();
         let total_kept = 2 * per + kept_last;
         assert_eq!(em.total_frames(), total_kept);
@@ -1285,6 +1344,150 @@ mod tests {
         for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    /// The `<star>` sentinel is a real target, and its column is the
+    /// reference's *appended* zero column rather than a real log-prob.  The
+    /// gathered form stamps it once up front; a lazy block re-derives every
+    /// slice from stored rows, so it has to stamp it again or the DP reads the
+    /// blank log-prob the column was gathered from (~-0.005) where the
+    /// constant is -1.0 — the star then parks for a different number of frames
+    /// and every later boundary moves with it.
+    ///
+    /// Both read paths matter: `fill_slice` feeds the DP forward, `score_path`
+    /// rescores the chosen path afterwards.  A fix in only one of them leaves
+    /// a token whose timestamp and whose score disagree.
+    #[test]
+    fn lazy_star_columns_score_the_reference_constant() {
+        let (hidden_dim, vocab, l) = (8usize, 23usize, 5usize);
+        let blank = 0usize;
+        // target 1 is the star: its expanded odd state is column 3
+        let token_ids: Vec<usize> = vec![1, 2, 3, 1, 4];
+        let star = 1usize;
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let expanded = crate::viterbi::build_expanded_labels(&token_ids, blank);
+        let s = expanded.len();
+        let cols: Vec<i32> = expanded.iter().map(|&x| x as i32).collect();
+        let star_state_idx: Vec<usize> = (0..token_ids.len())
+            .filter(|&i| token_ids[i] == star)
+            .map(|i| 2 * i + 1)
+            .collect();
+        assert_eq!(star_state_idx, vec![1, 7], "star sits on each target's odd state");
+
+        let head = crate::wav2vec2::LmHeadCpu {
+            linear: crate::wav2vec2::Linear {
+                w: (0..vocab * hidden_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect(),
+                b: (0..vocab).map(|i| -0.01 * i as f32).collect(),
+                out: vocab,
+                in_: hidden_dim,
+            },
+        };
+
+        let (row_offset, kept_last, per) = (5usize, 7usize, 13usize);
+        let rows_per = row_offset + per;
+        let block_all: Vec<f32> = (0..3 * rows_per * hidden_dim)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.11)
+            .collect();
+        let mut blocks = Vec::new();
+        let mut spans = Vec::new();
+        for i in 0..3 {
+            let kept = if i == 2 { kept_last } else { per };
+            blocks.push(
+                block_all[i * rows_per * hidden_dim..(i * rows_per + rows_per) * hidden_dim]
+                    .to_vec(),
+            );
+            spans.push((i, row_offset, kept));
+        }
+        let lb = LazyBlocks {
+            blocks,
+            kind: BlockKind::Hidden { hidden: hidden_dim },
+            num_states: s,
+            frames_per_chunk: per,
+            row_offset,
+            spans,
+        };
+
+        // reference: the gathered form, stamped exactly as forward_gathered does
+        let mut flat = Vec::new();
+        for (bi, &(_, row, kept)) in lb.spans.iter().enumerate() {
+            let src = &lb.blocks[bi][row * hidden_dim..(row + kept) * hidden_dim];
+            let mut logits = vec![0f32; kept * vocab];
+            head.into_logits(src, kept, &mut logits);
+            for r in 0..kept {
+                let mut out = vec![0f32; s];
+                head.gather_lp_row(&logits[r * vocab..(r + 1) * vocab], &cols, &mut out);
+                for &si in &star_state_idx {
+                    out[si] = CTC_STAR_SCORE;
+                }
+                flat.extend_from_slice(&out);
+            }
+        }
+        let gc = GatheredChunks {
+            chunks: flat.chunks(per * s).map(|c| c.to_vec()).collect(),
+            frames_per_chunk: per,
+            num_states: s,
+        };
+        gc.validate().unwrap();
+
+        let em = LazyEmissions::new(&lb, RowGather::Head(&head), &expanded, &star_state_idx);
+        em.validate().unwrap();
+        let total_kept = 2 * per + kept_last;
+
+        // every gathered slice carries the constant, never the blank score
+        for t in 0..total_kept {
+            let (buf, lo, _rows) = em.slice_at(t);
+            let r = t % em.blocks.frames_per_chunk - lo;
+            let frame = &buf[r * s..][..s];
+            for &si in &star_state_idx {
+                assert_eq!(
+                    frame[si], CTC_STAR_SCORE,
+                    "frame {t} star column {si} is not the reference constant"
+                );
+                // -1.0, not the ~-0.005 blank log-prob the column was
+                // gathered from: below the guard, so a regression to the
+                // ungathered value cannot pass as equal
+                assert!(
+                    frame[si] < -0.5,
+                    "frame {t}: the constant must not read back as a blank log-prob"
+                );
+            }
+        }
+
+        // The DP seeds `prev[0]`/`prev[1]` from frame 0 through `score()`, which
+        // for the `Logits` kind reads the stored row directly and so has to
+        // apply the constant on its own — a slice gathered later cannot help
+        // here, and the path ends up parking on the star from frame 0.
+        for t in 0..total_kept.min(4) {
+            for &si in &star_state_idx {
+                assert_eq!(
+                    em.score(t, si),
+                    CTC_STAR_SCORE,
+                    "score({t}, star state {si}) is not the reference constant"
+                );
+            }
+        }
+
+        // and the two forms have to agree on the whole alignment
+        let word_ids: Vec<usize> = (0..token_ids.len()).collect();
+        let want = ctc_forced_align_gathered_with_word_ids(
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
+        let got = ctc_forced_align_emissions_with_word_ids(
+            &em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids).unwrap();
+
+        assert_eq!(got.tokens.len(), want.tokens.len());
+        for (g, w) in got.tokens.iter().zip(&want.tokens) {
+            assert_eq!(
+                (g.start_frame, g.end_frame),
+                (w.start_frame, w.end_frame),
+                "token {} moved", w.piece
+            );
+            assert_eq!(g.score.to_bits(), w.score.to_bits(), "token score bits");
+        }
+        assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
+        for (i, (a, b)) in got.frame_scores.iter().zip(&want.frame_scores).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "frame {i} score bits");
+        }
+        let _ = l;
     }
 
     /// The two trellis representations must be interchangeable: the lazy
@@ -1350,7 +1553,7 @@ mod tests {
         };
         gc.validate().unwrap();
 
-        let em = LazyEmissions::new(&lb, RowGather::Gpu, &expanded);
+        let em = LazyEmissions::new(&lb, RowGather::Gpu, &expanded, &[]);
         em.validate().unwrap();
         assert_eq!(em.total_frames(), total_kept);
         assert_eq!(gc.total_frames(), total_kept);
@@ -1372,5 +1575,111 @@ mod tests {
         for (a, b) in got.frame_scores.iter().zip(&want.frame_scores) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    /// The `Logits` kind's `score()` is a third read path, and the one the DP
+    /// hits first: it seeds `prev[0]`/`prev[1]` from frame 0 before any
+    /// `fill_emit` has gathered a slice.  It reads the stored row directly, so
+    /// the star constant has to be applied there too — otherwise the opening
+    /// frames score the star on the blank column and the path parks on it from
+    /// frame 0, which moves every boundary by the length of the leading blank
+    /// run.  Measured on dub: 52 frames, and log_prob off by 0.98 even after
+    /// `fill_slice` and `score_path` were already fixed.
+    #[test]
+    fn lazy_logits_star_seed_uses_the_reference_constant() {
+        let (vocab, l) = (23usize, 5usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = vec![1, 2, 3, 1, 4];
+        let star = 1usize;
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let expanded = crate::viterbi::build_expanded_labels(&token_ids, blank);
+        let s = expanded.len();
+        let star_state_idx: Vec<usize> = (0..token_ids.len())
+            .filter(|&i| token_ids[i] == star)
+            .map(|i| 2 * i + 1)
+            .collect();
+
+        let (row_offset, kept_last, per) = (5usize, 7usize, 13usize);
+        let rows_per = row_offset + per;
+        // stored logit rows; the blank column is deliberately attractive
+        // (-0.001) so an un-stamped star scores better than a real blank and
+        // the path visibly prefers to sit on it
+        let block_all: Vec<f32> = (0..3 * rows_per * vocab)
+            .map(|i| if i % vocab == blank { -0.001 } else { -((i % 37) as f32) * 0.07 - 0.3 })
+            .collect();
+        let mut blocks = Vec::new();
+        let mut spans = Vec::new();
+        for i in 0..3 {
+            let kept = if i == 2 { kept_last } else { per };
+            blocks.push(
+                block_all[i * rows_per * vocab..(i + 1) * rows_per * vocab].to_vec(),
+            );
+            spans.push((i, row_offset, kept));
+        }
+        let lb = LazyBlocks {
+            blocks,
+            kind: BlockKind::Logits { vocab },
+            num_states: s,
+            frames_per_chunk: per,
+            row_offset,
+            spans,
+        };
+
+        let em = LazyEmissions::new(&lb, RowGather::Gpu, &expanded, &star_state_idx);
+        em.validate().unwrap();
+        let total_kept = 2 * per + kept_last;
+
+        // the stored blank really is the tempting value, so the assertions
+        // below cannot pass by accident
+        let raw_blank = em.blocks.blocks[0][(row_offset as usize) * vocab + blank];
+        assert!(raw_blank > -0.01, "blank column should look attractive, got {raw_blank}");
+
+        for t in 0..total_kept {
+            for &si in &star_state_idx {
+                assert_eq!(
+                    em.score(t, si),
+                    CTC_STAR_SCORE,
+                    "score({t}, star state {si}) read the stored column instead of the constant"
+                );
+            }
+        }
+
+        // and the whole alignment has to match the gathered reference, which
+        // got the same constant stamped up front
+        let mut flat = Vec::with_capacity(total_kept * s);
+        for (b, &(_, row, kept)) in lb.spans.iter().enumerate() {
+            for r in 0..kept {
+                let src = &lb.blocks[b][(row + r) * vocab..][..vocab];
+                for (j, &c) in expanded.iter().enumerate() {
+                    flat.push(if star_state_idx.contains(&j) {
+                        CTC_STAR_SCORE
+                    } else {
+                        src[c]
+                    });
+                }
+            }
+        }
+        let gc = GatheredChunks {
+            chunks: flat.chunks(per * s).map(|c| c.to_vec()).collect(),
+            frames_per_chunk: per,
+            num_states: s,
+        };
+        gc.validate().unwrap();
+
+        let word_ids: Vec<usize> = (0..l).collect();
+        let want = ctc_forced_align_gathered_with_word_ids(
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
+        let got = ctc_forced_align_emissions_with_word_ids(
+            &em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids).unwrap();
+
+        for (g, w) in got.tokens.iter().zip(&want.tokens) {
+            assert_eq!(
+                (g.start_frame, g.end_frame),
+                (w.start_frame, w.end_frame),
+                "token {} moved",
+                w.piece
+            );
+        }
+        assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
     }
 }

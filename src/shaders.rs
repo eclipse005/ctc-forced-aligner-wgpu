@@ -119,51 +119,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     s.replace("@LOAD@", load).replace("@STORE@", store)
 }
 
-/// Elementwise gelu over n elements.
-pub fn gelu() -> String {
-    r#"
-struct Cfg { n: u32, _p0: u32, _p1: u32, _p2: u32 }
-@group(0) @binding(0) var<storage, read_write> h: array<f32>;
-@group(0) @binding(1) var<uniform> cfg: Cfg;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i < cfg.n) {
-        let v = h[i];
-        h[i] = 0.5 * v * (1.0 + erf(v / 1.4142135623730951));
-    }
-}
-
-fn erf(x: f32) -> f32 {
-    let s = sign(x);
-    let a = abs(x);
-    let t = 1.0 / (1.0 + 0.3275911 * a);
-    let y = 1.0 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
-        + 0.254829592) * t * exp(-a * a);
-    return s * y;
-}
-"#
-    .to_string()
-}
-
-/// `out[i] = a[i]` — plain copy (avoids reading a zero buffer out of bounds)
-pub fn copy() -> String {
-    r#"
-struct Cfg { n: u32, _p0: u32, _p1: u32, _p2: u32 }
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read_write> o: array<f32>;
-@group(0) @binding(2) var<uniform> cfg: Cfg;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i < cfg.n) { o[i] = a[i]; }
-}
-"#
-    .to_string()
-}
-
 /// `out[i] = a[i] + b[i]`
 pub fn add() -> String {
     r#"
@@ -174,8 +129,14 @@ struct Cfg { n: u32, _p0: u32, _p1: u32, _p2: u32 }
 @group(0) @binding(3) var<uniform> cfg: Cfg;
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    // the host folds workgroups across x and y, because n = t*hidden and one
+    // dimension caps at 65535 workgroups (an unchunked run over >341 s of
+    // audio reaches 16k+ frames); see `flat_grid` in wav2vec2_gpu.rs
+    let i = (wg.x + wg.y * 65535u) * 256u + lid.x;
     if (i < cfg.n) { o[i] = a[i] + b[i]; }
 }
 "#

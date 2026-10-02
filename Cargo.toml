@@ -31,6 +31,14 @@ libm = "0.2"
 [dev-dependencies]
 criterion = "0.5"
 
+[features]
+default = []
+# Count allocations in `alloc_stats::Stats`.  Off by default: the counters are
+# three relaxed atomic RMWs per allocation, which the aligner does not need in
+# a production run.  Build with `--features alloc-stats` and set
+# CTC_ALLOC_STATS=1 to get the per-chunk live/peak report.
+alloc-stats = []
+
 [[bench]]
 name = "rtfx"
 harness = false

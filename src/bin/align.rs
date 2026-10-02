@@ -4,10 +4,12 @@
 //! `--format spans` tiles silence onto the neighbouring chunks.
 //! `--format srt` / `cues` are subtitle breaks on the tight timestamps.
 //!
-//! The global allocator is the counting wrapper in `alloc_stats`: with
-//! `CTC_ALLOC_STATS=1` the run reports its live set and high-water mark per
-//! chunk on stderr (the forward pass makes ~1e3 allocations per chunk, so
-//! the counters are noise).
+//! The global allocator is the counting wrapper in `alloc_stats`, but only
+//! with `--features alloc-stats` (the counters are three relaxed atomics per
+//! allocation).  Build that way and set `CTC_ALLOC_STATS=1` to get the run's
+//! live set and high-water mark per chunk on stderr; the forward pass makes
+//! ~1e3 allocations per chunk, so the counters are noise.  A default build
+//! forwards every call straight to the system allocator.
 
 #[global_allocator]
 static GLOBAL: ctc_forced_aligner_wgpu::alloc_stats::Stats =
