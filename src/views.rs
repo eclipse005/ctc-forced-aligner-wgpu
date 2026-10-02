@@ -599,7 +599,7 @@ fn units(t: &Tok) -> f64 {
 /// with it. A span of Chinese wants a character count and a span of Latin wants
 /// a word count; a mixed transcript has both, so the majority of the span's own
 /// units picks the budget rather than a flag decided for the whole file.
-pub fn span_budget(span: &[&Tok], latin_words: f64, latin_chars: f64, cjk_chars: f64)
+fn span_budget(span: &[&Tok], latin_words: f64, latin_chars: f64, cjk_chars: f64)
     -> (f64, Option<f64>)
 {
     let splittable = span.iter().filter(|t| t.splittable).count();

@@ -79,8 +79,7 @@ impl Vocab {
         (ids, pieces)
     }
 
-    /// [`tokenise`], with `<star>` targets placed the way the reference places
-    /// them for this script.
+    /// [`tokenise`], with one `<star>` in front of every word.
     ///
     /// This is not cosmetic. `<star>` is a real entry of the CTC target
     /// sequence, so the DP has to place it and it consumes frames: on
@@ -91,24 +90,47 @@ impl Vocab {
     /// why every boundary landed one to three frames away from the
     /// reference's without any single rule looking wrong.
     ///
-    /// The placement follows the reference's per-script choice, and the choice
-    /// is made by the SCRIPT rather than by a caller-supplied flag:
+    /// The reference offers a second placement, `edges`, which puts one star
+    /// at each end of the whole file and none in between, and that is its
+    /// DEFAULT. It is not used here. A star is a DP anchor, and the DP on this
+    /// checkpoint is under-constrained wherever the acoustic evidence is weak:
+    /// with two stars the path can slide a whole phrase, and with one per word
+    /// it cannot.
     ///
-    ///   * `"edges"`   — one `<star>` at each end. Word-delimited scripts.
-    ///   * `"segment"` — one `<star>` at the start, then one before each
-    ///     segment. Scripts written without spaces, where a "word" is a run of
-    ///     characters and the stars are what separate the words.
+    /// Over the 180-clip multilingual set, 124 of whose clips FireRedVAD and a
+    /// short-time-energy detector agree about (VAD alone misses most of the
+    /// speech in some FLEURS English clips, and believing it inverts the
+    /// result), the per-frame path score:
     ///
-    /// A CJK transcript has no spaces, so the reference's whitespace split
-    /// yields a single word and `edges` would append a second star the
-    /// reference never had — a boundary shift INTRODUCED by the fix. Hence the
-    /// script test here rather than a fixed mode.
-    /// [	okenise_with_stars], plus the source word index of every target.
+    ///     Spanish   -0.1308 vs -0.3896
+    ///     French    -0.2605 vs -0.5315
+    ///     German    -0.3322 vs -0.5347
+    ///     English   -0.5936 vs -0.7137
+    ///     Japanese  -0.2348 vs -0.2346
+    ///     Chinese   -0.1993 vs -0.1987
+    ///     all 124   -0.2570 vs -0.4301      (one star per word wins 91)
+    ///
+    /// The gap is exactly where the mechanism says it should be: large on
+    /// scripts that space their words, nil on the ones that do not, where a
+    /// "word" is a whole line and both placements put about the same number of
+    /// stars anyway. On material with reference timings the same ordering
+    /// holds -- Korean broadcast word-start MAE 277.5 ms vs 442.0 ms, and on
+    /// the sung Chinese of the same file 82.8 ms vs 795.5 ms.
+    ///
+    /// The whole-file log-prob cannot compare the two: it sums over the path,
+    /// and two stars is fewer terms than one per word. The per-frame mean
+    /// divides by the same frame count either way, which is why it is the
+    /// number quoted.
+    ///
+    /// The stars are an ANCHOR, not a word marker. Word boundaries come from
+    /// `word_id`, which the tokenizer assigns per whitespace-delimited word and
+    /// which is correct for every script. Reading boundaries off the stars
+    /// instead put the whole English transcript into one cue.
+    /// [`tokenise_with_stars`], plus the source word index of every target.
     pub fn tokenise_with_word_ids(
         &self,
         text: &str,
     ) -> (Vec<usize>, Vec<String>, Vec<usize>) {
-        let cjk = text.chars().any(is_cjk);
         let mut ids: Vec<usize> = Vec::new();
         let mut pieces: Vec<String> = Vec::new();
         let mut word_ids: Vec<usize> = Vec::new();
@@ -132,7 +154,7 @@ impl Vocab {
             // or the ids would not be consecutive and the boundary would fall
             // in the wrong place.
             if letters.is_empty() { continue; }
-            if cjk && wi > 0 {
+            if wi > 0 {
                 push_star(&mut ids, &mut pieces, &mut word_ids, wi);
             }
             wi += 1;
@@ -142,14 +164,10 @@ impl Vocab {
                 word_ids.push(wi);
             }
         }
-        if !cjk {
-            push_star(&mut ids, &mut pieces, &mut word_ids, usize::MAX);
-        }
         (ids, pieces, word_ids)
     }
 
     pub fn tokenise_with_stars(&self, text: &str) -> (Vec<usize>, Vec<String>) {
-        let cjk = text.chars().any(is_cjk);
 
         // Words are split on whitespace and their letters concatenated, with a
         // `<star>` at each end (`edges`) or between words (`segment`).
@@ -196,9 +214,7 @@ impl Vocab {
 
         push_star(&mut ids, &mut pieces);
         for (i, w) in words.iter().enumerate() {
-            if i > 0 && cjk {
-                // `segment` mode separates words with a star, because the
-                // reference has no space token to separate them with there.
+            if i > 0 {
                 push_star(&mut ids, &mut pieces);
             }
             // The reference's `preprocess_text` builds `" ".join(list(word))`
@@ -218,9 +234,6 @@ impl Vocab {
                 ids.push(*id);
                 pieces.push(c.clone());
             }
-        }
-        if !cjk {
-            push_star(&mut ids, &mut pieces);
         }
         (ids, pieces)
     }
