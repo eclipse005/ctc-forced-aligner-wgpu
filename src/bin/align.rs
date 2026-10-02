@@ -19,24 +19,18 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ctc_forced_aligner_wgpu::align_inference::{AlignOutput, Aligner};
-use ctc_forced_aligner_wgpu::views::{self, resolve_split};
+use ctc_forced_aligner_wgpu::views;
 use ctc_forced_aligner_wgpu::DeviceSelector;
 
 const USAGE: &str = "\
 usage: align --audio <wav> (--text <text|file>) [options]
 
   --model <dir>            model directory (default: $CTC_MODEL_DIR or the bundled checkpoint)
-  --window <sec>           windowed encoding (default: 30; 0 = whole file)
-  --context <sec>          context on each side of a window (default: 2)
+  --window <sec>           memory/throughput only; it does not move timestamps (default: 30)
+  --context <sec>          encoder context each side of a window, at least 1.3 (default: 2)
   --device <spec>          one device: auto (default, cpu if no gpu), cpu, vulkan[:i], dx12[:i], #n, or a name substring
-  --format <json|spans|srt|cues>
-                           json is the tight alignment (default)
-  --split <word|char|sentence>
-                           spans only; default is char when the text is mostly CJK
-  --preset <short|standard|loose>
-                           subtitle preset (default: standard)
-  --merge-threshold <sec>  spans: snap a gap shorter than this (default: 0)
-  --output <path>          write here (default: print to stdout). spans also writes a .txt sidecar
+  --format <json|srt|cues> json is the full alignment (default); srt and cues are subtitles
+  --output <path>          write here (default: print to stdout)
   --list-devices           list wgpu adapters and exit
 ";
 
@@ -48,9 +42,6 @@ fn main() -> Result<()> {
     let mut context: f64 = 2.0;
     let mut device = String::from("auto");
     let mut format = String::from("json");
-    let mut split: Option<String> = None;
-    let mut preset = String::from("standard");
-    let mut merge_threshold: f64 = 0.0;
     let mut output: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
@@ -75,15 +66,6 @@ fn main() -> Result<()> {
                     .context("--context must be a number of seconds")?;
             }
             "--format" => format = it.next().context("--format needs a value")?,
-            "--split" => split = Some(it.next().context("--split needs a value")?),
-            "--preset" => preset = it.next().context("--preset needs a value")?,
-            "--merge-threshold" => {
-                merge_threshold = it
-                    .next()
-                    .context("--merge-threshold needs a value")?
-                    .parse()
-                    .context("--merge-threshold must be a number of seconds")?;
-            }
             "--device" => device = it.next().context("--device needs a value")?,
             "--output" | "-o" => {
                 output = Some(PathBuf::from(it.next().context("--output needs a value")?))
@@ -122,7 +104,7 @@ fn main() -> Result<()> {
     let out = aligner.align(&audio, &text, window, context)?;
     let rtfx = out.duration / (out.encode_s + out.align_s).max(1e-9);
 
-    let body = render(&out, &format, split.as_deref(), &preset, merge_threshold)?;
+    let body = render(&out, &format)?;
     match &output {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -131,20 +113,6 @@ fn main() -> Result<()> {
                 }
             }
             std::fs::write(path, &body)?;
-            if format == "spans" {
-                let split_name = resolve_split(&out.text, split.as_deref());
-                let spans = views::build_spans(
-                    &out.text,
-                    &out.tokens,
-                    out.frames,
-                    out.frame_rate,
-                    &out.frame_scores,
-                    &split_name,
-                    merge_threshold,
-                );
-                let txt = path.with_extension("txt");
-                std::fs::write(&txt, views::spans_to_txt(&spans))?;
-            }
         }
         None => println!("{body}"),
     }
@@ -166,52 +134,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn render(
-    out: &AlignOutput,
-    format: &str,
-    split: Option<&str>,
-    preset: &str,
-    merge_threshold: f64,
-) -> Result<String> {
+fn render(out: &AlignOutput, format: &str) -> Result<String> {
     match format {
         "json" => Ok(serde_json::to_string_pretty(out)?),
-        "spans" => {
-            if let Some(s) = split {
-                if !matches!(s, "word" | "char" | "sentence" | "auto") {
-                    anyhow::bail!("--split must be word, char, or sentence");
-                }
-            }
-            let split_name = resolve_split(&out.text, split);
-            let spans = views::build_spans(
-                &out.text,
-                &out.tokens,
-                out.frames,
-                out.frame_rate,
-                &out.frame_scores,
-                &split_name,
-                merge_threshold,
-            );
-            let segments: Vec<_> = spans
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "start": s.start,
-                        "end": s.end,
-                        "text": s.text,
-                        "score": s.score,
-                    })
-                })
-                .collect();
-            Ok(serde_json::to_string_pretty(&serde_json::json!({
-                "text": out.text,
-                "segments": segments,
-            }))?)
-        }
         "srt" | "cues" => {
-            if !matches!(preset, "short" | "standard" | "loose") {
-                anyhow::bail!("--preset must be short, standard, or loose");
-            }
-            let doc = views::build_cues(&out.tokens, preset);
+            let doc = views::build_cues(&out.tokens);
             if format == "srt" {
                 Ok(views::cues_to_srt(&doc))
             } else {
@@ -228,13 +155,12 @@ fn render(
                     })
                     .collect();
                 Ok(serde_json::to_string_pretty(&serde_json::json!({
-                    "preset": doc.preset,
                     "script": doc.script,
                     "cues": cues,
                 }))?)
             }
         }
-        other => anyhow::bail!("unknown --format {other:?}; expected json, spans, srt, or cues"),
+        other => anyhow::bail!("unknown --format {other:?}; expected json, srt, or cues"),
     }
 }
 

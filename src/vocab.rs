@@ -15,7 +15,7 @@ use std::path::Path;
 /// ("hello 你好") still needs the segment rule, and Thai / Kana / Hangul are
 /// spaced inconsistently enough that treating them as word-delimited would put
 /// a star where the reference has none.
-fn is_cjk(c: char) -> bool {
+pub fn is_cjk(c: char) -> bool {
     let n = c as u32;
     (0x3040..=0x30FF).contains(&n)      // kana
         || (0x3400..=0x4DBF).contains(&n)  // CJK ext A

@@ -29,8 +29,6 @@ pub enum Tower {
     Gpu(GpuModel),
 }
 
-pub const FRAME_RATE: f64 = 50.0;
-pub const BLANK_ID: usize = 0;
 
 /// The score the reference gives `<star>`: the column it appends to its
 /// emissions is `torch.cat([emissions, zeros(..., 1)], dim=1)` AFTER the
@@ -47,7 +45,6 @@ pub const BLANK_ID: usize = 0;
 /// frame is the star, which is the situation the reference's own banding
 /// produces.
 const CTC_STAR_SCORE: f32 = -1.0;
-const SUBSAMPLING: usize = 320; // samples per frame
 
 pub struct Aligner {
     pub tower: Tower,
@@ -58,6 +55,15 @@ pub struct Aligner {
     /// ([`RowGather::Head`]).  `None` on the CPU tower, which owns a full
     /// [`Model`].
     pub gpu_lm_head: Option<LmHeadCpu>,
+    /// Input samples per output frame, from the feature extractor's conv
+    /// strides. Not a constant: it is a property of the checkpoint, and
+    /// hardcoding it would silently mis-time every frame of a model whose
+    /// extractor downsamples differently.
+    pub subsampling: usize,
+    /// Timestamps per second, i.e. `TARGET_SR / subsampling`.
+    pub frame_rate: f64,
+    /// The CTC blank, i.e. the checkpoint's `pad_token_id`.
+    pub blank_id: usize,
 }
 
 /// One output JSON, mirroring `omni_align.cli.to_json_obj` field for field.
@@ -75,6 +81,11 @@ pub struct AlignOutput {
     pub chars: Vec<serde_json::Value>,
     pub words: Vec<serde_json::Value>,
     pub segments: Vec<serde_json::Value>,
+    /// The same transcript as `words`/`segments` but with the leading and
+    /// trailing silence folded in, so the spans tile the whole file and no
+    /// stretch of audio belongs to nobody. Granularity is chosen from the
+    /// transcript, not asked for.
+    pub spans: Vec<serde_json::Value>,
     /// Encoder time. Omitted from JSON so the schema stays the Python one.
     #[serde(skip)]
     pub encode_s: f64,
@@ -121,7 +132,33 @@ impl Aligner {
             Tower::Cpu(_) => None,
         };
         let vocab = Vocab::load(model_dir)?;
-        Ok(Self { tower, vocab, model_dir: model_dir.to_path_buf(), gpu_lm_head })
+        let cfg = crate::config::Wav2Vec2Config::load(model_dir)?;
+        // The star's synthetic id must land outside the vocabulary, and the
+        // vocabulary must be exactly as wide as the lm head: a checkpoint with
+        // spare columns takes a different gather path than one without, and
+        // guessing wrong mis-times the whole file.
+        anyhow::ensure!(
+            vocab.size == cfg.vocab_size,
+            "vocab.json holds {} ids but config.json declares vocab_size {}",
+            vocab.size,
+            cfg.vocab_size
+        );
+        let subsampling = cfg.subsampling();
+        let frame_rate = cfg.frame_rate(TARGET_SR);
+        anyhow::ensure!(
+            cfg.pad_token_id < vocab.size,
+            "pad_token_id {} is outside the vocabulary",
+            cfg.pad_token_id
+        );
+        Ok(Self {
+            tower,
+            vocab,
+            model_dir: model_dir.to_path_buf(),
+            gpu_lm_head,
+            subsampling,
+            frame_rate,
+            blank_id: cfg.pad_token_id,
+        })
     }
 
     pub fn backend_name(&self) -> &'static str {
@@ -222,7 +259,7 @@ impl Aligner {
         // present. The DP still treats the star as its own target, because the
         // skip rule compares ids and `<star>` never equals `<blank>`.
         let star = self.vocab.star_id;
-        let gather_ids: Vec<usize> = ids.iter().map(|&c| if c == star { BLANK_ID } else { c }).collect();
+        let gather_ids: Vec<usize> = ids.iter().map(|&c| if c == star { self.blank_id } else { c }).collect();
 
         let (waveform, sr) = load_audio(audio_path)
             .with_context(|| format!("load {}", audio_path.display()))?;
@@ -238,7 +275,7 @@ impl Aligner {
         // repeat rule, so it keeps the real one. The star's ODD state index in
         // `expanded` is recorded so its gathered score can be forced to the 0.0
         // the reference gives it -- see `forward_gathered`.
-        let expanded = build_expanded_labels(&gather_ids, BLANK_ID);
+        let expanded = build_expanded_labels(&gather_ids, self.blank_id);
         let star_state_idx: Vec<usize> =
             (0..ids.len()).filter(|&i| ids[i] == star).map(|i| 2 * i + 1).collect();
         let t_enc = std::time::Instant::now();
@@ -255,7 +292,7 @@ impl Aligner {
         let mut res = match trellis {
             Trellis::Gathered(gathered) => {
                 ctc_forced_align_gathered_with_word_ids(
-                    &gathered, &ids, FRAME_RATE, Some(&pieces), &word_ids, keep_path)?
+                    &gathered, &ids, self.frame_rate, Some(&pieces), &word_ids, keep_path)?
             }
             Trellis::Lazy(blocks) => {
                 let gather = match &self.tower {
@@ -275,7 +312,7 @@ impl Aligner {
                 let frames = em.total_frames();
                 em.validate()?;
                 ctc_forced_align_emissions_with_word_ids(
-                    &em, frames, &ids, FRAME_RATE, Some(&pieces), &word_ids)?
+                    &em, frames, &ids, self.frame_rate, Some(&pieces), &word_ids)?
             }
         };
         let align_s = t_al.elapsed().as_secs_f64();
@@ -314,6 +351,15 @@ impl Aligner {
             })
             .collect();
 
+        let spans = crate::views::build_spans(
+            &text,
+            &res.tokens,
+            res.frames,
+            res.frame_rate,
+            &res.frame_scores,
+            crate::views::auto_split(&text),
+        );
+
         Ok(AlignOutput {
             audio: audio_path.display().to_string(),
             text,
@@ -351,6 +397,17 @@ impl Aligner {
                     })
                 })
                 .collect(),
+            spans: spans
+                .iter()
+                .map(|s| {
+                serde_json::json!({
+                    "start": s.start,
+                    "end": s.end,
+                    "text": s.text,
+                    "score": s.score,
+                })
+            })
+            .collect(),
             encode_s,
             align_s,
             tokens: res.tokens,
@@ -379,7 +436,7 @@ impl Aligner {
         let vocab = self.vocab_size();
         let hidden = self.hidden_size();
         let states = expanded.len();
-        let frames = (waveform.len() / SUBSAMPLING).max(1);
+        let frames = (waveform.len() / self.subsampling).max(1);
         let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
         let form = match std::env::var("CTC_TRELLIS").ok().as_deref() {
             Some("gathered") => Form::Gathered,
@@ -563,8 +620,8 @@ impl Aligner {
                 }
             });
         }
-        let ctx_frames = ctx / SUBSAMPLING;
-        let win_frames = win / SUBSAMPLING;
+        let ctx_frames = ctx / self.subsampling;
+        let win_frames = win / self.subsampling;
         anyhow::ensure!(ctx_frames >= 64, "context must cover the ±64-frame positional conv");
         anyhow::ensure!(win_frames > 0, "window must span at least one frame");
 
@@ -572,7 +629,7 @@ impl Aligner {
         let extension = n.div_ceil(win) * win - n;
         // padded = [ctx zeros | waveform | ctx+extension zeros]
         let padded_len = n + 2 * ctx + extension;
-        let ext_frames = ((extension as f64 / TARGET_SR as f64 * FRAME_RATE).ceil()) as usize;
+        let ext_frames = ((extension as f64 / TARGET_SR as f64 * self.frame_rate).ceil()) as usize;
 
         // rows kept per window: the middle win_frames, clamped for a short one
         let kept_of = |rows: usize| (ctx_frames + win_frames).min(rows) - ctx_frames.min(rows);
