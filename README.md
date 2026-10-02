@@ -69,14 +69,15 @@ align --audio speech.wav --text transcript.txt --format srt --output out.srt
 | `--text <file/text>` | Transcript: an existing path is read as a file, otherwise the argument is used as text |
 | `--model <dir>` | Model directory, or the `CTC_MODEL_DIR` environment variable |
 | `--device <spec>` | `auto` (default, CPU when no GPU), `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring |
-| `--window <sec>` | Windowed encoding in seconds (default `30`); `0` runs the whole file in one forward pass |
-| `--context <sec>` | Overlap carried on each side of a window (default `2`) |
-| `--format <json\|spans\|srt\|cues>` | `json` is the tight character alignment (default); `spans` tiles silence onto neighbouring segments; `srt` / `cues` are subtitle breaks |
-| `--split <word\|char\|sentence>` | `spans` only; defaults to `char` for mostly-CJK text |
-| `--preset <short\|standard\|loose>` | Subtitle preset for `srt` / `cues` (default `standard`) |
-| `--merge-threshold <sec>` | `spans`: snap a gap shorter than this (default `0`) |
-| `--output <path>` | Write here (default: print to stdout). `spans` also writes a `.txt` sidecar |
+| `--window <sec>` | Memory and throughput; **does not move timestamps** (default `30`). Capped near 90 s by the single-forward VRAM limit |
+| `--context <sec>` | Encoder overlap on each side of a window (default `2`, floor near 1.3 — it must cover the positional conv) |
+| `--format <json\|srt>` | `json` is the full alignment (default); `srt` is subtitles |
+| `--output <path>` | Write here (default: print to stdout) |
 | `--list-devices` | List the wgpu adapters usable on this machine |
+
+`--window` and `--context` were measured: across their legal range they move no timestamp metric (30/2 against 60/4 on the same material differ inside the noise on start MAE), and 60/4 encodes 47% slower. They are memory knobs, not accuracy knobs.
+
+`json` carries `chars` (per character, with frame indices and confidence), `words`, `segments`, `spans` (silence folded onto neighbours so the timeline is gapless) and `cues` (exactly the line breaking `--format srt` renders). `--format srt` is those cues as text, so the two cannot disagree.
 
 ### Library
 
@@ -106,7 +107,45 @@ Only WAV is currently supported.
 
 ### Timestamp granularity
 
-The model's convolutional frontend subsamples by 320, so **timestamps land on a 20 ms grid** — that is the model's limit, not this implementation's. Tokenization is whitespace-split for word-delimited scripts and per-character for CJK; characters outside the checkpoint's vocabulary are dropped.
+The model's convolutional frontend subsamples by 320, so **timestamps land on a 20 ms grid** — that is the model's limit, not this implementation's. The frame rate, the subsampling factor and the blank id all come from `config.json` (the product of `conv_stride`, and `pad_token_id`), none of them is a constant.
+
+**What gets aligned is the character. Spaces do not** — a space is a tokenizer separator, and the audio has no such acoustic event. **Punctuation does, but occupies no time**: it is in the vocabulary and a real CTC target, but it is snapped onto the preceding token's end, so `start == end` and it takes zero frames. The model has no opinion about it either — measured confidence runs −12 to −24 — and giving it a duration would be inventing one.
+
+Whether the output is per character or per word is decided **per word**, with no language table: a word whose characters are mostly CJK is split into characters, every other word is one unit the line-breaker cannot cut inside. So Korean and Japanese come out per character, Chinese likewise (a Chinese "word" is a whole sentence, and the test applies inside it), and English, Spanish and French per word.
+
+Characters outside the checkpoint's vocabulary are dropped, and listed in the `skipped` field of `json`.
+
+### Deliberate departures from the reference
+
+The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that implementation was written for its own MMS checkpoint. The following five were changed **on measurement, on this checkpoint**. They are not bugs:
+
+1. **One `<star>` per word, not the reference's `edges` placement (one at each end of the file).**
+   A star is a DP anchor, not a word marker. This checkpoint's DP is under-constrained wherever the acoustic evidence is weak: two stars let the whole path slide, one per word does not. Over a 180-clip multilingual set — 124 of which pass a FireRedVAD / short-time-energy cross-check, since VAD alone misses most of the speech in some FLEURS English clips and believing it inverts the result:
+
+   | Language | one per word | `edges` |
+   |---|---:|---:|
+   | Spanish | **−0.1308** | −0.3896 |
+   | French | **−0.2605** | −0.5315 |
+   | German | **−0.3322** | −0.5347 |
+   | English | **−0.5936** | −0.7137 |
+   | Japanese | −0.2348 | −0.2346 |
+   | Chinese | −0.1993 | −0.1987 |
+   | **all 124** | **−0.2570** | −0.4301 |
+
+   The gap lands exactly where the mechanism says it should: large on scripts that space their words, nil on the ones that do not, where a "word" is a whole line and both placements insert about as many stars. The whole-file `log_prob` cannot compare the two — it sums over the path, and two stars is fewer terms — so the per-frame mean is the number quoted.
+
+2. **A token may claim at most 1.0 s of the following silence.**
+   The midpoint rule hands a whole pause to the token in front of it, and one syllable was measured swallowing 8.4 s. The bound comes from the same corpus: over 15,722 characters the depth a token's tail reaches past the last detected speech has median 0.00 s, p99 0.00 s and a maximum of 1.57 s, so it is nearly free on read speech, and on material with long pauses it takes the worst end error from 8.4 s to 1.7 s and the end MAE from 896 ms to 486 ms — with **every start boundary bit-identical**, because the bound is one-sided and never reaches a start.
+   FireRedASR2 caps by a multiple of the mean duration instead. On this corpus that rule fired on 7.9% of tokens and cut more real speech than it released: a multiple of a duration and a bound in seconds are not the same thing.
+
+3. **The line-breaker groups on `word_id`, not on `<star>`.**
+   Recovering word boundaries from stars only works for scripts whose placement puts one in front of every word. English takes `edges`, with two stars in a whole file, so the entire transcript arrived as one cue and every word was cut in half.
+
+4. **The breaking unit is decided per word, not per file.**
+   The old code asked once per file whether the text was Chinese; one Han character made the whole transcript Chinese, and `alignment` came out as `alignm` and `ent`.
+
+5. **`--format cues` is now a field of `json`.**
+   It was the same `build_cues()` call as `--format srt` with the numbers serialised as JSON, verified identical cue for cue. Two formats could only ever disagree with each other.
 
 ### Long audio
 
@@ -122,6 +161,8 @@ Measured against the [Buckeye](https://buckeye.shoup.informatics.cmu.edu/) hand-
 | MMS-FA (published, fa-bench Track-1) | 30.5 / 31.1 ms | — | — |
 
 The two tower implementations (CPU and GPU) and all three trellis forms are bit-identical on the same input, so the numbers above are a property of the checkpoint, not of the backend.
+
+**The scope of that number is worth stating.** Buckeye is read English with short inter-word gaps. On broadcast material with long pauses, start boundaries stay accurate — 277.5 ms word-start MAE (median 65 ms) on a Korean broadcast, 82.8 ms on the sung Chinese of the same file — but **end boundaries reach into the silence that follows**, because the midpoint rule says so. The bound above in the departures list reduces it; a systematic lateness remains.
 
 ### Why wgpu?
 
