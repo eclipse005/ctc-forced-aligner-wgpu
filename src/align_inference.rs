@@ -288,13 +288,23 @@ impl Aligner {
         let hidden = self.hidden_size();
         let states = expanded.len();
         let frames = (waveform.len() / SUBSAMPLING).max(1);
+        let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
         let form = match std::env::var("CTC_TRELLIS").ok().as_deref() {
             Some("gathered") => Form::Gathered,
             Some("logits") => Form::Lazy(BlockKind::Logits { vocab }),
             Some("hidden") => Form::Lazy(BlockKind::Hidden { hidden }),
             _ if fits(frames, states) => Form::Gathered,
-            _ if fits(frames, vocab) => Form::Lazy(BlockKind::Logits { vocab }),
-            _ => Form::Lazy(BlockKind::Hidden { hidden }),
+            // past the gathered trellis, the encoder stream (4 KB/frame) beats
+            // parking the lm head's logits (41 KB/frame) for a windowed run:
+            // the per-window head re-run costs ~25 ms against a 34 s window,
+            // while the logits form's extra 37 KB/frame sits resident for the
+            // whole DP.  Measured on 15 m: hidden 2.24 GB / RTFx 17.8 vs
+            // logits 4.19 GB / 17.1, outputs byte-identical.  An unchunked
+            // forward has no windows to re-run over — the head would
+            // materialise the whole (T, V) matrix anyway — so it keeps the
+            // logits form.
+            _ if win.is_some() => Form::Lazy(BlockKind::Hidden { hidden }),
+            _ => Form::Lazy(BlockKind::Logits { vocab }),
         };
         // the GPU tower reads its log-probs back from the device, and the
         // encoder stream is not plumbed through its readback, so a forced
