@@ -428,17 +428,32 @@ fn cue_tokens(tokens: &[TokenAlignment]) -> Vec<Tok> {
     };
 
     for t in tokens {
-        // `<star>` is the reference's synthetic word-boundary marker, not a
-        // character of the transcript. It is the boundary signal that survives
-        // here: the tokenizer drops the transcript's own spaces (they are word
-        // separators, not vocabulary pieces). Reading it as a boundary keeps
-        // the words apart; keeping it would print the marker in the subtitle.
+        // Two different boundary signals, and they arrive in different places.
+        //
+        // `<star>` and whitespace are markers that sit BETWEEN words, so
+        // discarding them loses nothing -- and the star has to go, or it is
+        // printed in the subtitle.
+        //
+        // A change of `word_id` arrives ON the first character of the next
+        // word: that character is real text. Treating it as a boundary threw
+        // away the first letter of every word, which is what turned
+        // "All right, we purse welcome" into "All ight, e urse elcome". Flush
+        // on the change and keep the token.
+        //
+        // The word id is the signal that works for every script. The star
+        // placement does not: English takes `edges`, which has exactly two
+        // stars in a whole file, so grouping on stars made the entire
+        // transcript one 3-minute cue with every space gone.
         if t.piece == "<star>" || t.piece.trim().is_empty() {
             flush(&mut buf, &mut pending, &mut out);
             pending = true;
-        } else {
-            buf.push(t);
+            continue;
         }
+        if t.word_id != buf.first().map(|b| b.word_id).unwrap_or(t.word_id) {
+            flush(&mut buf, &mut pending, &mut out);
+            pending = true;
+        }
+        buf.push(t);
     }
     flush(&mut buf, &mut pending, &mut out);
     merge_decimals(out)
@@ -873,10 +888,17 @@ mod tests {
     use super::*;
 
     fn tok(i: usize, piece: &str, sf: i64, ef: i64) -> TokenAlignment {
+        tokw(i, piece, i, sf, ef)
+    }
+
+    /// A token that belongs to word `w`. The word id is what the tokenizer
+    /// assigns per whitespace-delimited word, and it is what `cue_tokens` now
+    /// groups on -- a star is the CTC anchor, not the word boundary.
+    fn tokw(i: usize, piece: &str, w: usize, sf: i64, ef: i64) -> TokenAlignment {
         TokenAlignment {
             index: i,
             token_id: 1,
-            word_id: i,
+            word_id: w,
             piece: piece.to_string(),
             start: sf as f64 / 50.0,
             end: (ef + 1) as f64 / 50.0,
@@ -884,6 +906,21 @@ mod tests {
             end_frame: ef,
             score: -0.2,
         }
+    }
+
+    /// A run of tokens laid out as words: `[["<star>", "你", "好"], ...]`.
+    fn words_from(groups: &[&[&str]]) -> Vec<TokenAlignment> {
+        let mut out = Vec::new();
+        for (w, g) in groups.iter().enumerate() {
+            for piece in *g {
+                if *piece == "<star>" {
+                    out.push(tokw(out.len(), piece, w, 10 + 10 * out.len() as i64, 12 + 10 * out.len() as i64));
+                } else {
+                    out.push(tokw(out.len(), piece, w, 10 + 10 * out.len() as i64, 12 + 10 * out.len() as i64));
+                }
+            }
+        }
+        out
     }
 
     #[test]
@@ -904,7 +941,7 @@ mod tests {
     #[test]
     fn cues_keep_decimal() {
         let pieces = ["达", "到", "2", ".", "5", "。"];
-        let tokens: Vec<_> = pieces.iter().enumerate().map(|(i, p)| tok(i, p, 10 + i as i64, 10 + i as i64)).collect();
+        let tokens: Vec<_> = pieces.iter().enumerate().map(|(i, p)| tokw(i, p, 0, 10 + i as i64, 10 + i as i64)).collect();
         let doc = build_cues(&tokens);
         assert_eq!(doc.cues.len(), 1);
         assert_eq!(doc.cues[0].text, "达到2.5。");
@@ -1006,12 +1043,7 @@ mod tests {
         // in front of every word. It is the only word-boundary signal left
         // (the tokenizer drops the transcript's spaces), so it has to become
         // the boundary AND stay out of the rendered text.
-        let names = ["<star>", "你", "好", "<star>", "世", "界", "<star>"];
-        let tokens: Vec<TokenAlignment> = names
-            .iter()
-            .enumerate()
-            .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
-            .collect();
+        let tokens = words_from(&[&["<star>", "你", "好"], &["<star>", "世", "界"]]);
         let words = cue_tokens(&tokens);
         assert!(words.iter().all(|w| w.splittable));
         let text: String = words.iter().map(|w| w.token.as_str()).collect();
@@ -1040,15 +1072,7 @@ mod tests {
     /// line-breaker duly cut `alignment` into `alignm` and `ent`.
     #[test]
     fn mixed_script_breaks_between_characters_and_never_inside_a_word() {
-        let names = [
-            "<star>", "你", "好", "这", "个", "<star>", "a", "l", "i", "g", "n", "<star>",
-            "工", "具", "<star>",
-        ];
-        let tokens: Vec<TokenAlignment> = names
-            .iter()
-            .enumerate()
-            .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
-            .collect();
+        let tokens = words_from(&[&["<star>", "你", "好", "这", "个"], &["<star>", "a", "l", "i", "g", "n"], &["<star>", "工", "具"]]);
         let words = cue_tokens(&tokens);
         let text: String = join_seg(&words);
         assert_eq!(text, "你好这个 align 工具");
@@ -1079,21 +1103,15 @@ mod tests {
         let sentence = "the quick brown fox jumps over the lazy dog and then it keeps running \
                         for a while until somebody finally calls it back to the yard again";
         let words: Vec<String> = sentence.split_whitespace().map(String::from).collect();
-        let mut names: Vec<String> = vec!["<star>".to_string()];
-        let mut chars = 0usize;
-        for (i, w) in words.iter().enumerate() {
-            if i > 0 {
-                names.push("<star>".to_string());
-            }
-            names.extend(w.chars().map(|c| c.to_string()));
-            chars += w.chars().count();
-        }
-        names.push("<star>".to_string());
-        let tokens: Vec<TokenAlignment> = names
-            .iter()
-            .enumerate()
-            .map(|(i, p)| tok(i, p, 10 + 2 * i as i64, 12 + 2 * i as i64))
+        // the layout the tokenizer actually produces: every word carries a
+        // word id, and the star placement is whatever the script gets
+        let groups: Vec<Vec<&str>> = vec![vec!["<star>"]]
+            .into_iter()
+            .chain(words.iter().map(|w| vec!["<star>", w.as_str()]))
             .collect();
+        let borrowed: Vec<&[&str]> = groups.iter().map(|g| g.as_slice()).collect();
+        let tokens = words_from(&borrowed);
+        let chars: usize = words.iter().map(|w| w.chars().count()).sum();
         let doc = build_cues(&tokens);
         assert!(doc.cues.len() > 1, "a long sentence must be cut");
         let mut rejoined = String::new();
@@ -1119,7 +1137,7 @@ mod tests {
         let tokens: Vec<TokenAlignment> = names
             .iter()
             .enumerate()
-            .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
+            .map(|(i, p)| tokw(i, p, 0, 10 + 10 * i as i64, 12 + 10 * i as i64))
             .collect();
         let words = cue_tokens(&tokens);
         assert_eq!(words.len(), 1);
