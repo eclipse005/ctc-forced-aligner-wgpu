@@ -744,6 +744,7 @@ mod tests {
         TokenAlignment {
             index: i,
             token_id: 1,
+            word_id: i,
             piece: piece.to_string(),
             start: sf as f64 / 50.0,
             end: (ef + 1) as f64 / 50.0,

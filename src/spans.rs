@@ -9,8 +9,20 @@
 use crate::viterbi::TokenAlignment;
 
 /// Characters treated as a word boundary rather than word content.
+///
+/// The apostrophe is deliberately NOT here. It is word-INTERNAL in English
+/// (`it's`, `i'm`, `don't`, `we're`) and the Python reference splits words on
+/// whitespace, not on punctuation, so those are single words there. Listing
+/// `'` as punctuation made `it's` come out as two words `it` + `s` -- on
+/// Buckeye dev that turned 135 gold words into 146 predictions, and only 85 of
+/// them matched a gold label, because the stray `s`/`t`/`m` fragments had
+/// nothing to pair with.
+///
+/// It stays excluded from the WORD-BREAKING set below; a standalone quote
+/// surrounded by spaces is still a separator there, because word boundaries
+/// come from the whitespace run, not from this character.
 pub const PUNCT: &[char] = &[
-    ' ', '\t', '\n', '.', ',', '!', '?', ';', ':', '"', '\'', '(', ')', '[', ']', '{', '}', '<',
+    ' ', '\t', '\n', '.', ',', '!', '?', ';', ':', '"', '(', ')', '[', ']', '{', '}', '<',
     '>', '«', '»', '„', '“', '”', '‘', '’', '…', '、', '，', '。', '！', '？', '；', '：', '（',
     '）', '【', '】', '《', '》', '〈', '〉', '·', '～', '~', '-', '—', '–',
 ];
@@ -46,6 +58,13 @@ pub struct SegmentSpan {
 }
 
 fn is_word_char(piece: &str) -> bool {
+    if piece == "<star>" {
+        // `<star>` is the CTC target the reference inserts between words, not a
+        // character of one. It must BREAK the word: treating its pieces (`<`,
+        // `s`, `t`, `a`, `r`, `>`) as word characters fused a whole utterance
+        // into a single word, because none of them appear in PUNCT either.
+        return false;
+    }
     !piece.is_empty() && !piece.chars().any(|c| PUNCT.contains(&c))
 }
 
@@ -71,6 +90,16 @@ pub fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
     }
 
     for t in tokens {
+        // The word boundary comes from `word_id`, not from the piece. The
+        // target sequence is every word's letters laid end to end with nothing
+        // between the words, so a piece test cannot see where one word stopped:
+        // "andhesat" looks like one long run and the whole utterance came out as
+        // a single word. A space token would have carried the boundary, but it
+        // would also be a CTC target the reference never had, and it lengthens
+        // the sequence past what the frame count can carry.
+        if t.word_id != buf.first().map(|b| b.word_id).unwrap_or(t.word_id) {
+            flush!();
+        }
         if is_word_char(&t.piece) {
             buf.push(t);
         } else {

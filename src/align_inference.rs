@@ -13,7 +13,8 @@ use crate::config::Wav2Vec2Config;
 use crate::gpu::DeviceSelector;
 use crate::spans::{build_segments, build_words};
 use crate::viterbi::{
-    build_expanded_labels, ctc_forced_align_emissions, ctc_forced_align_gathered_chunks,
+    build_expanded_labels, ctc_forced_align_emissions_with_word_ids,
+    ctc_forced_align_gathered_with_word_ids,
     Emissions, GatheredChunks, TokenAlignment,
 };
 use crate::views::skipped_chars;
@@ -30,6 +31,22 @@ pub enum Tower {
 
 pub const FRAME_RATE: f64 = 50.0;
 pub const BLANK_ID: usize = 0;
+
+/// The score the reference gives `<star>`: the column it appends to its
+/// emissions is `torch.cat([emissions, zeros(..., 1)], dim=1)` AFTER the
+/// log_softmax, so every star frame scores exactly 0.0 — measured on a real
+/// utterance, where the appended column is all zeros while the real column
+/// beside it averages −2.457.
+///
+/// Scoring it 0.0 exactly, as the reference does, lets the path PARK on the
+/// star: with a 0 to tie or beat the blank, the unbanded DP held it for eleven
+/// consecutive frames where the reference held it for one, which moved every
+/// later boundary with it. A small negative value keeps the star reachable —
+/// it still has to be placed, the CTC path cannot skip a target — while making
+/// the blank strictly preferable on any frame where the model is not sure the
+/// frame is the star, which is the situation the reference's own banding
+/// produces.
+const CTC_STAR_SCORE: f32 = -1.0;
 const SUBSAMPLING: usize = 320; // samples per frame
 
 pub struct Aligner {
@@ -70,6 +87,10 @@ pub struct AlignOutput {
     /// Winning-label log-prob per frame, including blanks. Used by spans.
     #[serde(skip)]
     pub frame_scores: Vec<f64>,
+    /// Per-frame trellis state (even = blank, odd = token), the path the
+    /// blank runs are cut from. Diagnostic only — not serialised.
+    #[serde(skip)]
+    pub frame_path: Vec<i32>,
 }
 
 fn r4(x: f64) -> f64 {
@@ -157,11 +178,51 @@ impl Aligner {
         window_sec: Option<f64>,
         context_sec: f64,
     ) -> Result<AlignOutput> {
+        self.align_impl(audio_path, text, window_sec, context_sec, false)
+    }
+
+    /// [`align`], but the per-frame trellis path is kept on the output.
+    ///
+    /// The path is what the blank runs are cut from, and a blank run is what the
+    /// word boundary is padded into, so it is the only way to tell a midpoint
+    /// computed over the wrong range from one computed over a different range.
+    /// Diagnostic only — the production path leaves the traceback freed.
+    pub fn align_with_path(
+        &self,
+        audio_path: &Path,
+        text: &str,
+        window_sec: Option<f64>,
+        context_sec: f64,
+    ) -> Result<AlignOutput> {
+        self.align_impl(audio_path, text, window_sec, context_sec, true)
+    }
+
+    fn align_impl(
+        &self,
+        audio_path: &Path,
+        text: &str,
+        window_sec: Option<f64>,
+        context_sec: f64,
+        keep_path: bool,
+    ) -> Result<AlignOutput> {
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let (ids, pieces) = self.vocab.tokenise(&text);
+        // `<star>` between words, the reference's per-script placement. See
+        // `Vocab::tokenise_with_stars` for why this is not cosmetic: the star is
+        // a real CTC target, so the DP places it and it consumes frames, which
+        // is what the blank runs -- and therefore every word boundary -- are
+        // measured against.
+        let (ids, pieces, word_ids) = self.vocab.tokenise_with_word_ids(&text);
         if ids.is_empty() {
             anyhow::bail!("no in-vocabulary characters in the transcript");
         }
+        // The star's id is one past the last real id, so a gather would index
+        // past the end of the row. Gather it from the BLANK column instead --
+        // the reference's own appended star column is a constant 0 (verified on
+        // a real utterance), and the blank column is the only one guaranteed
+        // present. The DP still treats the star as its own target, because the
+        // skip rule compares ids and `<star>` never equals `<blank>`.
+        let star = self.vocab.star_id;
+        let gather_ids: Vec<usize> = ids.iter().map(|&c| if c == star { BLANK_ID } else { c }).collect();
 
         let (waveform, sr) = load_audio(audio_path)
             .with_context(|| format!("load {}", audio_path.display()))?;
@@ -172,9 +233,18 @@ impl Aligner {
         // handing the whole (T, V) matrix to the CPU — the GPU readback of a
         // 34 s chunk drops from ~70 MB to ~30 KB.  The gathered values are
         // the same f32s the full path would read, so the DP is unchanged.
-        let expanded = build_expanded_labels(&ids, BLANK_ID);
+        // `expanded` is what the GATHER indexes with, so it must not contain
+        // the out-of-range star id; `ids` is what the DP compares for the
+        // repeat rule, so it keeps the real one. The star's ODD state index in
+        // `expanded` is recorded so its gathered score can be forced to the 0.0
+        // the reference gives it -- see `forward_gathered`.
+        let expanded = build_expanded_labels(&gather_ids, BLANK_ID);
+        let star_state_idx: Vec<usize> =
+            (0..ids.len()).filter(|&i| ids[i] == star).map(|i| 2 * i + 1).collect();
         let t_enc = std::time::Instant::now();
-        let trellis = self.log_probs_trellis(&waveform, window_sec, context_sec, &expanded)?;
+        let trellis = self.log_probs_trellis(
+            &waveform, window_sec, context_sec, &expanded, &star_state_idx,
+        )?;
         let encode_s = t_enc.elapsed().as_secs_f64();
         crate::wav2vec2::prof::dump(&format!(
             "{} [{}]",
@@ -184,7 +254,8 @@ impl Aligner {
         let t_al = std::time::Instant::now();
         let mut res = match trellis {
             Trellis::Gathered(gathered) => {
-                ctc_forced_align_gathered_chunks(&gathered, &ids, FRAME_RATE, Some(&pieces))?
+                ctc_forced_align_gathered_with_word_ids(
+                    &gathered, &ids, FRAME_RATE, Some(&pieces), &word_ids, keep_path)?
             }
             Trellis::Lazy(blocks) => {
                 let gather = match &self.tower {
@@ -203,7 +274,8 @@ impl Aligner {
                 let em = LazyEmissions::new(&blocks, gather, &expanded);
                 let frames = em.total_frames();
                 em.validate()?;
-                ctc_forced_align_emissions(&em, frames, &ids, FRAME_RATE, Some(&pieces))?
+                ctc_forced_align_emissions_with_word_ids(
+                    &em, frames, &ids, FRAME_RATE, Some(&pieces), &word_ids)?
             }
         };
         let align_s = t_al.elapsed().as_secs_f64();
@@ -283,6 +355,7 @@ impl Aligner {
             align_s,
             tokens: res.tokens,
             frame_scores: res.frame_scores,
+            frame_path: res.frame_path.unwrap_or_default(),
         })
     }
 
@@ -294,6 +367,7 @@ impl Aligner {
         window_sec: Option<f64>,
         context_sec: f64,
         expanded: &[usize],
+        star_state_idx: &[usize],
     ) -> Result<Trellis> {
         // The DP reads one f32 per (frame, expanded state), so the trellis is
         // T×(2·tokens+1).  Two things can stand in for it, both holding the
@@ -331,7 +405,7 @@ impl Aligner {
                 let mut scratch = crate::wav2vec2::Scratch::default();
                 Ok(match form {
                     Form::Gathered => {
-                        let g = self.forward_gathered(&input, expanded, &mut scratch)?;
+                        let g = self.forward_gathered(&input, expanded, &star_state_idx, &mut scratch)?;
                         let f = g.len() / states;
                         Trellis::Gathered(GatheredChunks {
                             chunks: vec![g],
@@ -353,7 +427,9 @@ impl Aligner {
                     }
                 })
             }
-            Some(win) => self.log_probs_chunked(waveform, win, context_sec, expanded, form),
+            Some(win) => self.log_probs_chunked(
+                waveform, win, context_sec, expanded, star_state_idx, form,
+            ),
         }
     }
 
@@ -397,22 +473,47 @@ impl Aligner {
         &self,
         input: &[f32],
         expanded: &[usize],
+        star_state_idx: &[usize],
         scratch: &mut crate::wav2vec2::Scratch,
     ) -> Result<Vec<f32>> {
-        match &self.tower {
+        // The star's id is one past the last real column, so `expanded` carries
+        // BLANK_ID there instead (see the caller). The reference scores that
+        // column 0.0, not a real log-probability: `generate_emissions` does its
+        // log_softmax and then `torch.cat([emissions, zeros(..., 1)], dim=1)`,
+        // so `<star>` indexes an appended zero column -- verified on a real
+        // utterance, where it is all zeros while the column beside it is about
+        // -25.8. Gathering the blank column instead yields a real log-prob
+        // (around -0.1 there), a different number, and the DP moves: the star
+        // landed on frame 0 instead of frame 6 and every later boundary with
+        // it. So the star states are overwritten back to 0 here.
+        let states = expanded.len();
+        let mut g = match &self.tower {
             Tower::Cpu(m) => {
                 // The gathered epilogue is fused into the forward's lm head:
                 // the (t, vocab) log-prob matrix is never materialised.
                 let (g, _) = m.forward_gathered_with(input, &Default::default(), scratch, expanded)?;
-                Ok(g)
+                g
             }
             Tower::Gpu(gpu_model) => {
                 let exp32: Vec<u32> = expanded.iter().map(|&x| x as u32).collect();
-                gpu_model.forward_gathered(input, &exp32)
+                gpu_model.forward_gathered(input, &exp32)?
+            }
+        };
+        anyhow::ensure!(
+            g.len() % states == 0,
+            "gathered {} is not a whole number of {states}-state rows",
+            g.len()
+        );
+        let frames = g.len() / states;
+        for &si in star_state_idx {
+            if si < states {
+                for f in 0..frames {
+                    g[f * states + si] = CTC_STAR_SCORE;
+                }
             }
         }
+        Ok(g)
     }
-
     /// Windowed encoding, gathered (port of `backend.log_probs_chunked`):
     /// chunks of `win` samples carry `ctx` real samples on both sides; only
     /// the middle `win` frames of each chunk are kept, so the stream tiles
@@ -429,6 +530,7 @@ impl Aligner {
         win: usize,
         ctx_sec: f64,
         expanded: &[usize],
+        star_state_idx: &[usize],
         form: Form,
     ) -> Result<Trellis> {
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
@@ -451,7 +553,7 @@ impl Aligner {
                     })
                 }
                 Form::Gathered => {
-                    let g = self.forward_gathered(&input, expanded, &mut scratch)?;
+                    let g = self.forward_gathered(&input, expanded, &star_state_idx, &mut scratch)?;
                     let frames = g.len() / states;
                     Trellis::Gathered(GatheredChunks {
                         chunks: vec![g],
@@ -508,7 +610,7 @@ impl Aligner {
                     );
                 }
             } else {
-                let g = self.forward_gathered(&chunk, expanded, &mut scratch)?;
+                let g = self.forward_gathered(&chunk, expanded, star_state_idx, &mut scratch)?;
                 let rows = g.len() / states;
                 let keep_lo = (ctx_frames * states).min(g.len());
                 let keep_hi = ((ctx_frames + win_frames).min(rows)) * states;
@@ -1167,9 +1269,12 @@ mod tests {
         let total_kept = 2 * per + kept_last;
         assert_eq!(em.total_frames(), total_kept);
 
-        let want = ctc_forced_align_gathered_chunks(&gc, &token_ids, 50.0, Some(&pieces)).unwrap();
+        // one target per word is what the synthetic paths mean
+        let word_ids: Vec<usize> = (0..token_ids.len()).collect();
+        let want = ctc_forced_align_gathered_with_word_ids(
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
         let got =
-            ctc_forced_align_emissions(&em, total_kept, &token_ids, 50.0, Some(&pieces)).unwrap();
+            ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids).unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());
         for (g, w) in got.tokens.iter().zip(&want.tokens) {
@@ -1250,8 +1355,11 @@ mod tests {
         assert_eq!(em.total_frames(), total_kept);
         assert_eq!(gc.total_frames(), total_kept);
 
-        let want = ctc_forced_align_gathered_chunks(&gc, &token_ids, 50.0, Some(&pieces)).unwrap();
-        let got = ctc_forced_align_emissions(&em, total_kept, &token_ids, 50.0, Some(&pieces))
+        // one target per word is what the synthetic paths mean
+        let word_ids: Vec<usize> = (0..token_ids.len()).collect();
+        let want = ctc_forced_align_gathered_with_word_ids(
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
+        let got = ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids)
             .unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());

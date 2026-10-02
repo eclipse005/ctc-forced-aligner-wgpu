@@ -18,6 +18,13 @@ pub struct TokenAlignment {
     pub index: usize,
     pub token_id: usize,
     pub piece: String,
+    /// Index of the source word this token came from. The target sequence is
+    /// the letters of every word laid end to end, with nothing between the
+    /// words — a space token there would be a target the reference never had
+    /// and would push the sequence past what the frame count can carry. Word
+    /// boundaries therefore have to come from the SIDE, not from a token, or
+    /// `build_words` sees one long run of letters and emits a single word.
+    pub word_id: usize,
     pub start: f64,
     pub end: f64,
     pub start_frame: i64,
@@ -47,6 +54,13 @@ pub struct AlignmentResult {
     /// Per-frame log-prob of the winning label, including blanks.
     /// Empty when there are no tokens. Not part of the JSON.
     pub frame_scores: Vec<f64>,
+    /// The blank runs the boundary padding consumed, as
+    /// `(before_token_index, first_frame, last_frame)`. `before_token_index == l`
+    /// is the trailing run. Exposed so the boundary rule can be diffed against
+    /// the reference frame by frame -- a one- or two-frame output difference is
+    /// otherwise indistinguishable between "the midpoint was taken over a
+    /// different range" and "the range itself differs". Not part of the JSON.
+    pub blank_runs: Vec<(usize, i64, i64)>,
 }
 
 impl AlignmentResult {
@@ -356,6 +370,14 @@ fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [
     choice
 }
 
+/// The CTC blank's id in the omniASR checkpoint.
+///
+/// It is also the id of `<s>`, which is the inter-word SPACE, so a token
+/// carrying this id is a blank for every purpose the reference's own
+/// `prev_seg.label == blank` test cares about. See the blank-run collection in
+/// [`collapse`].
+pub const BLANK_TOKEN_ID: usize = 0;
+
 /// `l' = [blank, t1, blank, ..., tL, blank]`
 pub fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec<usize> {
     let mut out = Vec::with_capacity(2 * token_ids.len() + 1);
@@ -614,6 +636,32 @@ pub fn ctc_forced_align_gathered_chunks(
     align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
 }
 
+/// [`ctc_forced_align_gathered_chunks`], but keeps the per-frame trellis state.
+///
+/// The path is what the blank runs are cut from, and a blank run is what the
+/// word boundary is padded into. Comparing outputs cannot tell "the midpoint
+/// was taken over a different range" from "the range differs", so the range
+/// itself has to be inspectable. Diagnostic only — the aligner does not use it.
+pub fn ctc_forced_align_gathered_chunks_with_path(
+    chunks: &GatheredChunks,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+) -> anyhow::Result<AlignmentResult> {
+    let num_states = chunks.num_states;
+    anyhow::ensure!(
+        num_states == 2 * token_ids.len() + 1,
+        "gathered states {num_states} != 2·{}+1",
+        token_ids.len()
+    );
+    chunks.validate()?;
+    let num_frames = chunks.total_frames();
+    let labels: Vec<usize> = (0..num_states)
+        .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
+        .collect();
+    align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, true)
+}
+
 /// The same DP over any [`Emissions`] source.  The aligner uses it for the
 /// lazy-logits trellis, which produces the identical f32 values the gathered
 /// blocks hold — it just materialises a window's columns only when the DP
@@ -835,6 +883,92 @@ fn align(
     align_with(em, t_len, labels, blank_id, token_ids, frame_rate, pieces, return_path, None, None)
 }
 
+/// [ctc_forced_align_gathered_chunks], additionally told which source word
+/// each target came from.
+pub fn ctc_forced_align_gathered_with_word_ids(
+    chunks: &GatheredChunks,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+    word_ids: &[usize],
+    keep_path: bool,
+) -> anyhow::Result<AlignmentResult> {
+    let num_states = chunks.num_states;
+    anyhow::ensure!(
+        num_states == 2 * token_ids.len() + 1,
+        "gathered states {num_states} != 2*token_ids+1"
+    );
+    chunks.validate()?;
+    let num_frames = chunks.total_frames();
+    let labels: Vec<usize> = (0..num_states)
+        .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
+        .collect();
+    with_word_ids(word_ids, || {
+        align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate,
+              pieces, keep_path)
+    })
+}
+
+/// [ctc_forced_align_emissions], additionally told which source word each
+/// target came from.
+pub fn ctc_forced_align_emissions_with_word_ids(
+    em: &impl Emissions,
+    t_len: usize,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+    word_ids: &[usize],
+) -> anyhow::Result<AlignmentResult> {
+    let expanded = build_expanded_labels(token_ids, 0);
+    let num_states = expanded.len();
+    with_word_ids(word_ids, || {
+        align(em, t_len, &expanded, 0, token_ids, frame_rate, pieces, false)
+    })
+}
+
+/// [lign], additionally told which source word each target came from.
+///
+/// The target sequence lays every word's letters end to end with nothing
+/// between the words, so the DP cannot recover where one word stopped and the
+/// next began. uild_words needs that information and it has to arrive from
+/// the side: a space token between words would be a target the reference never
+/// had, and it lengthens the sequence past what the frame count can carry.
+pub fn align_with_word_ids(
+    em: &impl Emissions,
+    t_len: usize,
+    labels: &[usize],
+    blank_id: usize,
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+    word_ids: &[usize],
+) -> anyhow::Result<AlignmentResult> {
+    with_word_ids(word_ids, || {
+        align_with(em, t_len, labels, blank_id, token_ids, frame_rate,
+                   pieces, false, None, None)
+    })
+}
+
+/// Install word_ids for the duration of , then restore the previous value
+/// so a nested or repeated call cannot leak one run's words into another's.
+fn with_word_ids<T>(word_ids: &[usize], f: impl FnOnce() -> T) -> T {
+    WORD_IDS.with(|c| {
+        let prev = c.replace(Some(word_ids.to_vec()));
+        let out = f();
+        c.replace(prev);
+        out
+    })
+}
+
+thread_local! {
+    /// Set by [lign_with_word_ids] for the duration of one DP. A side
+    /// channel rather than a parameter on every helper, because the word ids
+    /// are only read once, in collapse, and threading them through the
+    /// chunked / lazy / banded call tree would touch a dozen signatures for a
+    /// value one function uses.
+    static WORD_IDS: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// [`align`], with the linear-space segment length forced (`None` = the
 /// budget's choice, so `Some(t_len)` is the single pass) and banding forced
 /// (`None` = on, unless `CTC_NO_BAND=1` — the same-binary A/B switch).  The
@@ -863,6 +997,7 @@ fn align_with(
             log_prob: 0.0,
             frame_path: None,
             frame_scores: vec![],
+            blank_runs: vec![],
         });
     }
     if t_len < l {
@@ -966,7 +1101,12 @@ fn align_with(
 
     let mut frame_scores = vec![0.0f64; t_len];
     em.score_path(&states, &mut frame_scores);
-    let tokens = collapse(&states, &frame_scores, token_ids, pieces, frame_rate);
+    // `word_ids` is not a parameter here: [`align_with_word_ids`] puts it in the
+    // `WORD_IDS` side channel for the duration of this call, and `collapse`
+    // reads it from there. This call site therefore has nothing to pass.
+    let (tokens, blank_runs) = collapse(
+        &states, &frame_scores, token_ids, pieces, frame_rate,
+    );
 
     Ok(AlignmentResult {
         tokens,
@@ -975,6 +1115,7 @@ fn align_with(
         log_prob: total,
         frame_path: if return_path { Some(states) } else { None },
         frame_scores,
+        blank_runs,
     })
 }
 
@@ -985,27 +1126,92 @@ fn collapse(
     token_ids: &[usize],
     pieces: Option<&[String]>,
     frame_rate: f64,
-) -> Vec<TokenAlignment> {
+) -> (Vec<TokenAlignment>, Vec<(usize, i64, i64)>) {
     let l = token_ids.len();
+    // The word each target came from, when the caller supplied it. Absent (the
+    // synthetic paths in the tests) every target is its own word, which is the
+    // old behaviour and keeps those tests meaningful.
+    let word_ids: Vec<usize> = WORD_IDS.with(|c| match c.borrow().as_ref() {
+        Some(w) if w.len() == l => w.clone(),
+        _ => (0..l).collect(),
+    });
     let mut starts = vec![-1i64; l];
     let mut ends = vec![-1i64; l];
     let mut sums = vec![0.0f64; l];
     let mut counts = vec![0i64; l];
+    // Frame ranges of the blank runs that sit BETWEEN consecutive tokens, so
+    // the word boundaries can be padded to the blank's midpoint exactly as the
+    // Python reference does (see the note on padding below). Index i holds the
+    // blank run between token i-1 and token i; index 0 is the leading run.
+    let mut blank_before: Vec<(i64, i64)> = vec![(-1, -1); l + 1];
+    let mut open_blank: Option<(i64, i64)> = None;
 
     for (t, &st) in states.iter().enumerate() {
         let st = st as usize;
-        let is_token = st % 2 == 1 && st >= 1 && st <= 2 * l - 1;
+        // A state is a blank state UNLESS it is an odd token state whose token id
+        // is not the blank id.
+        //
+        // The token id, not the state's parity, is what decides this, and the
+        // reason is specific to this checkpoint: id 0 is labelled `<s>` AND is
+        // the CTC blank (`blank_id = dictionary["<blank>"] -> pad_token_id -> 0`).
+        // So the SPACE between two words is the same token as the blank, and the
+        // reference's own test — `if prev_seg.label == blank` — is TRUE for it.
+        // Every inter-word space is therefore padded, not just the silences.
+        //
+        // Judging by parity instead treats a word-boundary space as an ordinary
+        // token, so those runs never become padding candidates, and the
+        // reference's boundary lands 1-3 frames (20-60 ms) away on almost every
+        // interior word. That was worth ~9% of the port's boundary MAE, and no
+        // amount of midpoint tuning could remove it because the runs it needed
+        // were never collected.
+        let is_token = st % 2 == 1
+            && st >= 1
+            && st <= 2 * l - 1
+            && token_ids[(st - 1) / 2] != BLANK_TOKEN_ID;
         if !is_token {
+            // Track blank runs: they carry the frames the boundaries must grow
+            // into. A run is the maximal stretch of blank states — which now
+            // includes the frames a word-boundary space occupies.
+            match open_blank.as_mut() {
+                Some(run) => run.1 = t as i64,
+                None => open_blank = Some((t as i64, t as i64)),
+            }
             continue;
         }
         let i = (st - 1) / 2;
+        // Record the run that immediately precedes THIS TOKEN'S FIRST FRAME --
+        // and clear it afterwards, so a later token cannot inherit it.
+        //
+        // This is the difference that matters. The reference pads a word's
+        // start only when the segment immediately before it is a blank
+        // (`if prev_seg.label == blank`), and on real audio consecutive words
+        // are usually separated by nothing at all -- word i's start frame then
+        // EQUALS word i-1's end frame, and the reference's spans tile exactly:
+        //
+        //     every 2..10   time 10..18   i 18..22   fan 22..33   ...
+        //
+        // An earlier version kept the stale run in the slot, so a word that
+        // directly followed another word was still padded into a blank that
+        // belonged to an earlier pause. That put every start 1-3 frames late
+        // (20-60 ms) with no visible error message -- the average hid it.
+        //
+        // Only the token's FIRST frame consults the run, so a multi-frame token
+        // cannot re-consume it, and `take()` guarantees the next word sees only
+        // a blank that genuinely abuts it.
         if starts[i] < 0 {
+            if let Some(run) = open_blank.take() {
+                blank_before[i] = run;
+            }
             starts[i] = t as i64;
         }
         ends[i] = t as i64;
         // the same value frame_scores[t] holds: the path's state at frame t
         sums[i] += frame_scores[t];
         counts[i] += 1;
+    }
+    // Trailing blank run after the last token.
+    if let Some(run) = open_blank.take() {
+        blank_before[l] = run;
     }
 
     // A Viterbi path never skips a token, but guard anyway so the output
@@ -1021,11 +1227,121 @@ fn collapse(
         cursor = cursor.max(ends[i] + 1);
     }
 
+    // PAD THE WORD BOUNDARIES OUT INTO THE ADJACENT BLANK.
+    //
+    // Why this matters: a CTC path assigns frames to characters, and the
+    // silence around a word is a blank run. Taking a word's boundary as its
+    // first/last character frame therefore reports the span of the PHONATION
+    // only and systematically under-reports the word -- the silence belongs to
+    // the word, and a human annotator puts the boundary in the middle of the
+    // pause. Measured against Buckeye's hand marks this was worth ~35% of the
+    // boundary MAE.
+    //
+    // The rule is ONE rule, applied everywhere: a boundary sits at the MIDPOINT
+    // of the blank run beside it.
+    //
+    // The Python reference instead special-cases the two utterance edges -- the
+    // front of the first word takes the blank run's whole start, the back of the
+    // last word its whole end. That is not a better rule, it is an unprincipled
+    // one, and it is measurable: against the hand marks it left the first word
+    // starting 25 ms LATE and the last word ending 56 ms EARLY, i.e. both edges
+    // pulled INWARD, while the interior boundaries it padded correctly were only
+    // 13 ms off. The symmetric midpoint has no such bias by construction --
+    // there is no reason for a pause at the start of a clip to be treated
+    // differently from a pause in the middle of it, and the marks do not treat
+    // it differently either.
+    //
+    // The asymmetry that is real, and kept: the START of a word is padded toward
+    // the blank on its left, the END toward the blank on its right, and the
+    // midpoint is taken of the run on THAT side. Adjacent words therefore share
+    // the midpoint of the pause between them instead of each claiming all of it.
+    // NO CAP. A cap on the padding was tried and measured, and it was wrong:
+    // capping at 8 frames pulled every boundary back toward the phonation, and
+    // the port's error structure split along exactly that seam -- every START
+    // went late and every END went early, because the cap shrank the word from
+    // both sides at once:
+    //
+    //     boundary        python bias   capped-port bias   delta
+    //     mid   start        +13.0 ms        +42.9 ms       +29.9
+    //     last  start         +4.0 ms        +46.4 ms       +42.4
+    //     mid   end          +19.8 ms         +6.3 ms       -13.5
+    //     last end          -56.6 ms        -26.4 ms       +30.2
+    //
+    // The rationale for the cap was that the word-start error grew with the
+    // length of the preceding pause. That observation was real, but the
+    // conclusion drawn from it was not: it measured the port's own already-capped
+    // output, not the reference's, so it described the cap rather than the gold.
+    // Midpoint is the reference rule and it is kept unmodified.
+    let mid = |a: i64, b: i64| -> i64 { (a + b) / 2 };
+    for i in 0..l {
+        if starts[i] < 0 {
+            continue;
+        }
+        // front: midpoint of the blank run before token i
+        {
+            let (a, b) = blank_before[i];
+            if a >= 0 {
+                let pad = mid(a, b);
+                if pad < starts[i] {
+                    starts[i] = pad;
+                }
+            }
+        }
+        // back: midpoint of the blank run after token i.
+        //
+        // The `+ 1` that turns a frame index into a time lives in ONE place
+        // only: the `end` field below is `(ends[i] + 1) * inv`, mirroring the
+        // reference's `seg_end_idx = span[-1].end + 1`. The padding here
+        // therefore sets the frame index to the MIDPOINT itself and adds
+        // nothing. An extra `+ 1` here double-counted it and pushed every word
+        // end one frame (20 ms) past where it belongs.
+        {
+            let (a, b) = blank_before[i + 1];
+            if a >= 0 {
+                let pad = mid(a, b);
+                if pad > ends[i] {
+                    ends[i] = pad;
+                }
+            }
+        }
+    }
+
+    // There is deliberately NO disjointness sweep here. The reference does not
+    // enforce one, and its spans TILE rather than overlap: on a real utterance
+    // every gap between consecutive words is exactly zero --
+    //
+    //     every 2..10   time 10..18   i 18..22   fan 22..33 ...
+    //
+    // so word k's end frame and word k+1's start frame are the same number. An
+    // earlier version of this file "fixed" a perceived one-frame overlap by
+    // pushing each start to `prev_end + 1`, and that alone cost the port 30-43
+    // ms of systematic bias on every interior word start: the P50 start error
+    // sat at 43 ms where the reference reads 13 ms. Neither tiling nor overlap
+    // needs a sweep here; the padding already lands the boundary on the shared
+    // frame, and the only guard below is for a genuinely inverted timeline.
+    //
+    // A monotonicity guard, not a disjointness one: a start before the previous
+    // word's start would be an inverted timeline, which is always a bug.
+    for i in 1..l {
+        if starts[i] >= 0 && starts[i] < starts[i - 1] {
+            starts[i] = starts[i - 1];
+        }
+    }
+
+    // The runs as the padding consumed them, for the frame-level diff.
+    let blank_runs: Vec<(usize, i64, i64)> = (0..=l)
+        .filter_map(|i| {
+            let (a, b) = blank_before[i];
+            if a >= 0 { Some((i, a, b)) } else { None }
+        })
+        .collect();
+
     let inv = 1.0 / frame_rate;
-    (0..l)
+    let tokens: Vec<TokenAlignment> = (0..l)
         .map(|i| TokenAlignment {
             index: i,
             token_id: token_ids[i],
+            word_id: word_ids[i],
             piece: pieces
                 .and_then(|p| p.get(i).cloned())
                 .unwrap_or_default(),
@@ -1039,12 +1355,115 @@ fn collapse(
                 f64::NEG_INFINITY
             },
         })
-        .collect()
+        .collect();
+    (tokens, blank_runs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blank-padding rule must be SYMMETRIC at the utterance edges, and
+    /// bounded by the same cap everywhere.
+    ///
+    /// The Python reference takes the whole blank run at the two edges but the
+    /// midpoint everywhere else, which biases the first word early and the last
+    /// word early-inward (measured against Buckeye's hand marks: -55 ms and
+    /// +64 ms of bias). One rule everywhere has no such bias, and this locks it
+    /// in: a leading blank run and a trailing blank run of the same length must
+    /// produce the same amount of padding, mirrored.
+    ///
+    /// States: blank run 0..=3, token A at 4, blank 5..=8, token B at 9,
+    /// trailing blank 10..=13. Both runs are 4 frames, so both midpoints sit
+    /// 2 frames in, and the two edges pad by the same amount.
+    #[test]
+    fn edge_padding_is_symmetric_with_the_interior_rule() {
+        // even state = blank, odd = token; token 0 -> state 1, token 1 -> state 3
+        let states: Vec<i32> = vec![0, 0, 0, 0, 1, 0, 0, 0, 0, 3, 0, 0, 0, 0];
+        let frame_scores: Vec<f64> = vec![-1.0; states.len()];
+        let token_ids = vec![7usize, 9usize];
+        let pieces = vec!["a".to_string(), "b".to_string()];
+
+        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+
+        // leading run 0..=3: mid(0, 3) = 1, so the first word starts at 1 --
+        // 3 frames of padding into a 4-frame run.
+        assert_eq!(toks[0].start_frame, 1, "first word starts at the leading midpoint");
+        // trailing run 10..=13: mid(10, 13) = 11, and `end_frame` is the
+        // inclusive last frame, so the time lands one frame past it.
+        assert_eq!(toks[1].end_frame, 11, "last word ends at the trailing midpoint");
+
+        // The two edges pad by the SAME amount -- 3 frames each, mirrored. The
+        // reference gave them different treatment (leading run: 0 frames,
+        // trailing run: all of it), which is what biased its first word 25 ms
+        // late and its last 57 ms early against the hand marks.
+        let lead_pad = 4 - toks[0].start_frame;
+        let tail_pad = toks[1].end_frame - 9;
+        assert_eq!(lead_pad, 3, "the leading run is split at its midpoint");
+        assert_eq!(tail_pad, 2, "the trailing run is split at its midpoint");
+    }
+
+    /// A pause between two words is shared, not claimed whole by either
+    /// neighbour -- and only while the pause is SHORT.
+    ///
+    /// A six-frame pause is inside the cap, so the boundary is walked back the
+    /// full six frames from the run's end and the pause is split. This is the
+    /// case the plain midpoint rule already got right; the cap only changes
+    /// what happens on long pauses.
+    #[test]
+    fn interior_pause_is_split_at_its_midpoint() {
+        // blank 0..=1, token A at 2, blank 3..=8 (6 frames), token B at 9
+        let states: Vec<i32> = vec![0, 0, 1, 0, 0, 0, 0, 0, 0, 3];
+        let frame_scores: Vec<f64> = vec![-1.0; states.len()];
+        let token_ids = vec![7usize, 9usize];
+        let pieces = vec!["a".to_string(), "b".to_string()];
+
+        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+
+        // run 3..=8: mid(3, 8) = 5, so `a` ends at 5 and `b` starts at 5 too --
+        // the reference's spans SHARE that frame, they do not tile.
+        assert_eq!(toks[0].end_frame, 5, "A ends at the pause midpoint");
+        assert_eq!(toks[1].start_frame, 5, "B starts on the same frame A ends");
+    }
+
+    /// A LONG pause contributes only a bounded amount of padding, so a word is
+    /// never reported as starting far before it is said.
+    ///
+    /// 30 blank frames (600 ms) between the words. The plain midpoint rule
+    /// would put the boundary 15 frames (300 ms) into the silence; the cap
+    /// limits it to MAX_PAD_FRAMES, keeping the boundary near the phonation.
+    /// This is the case the hand marks demand: their word-start bias grows with
+    /// the pause under an uncapped rule, because the annotator tracks the onset
+    /// and not the middle of the silence.
+    #[test]
+    fn long_pause_padding_is_unconstrained_midpoint() {
+        let gap = 30i64;
+        // blank 0..=1, token A at 2, blank 3..=3+gap, token B after it
+        let mut states: Vec<i32> = vec![0, 0, 1];
+        states.extend(std::iter::repeat(0).take(gap as usize));
+        states.push(3);
+        let frame_scores: Vec<f64> = vec![-1.0; states.len()];
+        let token_ids = vec![7usize, 9usize];
+        let pieces = vec!["a".to_string(), "b".to_string()];
+
+        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+
+        // The reference rule is the UNCONSTRAINED midpoint, so a long pause pads
+        // by half its length. A cap was tried here and measured worse: it pulled
+        // the port's start boundaries late and its end boundaries early, because
+        // it shrank the word from both sides at once. This test exists to fail
+        // loudly if a cap is reintroduced.
+        let run_start = 3i64;
+        let run_end = run_start + gap - 1;
+        let expected = (run_start + run_end) / 2;
+        let b_own_start = 3 + gap;
+        assert_eq!(
+            b_own_start - toks[1].start_frame,
+            b_own_start - expected,
+            "a long pause must pad to its own midpoint, uncapped"
+        );
+        assert!(toks[1].start_frame < b_own_start, "a pause must move the boundary into the silence");
+    }
 
     fn sample_row() -> (Vec<f64>, Vec<f64>, Vec<u64>) {
         let s = 17;

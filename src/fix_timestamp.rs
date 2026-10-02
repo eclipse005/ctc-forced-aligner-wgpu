@@ -15,6 +15,13 @@ use crate::viterbi::TokenAlignment;
 
 /// False when every character is already a word boundary.
 pub fn owns_time(piece: &str) -> bool {
+    // `<star>` holds no time of its own — it is the reference's marker between
+    // words, and it must not become the anchor that a following space is
+    // snapped back to, or the mark lands on the star instead of on the speech
+    // that precedes it.
+    if piece == "<star>" {
+        return false;
+    }
     piece.chars().any(|ch| !PUNCT.contains(&ch))
 }
 
@@ -45,6 +52,7 @@ mod tests {
         TokenAlignment {
             index: 0,
             token_id: 0,
+            word_id: 0,
             piece: piece.to_string(),
             start,
             end,

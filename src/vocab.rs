@@ -8,10 +8,33 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Scripts written without spaces between words, which is what makes the
+/// reference place `<star>` between segments rather than at the edges.
+///
+/// Deliberately narrower than "not ASCII": a transcript mixing Latin and Han
+/// ("hello 你好") still needs the segment rule, and Thai / Kana / Hangul are
+/// spaced inconsistently enough that treating them as word-delimited would put
+/// a star where the reference has none.
+fn is_cjk(c: char) -> bool {
+    let n = c as u32;
+    (0x3040..=0x30FF).contains(&n)      // kana
+        || (0x3400..=0x4DBF).contains(&n)  // CJK ext A
+        || (0x4E00..=0x9FFF).contains(&n)  // CJK
+        || (0xF900..=0xFAFF).contains(&n)  // compatibility
+        || (0xAC00..=0xD7AF).contains(&n)  // hangul syllables
+        || (0x20000..=0x2A6DF).contains(&n) // CJK ext B
+}
+
 pub struct Vocab {
     pub char_to_id: HashMap<char, usize>,
     pub unk_id: usize,
     pub size: usize,
+    /// The reference's synthetic `<star>` id, `len(dictionary)`, which is one
+    /// past the last real id. `<star>` is NOT in vocab.json -- the reference
+    /// adds it to its own dictionary after loading -- so it cannot come from
+    /// `char_to_id`. It is a real target in the CTC sequence (see
+    /// [`tokenise_with_stars`]) and therefore occupies frames.
+    pub star_id: usize,
 }
 
 impl Vocab {
@@ -34,7 +57,11 @@ impl Vocab {
                 char_to_id.insert(c, id);
             }
         }
-        Ok(Self { char_to_id, unk_id, size })
+        // The reference builds `dictionary = {k.lower(): v for k, v in vocab}`
+        // and then appends `<star>`, so the synthetic id is the dictionary
+        // SIZE -- one past the largest real id, which `size` already is.
+        let star_id = size;
+        Ok(Self { char_to_id, unk_id, size, star_id })
     }
 
     pub fn tokenise(&self, text: &str) -> (Vec<usize>, Vec<String>) {
@@ -48,6 +75,152 @@ impl Vocab {
                 ids.push(id);
                 pieces.push(c.to_string());
             }
+        }
+        (ids, pieces)
+    }
+
+    /// [`tokenise`], with `<star>` targets placed the way the reference places
+    /// them for this script.
+    ///
+    /// This is not cosmetic. `<star>` is a real entry of the CTC target
+    /// sequence, so the DP has to place it and it consumes frames: on
+    /// "every time i fan myself it goes up" the reference's per-frame path
+    /// opens with `[10022, 0, 0, 0, 2802, ...]`, frame 0 being the star, and
+    /// its first blank run is `(1, 3)` where a starless path's is `(0, 3)`.
+    /// Those shifted runs are what the word boundary is padded into, which is
+    /// why every boundary landed one to three frames away from the
+    /// reference's without any single rule looking wrong.
+    ///
+    /// The placement follows the reference's per-script choice, and the choice
+    /// is made by the SCRIPT rather than by a caller-supplied flag:
+    ///
+    ///   * `"edges"`   — one `<star>` at each end. Word-delimited scripts.
+    ///   * `"segment"` — one `<star>` at the start, then one before each
+    ///     segment. Scripts written without spaces, where a "word" is a run of
+    ///     characters and the stars are what separate the words.
+    ///
+    /// A CJK transcript has no spaces, so the reference's whitespace split
+    /// yields a single word and `edges` would append a second star the
+    /// reference never had — a boundary shift INTRODUCED by the fix. Hence the
+    /// script test here rather than a fixed mode.
+    /// [	okenise_with_stars], plus the source word index of every target.
+    pub fn tokenise_with_word_ids(
+        &self,
+        text: &str,
+    ) -> (Vec<usize>, Vec<String>, Vec<usize>) {
+        let cjk = text.chars().any(is_cjk);
+        let mut ids: Vec<usize> = Vec::new();
+        let mut pieces: Vec<String> = Vec::new();
+        let mut word_ids: Vec<usize> = Vec::new();
+        let star = self.star_id;
+        let mut push_star = |ids: &mut Vec<usize>, pieces: &mut Vec<String>,
+                             word_ids: &mut Vec<usize>, w: usize| {
+            ids.push(star);
+            pieces.push("<star>".to_string());
+            word_ids.push(w);
+        };
+        // a leading star belongs to no word; use a sentinel nothing else takes
+        push_star(&mut ids, &mut pieces, &mut word_ids, usize::MAX);
+        let mut wi = 0usize;
+        for w in text.split_whitespace() {
+            let letters: Vec<(usize, String)> = w.chars().filter_map(|c| {
+                let id = *self.char_to_id.get(&c)?;
+                if id == self.unk_id { None } else { Some((id, c.to_string())) }
+            }).collect();
+            // the id counts only words that survive tokenisation: a word the
+            // vocabulary dropped entirely must not leave a hole in the numbering,
+            // or the ids would not be consecutive and the boundary would fall
+            // in the wrong place.
+            if letters.is_empty() { continue; }
+            if cjk && wi > 0 {
+                push_star(&mut ids, &mut pieces, &mut word_ids, wi);
+            }
+            wi += 1;
+            for (id, c) in letters {
+                ids.push(id);
+                pieces.push(c);
+                word_ids.push(wi);
+            }
+        }
+        if !cjk {
+            push_star(&mut ids, &mut pieces, &mut word_ids, usize::MAX);
+        }
+        (ids, pieces, word_ids)
+    }
+
+    pub fn tokenise_with_stars(&self, text: &str) -> (Vec<usize>, Vec<String>) {
+        let cjk = text.chars().any(is_cjk);
+
+        // Words are split on whitespace and their letters concatenated, with a
+        // `<star>` at each end (`edges`) or between words (`segment`).
+        //
+        // Two things that look like they belong here and do not:
+        //
+        //   * a space token between WORDS. It reads as the obvious word
+        //     boundary, but the reference's flat target list has the letters
+        //     and the stars adjacent, and adding one lengthens the sequence
+        //     past what the frame count can carry — the DP then compresses the
+        //     path and every boundary drifts earlier, cumulatively.
+        //   * a space token between LETTERS of a word. `preprocess_text` writes
+        //     `" ".join(list(word))` per word, but `get_alignments` flattens it
+        //     again and keeps only dictionary entries, and the space is not one
+        //     (`if c in dictionary`). It never becomes a target.
+        //
+        // What DOES separate words is the two stars plus `build_words`' own
+        // word-character test, and what pads the boundaries is the blank run
+        // around each letter — see [`crate::viterbi::collapse`].
+        let words: Vec<Vec<(usize, String)>> = text
+            .split_whitespace()
+            .map(|w| {
+                w.chars()
+                    .filter_map(|c| {
+                        let id = *self.char_to_id.get(&c)?;
+                        if id == self.unk_id {
+                            None
+                        } else {
+                            Some((id, c.to_string()))
+                        }
+                    })
+                    .collect::<Vec<(usize, String)>>()
+            })
+            .filter(|w: &Vec<(usize, String)>| !w.is_empty())
+            .collect();
+
+        let mut ids: Vec<usize> = Vec::new();
+        let mut pieces: Vec<String> = Vec::new();
+        let star = self.star_id;
+        let push_star = |ids: &mut Vec<usize>, pieces: &mut Vec<String>| {
+            ids.push(star);
+            pieces.push("<star>".to_string());
+        };
+
+        push_star(&mut ids, &mut pieces);
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 && cjk {
+                // `segment` mode separates words with a star, because the
+                // reference has no space token to separate them with there.
+                push_star(&mut ids, &mut pieces);
+            }
+            // The reference's `preprocess_text` builds `" ".join(list(word))`
+            // per word, but `get_alignments` flattens that on
+            // `" ".join(tokens).split(" ")` and then keeps only entries the
+            // dictionary knows -- and the space is NOT one of them:
+            // `token_indices = [dictionary[c] for c in ... if c in dictionary]`.
+            // The letters are adjacent in the target sequence; the space only
+            // ever existed to be split away again.
+            //
+            // Emitting a space token between letters is therefore wrong twice
+            // over: it adds a target the reference never had, and it pushes the
+            // sequence past what the frame count can carry. On a 118-frame clip
+            // the DP then has to compress the path, and every boundary drifts
+            // earlier cumulatively -- up to 60 frames by the last word.
+            for (id, c) in w {
+                ids.push(*id);
+                pieces.push(c.clone());
+            }
+        }
+        if !cjk {
+            push_star(&mut ids, &mut pieces);
         }
         (ids, pieces)
     }
