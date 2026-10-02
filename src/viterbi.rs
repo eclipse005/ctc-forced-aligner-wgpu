@@ -81,20 +81,22 @@ impl AlignmentResult {
 /// aligner uses.  It is the one structure that grows with the audio *and* with
 /// the transcript (T×(2·tokens+1)), so the 4x is what keeps an hour of audio
 /// inside RAM: 15 m goes 1.44 GB → 360 MB.
-#[inline]
-fn put_back(row: &mut [u8], st: usize, choice: u8) {
-    let i = st >> 2;
-    let sh = (st & 3) * 2;
-    row[i] = (row[i] & !(0b11u8 << sh)) | (choice << sh);
-}
-
 /// Store a whole packed byte — four states' choices at once.
 ///
-/// Nothing here reads the buffer first: the DP fills a row before the
+/// `back_row` holds that row's backpointers **2 bits per state** (stay 0,
+/// advance 1, skip 2), four states to a byte — the packing the reference C++
+/// aligner uses.  It is the one structure that grows with the audio *and* with
+/// the transcript (T×(2·tokens+1)), so the 4x is what keeps an hour of audio
+/// inside RAM: 15 m goes 1.44 GB → 360 MB.
+///
+/// Write-only by contract, and deliberately not a read-modify-write: nothing
+/// here reads the buffer first, because the DP fills a row before the
 /// traceback reads it, and every byte the traceback can reach is written
 /// wholesale (the vector loop by four states, the 0..3 and tail groups
-/// below), so the allocation can stay uninitialised instead of costing a
-/// 360 MB memset on the 15 m fixture.
+/// below).  That is what lets the allocation stay uninitialised instead of
+/// costing a 360 MB memset on the 15 m fixture — and it is also why a
+/// state-at-a-time `row[i] = (row[i] & ..) | ..` setter must never come back:
+/// it would read uninitialised bytes on the first write of a row.
 #[inline]
 fn put_back_byte(row: &mut [u8], byte_index: usize, byte: u8) {
     row[byte_index] = byte;
@@ -920,7 +922,6 @@ pub fn ctc_forced_align_emissions_with_word_ids(
     word_ids: &[usize],
 ) -> anyhow::Result<AlignmentResult> {
     let expanded = build_expanded_labels(token_ids, 0);
-    let num_states = expanded.len();
     with_word_ids(word_ids, || {
         align(em, t_len, &expanded, 0, token_ids, frame_rate, pieces, false)
     })
@@ -1006,7 +1007,7 @@ fn align_with(
         );
     }
 
-    // 0 = stay, 1 = from s-1, 2 = from s-2, two bits each (see `put_back`).
+    // 0 = stay, 1 = from s-1, 2 = from s-2, two bits each (see `put_back_byte`).
     // Row 0 is never read (traceback starts at t >= 1); every later row is
     // written in full before that.
     let rb = row_bytes(s);

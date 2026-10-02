@@ -1099,7 +1099,7 @@ impl<'a> LazyEmissions<'a> {
         } else {
             self.fill_slice(block, row0, lo, rows, &[]);
         }
-        let mut cache = self.cache.borrow_mut();
+        let cache = self.cache.borrow_mut();
         (
             RefMut::map(cache, |c: &mut Option<(usize, usize, usize, Vec<f32>)>| {
                 c.as_mut().expect("just filled").3.as_mut_slice()

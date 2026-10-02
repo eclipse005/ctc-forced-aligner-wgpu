@@ -290,7 +290,6 @@ impl GpuModel {
             Ok((w, b))
         };
 
-        type Prepped = Vec<(Vec<f32>, Vec<f32>)>;
         let layers: Vec<(Vec<f32>, [Vec<f32>; 10])> = (0..cfg.num_hidden_layers)
             .into_par_iter()
             .map(|i| {

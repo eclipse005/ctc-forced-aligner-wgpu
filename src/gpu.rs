@@ -16,9 +16,6 @@ pub struct Gpu {
     pub features: wgpu::Features,
     pub pipeline_cache: Option<wgpu::PipelineCache>,
     pub pipeline_cache_path: Option<std::path::PathBuf>,
-    /// Reused MAP_READ staging for readbacks (some drivers invalidate freshly
-    /// created mapped buffers in quick succession).
-    readback_staging: std::sync::Mutex<Option<(wgpu::Buffer, u64)>>,
 }
 
 /// One device: `auto`, `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring.
@@ -323,7 +320,6 @@ impl Gpu {
             features,
             pipeline_cache,
             pipeline_cache_path,
-            readback_staging: std::sync::Mutex::new(None),
         })
     }
 

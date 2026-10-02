@@ -1,8 +1,11 @@
-//! CPU forward RTF baseline — the number every RTFX change is judged by.
+//! CPU forward RTFx baseline — the number every change is judged by.
 //!
 //! Run: `cargo bench --bench rtfx`  (model dir: `$CTC_MODEL_DIR`)
 //!
-//! RTF = 34 s of audio / mean iteration time (higher is better, 1.0 = realtime).
+//! RTFx = 34 s of audio / mean iteration time — how many times faster than
+//! realtime. Higher is better; 1.0 means exactly realtime, 20.0 means a
+//! 34 s chunk encodes in 1.7 s. Criterion reports raw `time/iter`; divide
+//! 34.0 by it (in seconds) to get RTFx.
 //! `34s_steady_scratch` is the production path (the aligner reuses one Scratch
 //! across chunks); `34s_fresh_scratch` quantifies the buffer-reuse win.
 

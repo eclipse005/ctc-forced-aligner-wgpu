@@ -113,7 +113,7 @@ impl Vocab {
         let mut pieces: Vec<String> = Vec::new();
         let mut word_ids: Vec<usize> = Vec::new();
         let star = self.star_id;
-        let mut push_star = |ids: &mut Vec<usize>, pieces: &mut Vec<String>,
+        let push_star = |ids: &mut Vec<usize>, pieces: &mut Vec<String>,
                              word_ids: &mut Vec<usize>, w: usize| {
             ids.push(star);
             pieces.push("<star>".to_string());
