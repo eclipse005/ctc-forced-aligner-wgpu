@@ -12,8 +12,8 @@
 mod gemm_kernel;
 
 pub use gemm_kernel::{
-    conv_gemm, gemm_bias, gemm_bias_tiled, gemm_shared_bytes, pos_conv, KS, MT, NT, POS_KS, POS_MT,
-    POS_NT,
+    conv_gemm, conv_gemm_variant, gemm_bias, gemm_bias_tiled, gemm_shared_bytes, gemm_tile,
+    gemm_variant, pos_conv, pick_gemm_variant, GemmVariant, KS, MT, NT, POS_KS, POS_MT, POS_NT,
 };
 
 /// Row LayerNorm over `cols` (affine, biased variance, eps inside sqrt) then
@@ -332,6 +332,13 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 /// lp[t * V + labels[s]].  The forced-alignment Viterbi only ever reads
 /// those T*S values, so the GPU downloads ~30 KB instead of the whole
 /// T*10288 matrix (70 MB for a 34 s chunk).
+///
+/// `star[s] == 1` marks the `<star>` sentinel's states: their score is the
+/// reference's appended zero column, a constant (-1.0 here — see
+/// `CTC_STAR_SCORE` in `align_inference`), not a real log-probability.
+/// Stamping them here replaces a host loop that walked every (frame, star)
+/// cell per chunk — column-major scattered writes the GPU does for free
+/// while gathering.
 pub(crate) fn gather() -> String {
     r#"
 struct Cfg { total: u32, s: u32, v: u32, _p0: u32 }
@@ -339,6 +346,7 @@ struct Cfg { total: u32, s: u32, v: u32, _p0: u32 }
 @group(0) @binding(1) var<storage, read> labels: array<u32>;
 @group(0) @binding(2) var<storage, read_write> out: array<f32>;
 @group(0) @binding(3) var<uniform> cfg: Cfg;
+@group(0) @binding(4) var<storage, read> star: array<u32>;
 
 @compute @workgroup_size(256)
 fn main(
@@ -350,7 +358,9 @@ fn main(
     let i = (wg.x + wg.y * 65535u) * 256u + lid.x;
     if (i < cfg.total) {
         let t = i / cfg.s;
-        out[i] = lp[t * cfg.v + labels[i % cfg.s]];
+        let s = i % cfg.s;
+        let lp = lp[t * cfg.v + labels[s]];
+        out[i] = select(lp, -1.0, star[s] == 1u);
     }
 }
 "#

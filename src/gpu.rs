@@ -363,25 +363,61 @@ impl Gpu {
     }
 
     pub fn readback(&self, buf: &wgpu::Buffer, bytes: u64) -> Result<Vec<u8>> {
-        // chunked: one big MAP_READ staging can fail to map after a long
-        // dispatch sequence on some drivers; small maps keep working
-        const CHUNK: u64 = 4 << 20;
         let mut out: Vec<u8> = Vec::with_capacity(bytes as usize);
-        let mut off: u64 = 0;
-        while off < bytes {
-            let take = CHUNK.min(bytes - off);
-            let size = (take + 3) & !3;
-            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("readback"),
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            {
-                let mut enc = self.device.create_command_encoder(&Default::default());
+        self.readback_map(buf, 0, bytes, &mut |piece| out.extend_from_slice(piece))?;
+        Ok(out)
+    }
+
+    /// Same readback, typed as f32 without the intermediate byte `Vec`: the
+    /// gathered trellis download is (T, S) floats — ~36 MB on a 2.7 k-token
+    /// transcript — and every skipped copy of it is host time between chunks.
+    /// `offset` must be 4-byte aligned (a row range of the source block).
+    pub fn readback_f32(&self, buf: &wgpu::Buffer, offset: u64, floats: u64) -> Result<Vec<f32>> {
+        let mut out: Vec<f32> = Vec::with_capacity(floats as usize);
+        self.readback_map(buf, offset, floats * 4, &mut |piece| {
+            out.extend_from_slice(bytemuck::cast_slice(piece));
+        })?;
+        Ok(out)
+    }
+
+    /// Copy `bytes` of `buf` at `offset` out in 16 MiB staging pieces, handing
+    /// each mapped piece to `sink` in order.
+    ///
+    /// The staging stays chunked — one big MAP_READ staging can fail to map
+    /// after a long dispatch sequence on some drivers; small maps keep
+    /// working — but every copy is submitted before the first map, so the
+    /// pieces no longer serialize behind one poll round trip each.
+    fn readback_map(
+        &self,
+        buf: &wgpu::Buffer,
+        offset: u64,
+        bytes: u64,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> Result<()> {
+        const CHUNK: u64 = 16 << 20;
+        let mut pieces: Vec<(wgpu::Buffer, u64)> = Vec::new();
+        {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            let mut off: u64 = offset;
+            while off < offset + bytes {
+                let take = CHUNK.min(offset + bytes - off);
+                let size = (take + 3) & !3;
+                let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
                 enc.copy_buffer_to_buffer(buf, off, &staging, 0, take);
-                self.queue.submit([enc.finish()]);
+                pieces.push((staging, take));
+                off += take;
             }
+            self.queue.submit([enc.finish()]);
+        }
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("poll for readback")?;
+        for (staging, take) in &pieces {
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -398,13 +434,12 @@ impl Gpu {
                 }
                 Err(e) => anyhow::bail!("map callback dropped: {e}"),
             }
-            let mut part = slice.get_mapped_range()?.to_vec();
+            let mapped = slice.get_mapped_range()?;
+            sink(&mapped[..*take as usize]);
+            drop(mapped);
             staging.unmap();
-            part.truncate(take as usize);
-            out.extend_from_slice(&part);
-            off += take;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Compile a WGSL module + compute pipeline, surfacing validation errors.

@@ -28,11 +28,81 @@ pub fn gemm_bias() -> String {
 }
 
 pub fn gemm_bias_tiled(mt: u32, nt: u32, ks: u32, unroll: bool) -> String {
-    emit(mt, nt, ks, unroll, Kind::Gemm)
+    emit(mt, nt, ks, unroll, Kind::Gemm, false)
 }
 
 pub fn conv_gemm() -> String {
-    emit(MT, NT, KS, UNROLL_K, Kind::Conv)
+    emit(MT, NT, KS, UNROLL_K, Kind::Conv, false)
+}
+
+/// The encoder GEMM shader, per the buffering policy picked for this device.
+///
+/// Swept on the P104-100 (Pascal, 3 m fixture, all bit-identical): base
+/// 128×64×32 single-buffered **48.2×**; db16 (128×64×16, double-buffered
+/// banks) 39.6×; m64 (64×64×32, double-buffered) 33.2×; m64s (64×64×32,
+/// single) 44.4×; n128s (64×128×32, single) 44.1×.
+///
+/// Both directions lose. Double-buffering prefetches the next K-tile behind
+/// the current FMAs, but the doubled shared footprint drops the workgroups
+/// per SM from 3 to 2, and occupancy hides more latency on Pascal than the
+/// prefetch does. Shrinking the tile buys occupancy back but pays it away in
+/// load instructions per FMA. So the tile stays 128×64×32, single-buffered —
+/// `CTC_GEMM` exists to re-check that on a different machine, the same way
+/// [`super::super::wav2vec2::forward::q_block_default`] does on the CPU.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GemmVariant {
+    /// 128×64×32, single-buffered — the default.
+    Base,
+    Db16,
+    M64,
+    /// 64×64×32, single-buffered: 17 KiB of shared memory, 5 workgroups/SM.
+    M64s,
+    /// 64×128×32, single-buffered: 25 KiB, half the B-tile traffic of base.
+    N128s,
+}
+
+pub fn pick_gemm_variant() -> GemmVariant {
+    if let Ok(v) = std::env::var("CTC_GEMM") {
+        return match v.as_str() {
+            "base" => GemmVariant::Base,
+            "db16" => GemmVariant::Db16,
+            "m64" => GemmVariant::M64,
+            "m64s" => GemmVariant::M64s,
+            "n128s" => GemmVariant::N128s,
+            other => panic!("unknown CTC_GEMM variant {other}"),
+        };
+    }
+    GemmVariant::Base
+}
+
+pub fn gemm_variant(variant: GemmVariant) -> String {
+    match variant {
+        GemmVariant::Base => emit(MT, NT, KS, UNROLL_K, Kind::Gemm, false),
+        GemmVariant::Db16 => emit(MT, NT, 16, UNROLL_K, Kind::Gemm, true),
+        GemmVariant::M64 => emit(64, NT, KS, UNROLL_K, Kind::Gemm, true),
+        GemmVariant::M64s => emit(64, NT, KS, UNROLL_K, Kind::Gemm, false),
+        GemmVariant::N128s => emit(64, 128, KS, UNROLL_K, Kind::Gemm, false),
+    }
+}
+
+pub fn conv_gemm_variant(variant: GemmVariant) -> String {
+    match variant {
+        GemmVariant::Base => emit(MT, NT, KS, UNROLL_K, Kind::Conv, false),
+        GemmVariant::Db16 => emit(MT, NT, 16, UNROLL_K, Kind::Conv, true),
+        GemmVariant::M64 => emit(64, NT, KS, UNROLL_K, Kind::Conv, true),
+        GemmVariant::M64s => emit(64, NT, KS, UNROLL_K, Kind::Conv, false),
+        GemmVariant::N128s => emit(64, 128, KS, UNROLL_K, Kind::Conv, false),
+    }
+}
+
+/// The (mt, nt) tile a variant was built with; dispatch grids tile with the
+/// same numbers or part of the output is never covered.
+pub fn gemm_tile(variant: GemmVariant) -> (u32, u32) {
+    match variant {
+        GemmVariant::Base | GemmVariant::Db16 => (MT, NT),
+        GemmVariant::M64 | GemmVariant::M64s => (64, NT),
+        GemmVariant::N128s => (64, 128),
+    }
 }
 
 pub fn pos_conv() -> String {
@@ -78,9 +148,9 @@ enum Kind {
     Conv,
 }
 
-fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind) -> String {
+fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind, dbuf: bool) -> String {
     let t = tile(mt, nt, ks);
-    let mut s = String::with_capacity(32 * 1024);
+    let mut s = String::with_capacity(48 * 1024);
     match kind {
         Kind::Gemm => s.push_str(
             r#"struct Dims {
@@ -90,6 +160,7 @@ fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind) -> String {
     a_z: u32, b_z: u32, c_z: u32,
     epilogue: u32,
     scale: f32,
+    a_vec: u32, b_vec: u32, _p0: u32,
 }
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
@@ -97,6 +168,11 @@ fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind) -> String {
 @group(0) @binding(3) var<storage, read_write> c: array<f32>;
 @group(0) @binding(4) var<uniform> d: Dims;
 @group(0) @binding(5) var<storage, read> res: array<f32>;
+// the same buffers as bindings 0/1, viewed as vec4s: when a tile's base
+// address is 16-byte aligned (host-checked, per dispatch), one 128-bit load
+// replaces four 32-bit loads
+@group(0) @binding(6) var<storage, read> a4: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read> b4: array<vec4<f32>>;
 
 // epilogue == 1 fuses the FFN gelu; == 2 adds the residual stream
 fn erf(x: f32) -> f32 {
@@ -120,18 +196,36 @@ fn gelu4(v: vec4<f32>) -> vec4<f32> {
         Kind::Conv => s.push_str(
             r#"struct Dims {
     m: u32, n: u32, k: u32,
-    c_in: u32, stride: u32, t_in: u32, _p0: u32,
+    c_in: u32, stride: u32, t_in: u32,
+    a_vec: u32, b_vec: u32,
 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> wt: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<storage, read_write> out: array<f32>;
 @group(0) @binding(4) var<uniform> d: Dims;
+@group(0) @binding(5) var<storage, read> x4: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> wt4: array<vec4<f32>>;
 "#,
         ),
     }
-    let _ = writeln!(s, "var<workgroup> sa: array<vec4<f32>, {}u>;", t.mt * t.sa_stride);
-    let _ = writeln!(s, "var<workgroup> sb: array<vec4<f32>, {}u>;", t.ks * t.sb_stride);
+    let banks: &[(u32, u32)] = if dbuf {
+        assert!(
+            2 * t.bytes <= 48 * 1024,
+            "double-buffered shared memory {} exceeds 48 KiB",
+            2 * t.bytes
+        );
+        &[(0, 0), (1, 1)]
+    } else {
+        assert!(t.bytes <= 48 * 1024, "shared memory {bytes} exceeds 48 KiB", bytes = t.bytes);
+        &[(0, 0)]
+    };
+    for (ai, _) in banks {
+        let _ = writeln!(s, "var<workgroup> sa{ai}: array<vec4<f32>, {}u>;", t.mt * t.sa_stride);
+    }
+    for (_, bi) in banks {
+        let _ = writeln!(s, "var<workgroup> sb{bi}: array<vec4<f32>, {}u>;", t.ks * t.sb_stride);
+    }
     s.push_str(
         "
 @compute @workgroup_size(16, 16)
@@ -160,64 +254,102 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         );
     }
     let _ = writeln!(s, "    let ktiles = (d.k + {}u - 1u) / {}u;", t.ks, t.ks);
-    s.push_str("    for (var kt = 0u; kt < ktiles; kt = kt + 1u) {\n");
-    let _ = writeln!(s, "        let k0 = kt * {}u;", t.ks);
-    let _ = writeln!(s, "        let k_full = k0 + {}u <= d.k;", t.ks);
-    emit_loads(&mut s, &t, kind);
-    s.push_str("        workgroupBarrier();\n");
-    emit_fma(&mut s, &t, unroll);
-    s.push_str("        workgroupBarrier();\n");
-    s.push_str("    }\n");
+    if !dbuf {
+        s.push_str("    for (var kt = 0u; kt < ktiles; kt = kt + 1u) {\n");
+        let _ = writeln!(s, "        let k0 = kt * {}u;", t.ks);
+        let _ = writeln!(s, "        let k_full = k0 + {}u <= d.k;", t.ks);
+        emit_loads(&mut s, &t, kind, "sa0", "sb0");
+        s.push_str("        workgroupBarrier();\n");
+        emit_fma(&mut s, &t, unroll, "sa0", "sb0");
+        s.push_str("        workgroupBarrier();\n");
+        s.push_str("    }\n");
+    } else {
+        // Double-buffered: tile 0 lands in bank 0, then each iteration loads
+        // the next tile into the other bank while the FMAs drain the current
+        // one. One barrier per tile: it retires the bank the FMAs just read
+        // and publishes the prefetch the FMAs will read next iteration.
+        s.push_str("    {\n        let k0 = 0u;\n");
+        let _ = writeln!(s, "        let k_full = k0 + {}u <= d.k;", t.ks);
+        emit_loads(&mut s, &t, kind, "sa0", "sb0");
+        s.push_str("    }\n");
+        s.push_str("    workgroupBarrier();\n");
+        s.push_str("    for (var kt = 0u; kt < ktiles; kt = kt + 2u) {\n");
+        s.push_str("        if (kt + 1u < ktiles) {\n");
+        let _ = writeln!(s, "            let k0 = (kt + 1u) * {}u;", t.ks);
+        let _ = writeln!(s, "            let k_full = k0 + {}u <= d.k;", t.ks);
+        emit_loads(&mut s, &t, kind, "sa1", "sb1");
+        s.push_str("        }\n");
+        emit_fma(&mut s, &t, unroll, "sa0", "sb0");
+        s.push_str("        workgroupBarrier();\n");
+        s.push_str("        if (kt + 1u < ktiles) {\n");
+        s.push_str("            if (kt + 2u < ktiles) {\n");
+        let _ = writeln!(s, "                let k0 = (kt + 2u) * {}u;", t.ks);
+        let _ = writeln!(s, "                let k_full = k0 + {}u <= d.k;", t.ks);
+        emit_loads(&mut s, &t, kind, "sa0", "sb0");
+        s.push_str("            }\n");
+        emit_fma(&mut s, &t, unroll, "sa1", "sb1");
+        s.push_str("            workgroupBarrier();\n");
+        s.push_str("        }\n");
+        s.push_str("    }\n");
+    }
     emit_store(&mut s, &t, kind);
     s.push_str("}\n");
     s
 }
 
-fn emit_loads(s: &mut String, t: &Tile, kind: Kind) {
+fn emit_loads(s: &mut String, t: &Tile, kind: Kind, sa: &str, sb: &str) {
     let a_vecs = t.mt * (t.ks / 4);
     let b_vecs = t.ks * t.sb_stride;
     let kv = t.ks / 4;
     match kind {
         Kind::Gemm => {
             s.push_str("        if (m_full && k_full) {\n");
-            emit_a_fast(s, t, a_vecs, kv);
+            emit_a_fast(s, t, a_vecs, kv, sa);
             s.push_str("        } else {\n");
-            emit_a_slow(s, t, a_vecs, kv);
+            emit_a_slow(s, t, a_vecs, kv, sa);
             s.push_str("        }\n");
             s.push_str("        if (n_full && k_full) {\n");
-            emit_b_fast(s, t, b_vecs, "b_off + gk * d.b_stride + gn", "b");
+            emit_b_fast(s, t, b_vecs, "b_off + gk * d.b_stride + gn", "b", sb, Some("b4"));
             s.push_str("        } else {\n");
-            emit_b_slow(s, t, b_vecs, "b_off + gk * d.b_stride + gn", "b");
+            emit_b_slow(s, t, b_vecs, "b_off + gk * d.b_stride + gn", "b", sb);
             s.push_str("        }\n");
         }
         Kind::Conv => {
             // im2col crosses a tap when c_in is not a multiple of 4, so the
             // guarded gather is used for every K tile. Conv is a few layers
             // once per chunk; the encoder GEMMs dominate.
-            emit_im2col(s, t, a_vecs, kv);
+            emit_im2col(s, t, a_vecs, kv, sa);
             s.push_str("        if (n_full && k_full) {\n");
-            emit_b_fast(s, t, b_vecs, "gk * d.n + gn", "wt");
+            emit_b_fast(s, t, b_vecs, "gk * d.n + gn", "wt", sb, Some("wt4"));
             s.push_str("        } else {\n");
-            emit_b_slow(s, t, b_vecs, "gk * d.n + gn", "wt");
+            emit_b_slow(s, t, b_vecs, "gk * d.n + gn", "wt", sb);
             s.push_str("        }\n");
         }
     }
 }
 
-fn emit_a_fast(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
+fn emit_a_fast(s: &mut String, t: &Tile, a_vecs: u32, kv: u32, sa: &str) {
     let _ = writeln!(s, "            for (var i = tid; i < {a_vecs}u; i = i + 256u) {{");
     let _ = writeln!(s, "                let rr = i / {kv}u;");
     let _ = writeln!(s, "                let kvi = i % {kv}u;");
     s.push_str("                let base = a_off + (m0 + rr) * d.a_stride + (k0 + kvi * 4u);\n");
+    s.push_str("                if (d.a_vec == 1u) {\n");
     let _ = writeln!(
         s,
-        "                sa[(rr * {}u) + kvi] = vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);",
+        "                    {sa}[(rr * {}u) + kvi] = a4[base / 4u];",
         t.sa_stride
     );
+    s.push_str("                } else {\n");
+    let _ = writeln!(
+        s,
+        "                    {sa}[(rr * {}u) + kvi] = vec4<f32>(a[base], a[base + 1u], a[base + 2u], a[base + 3u]);",
+        t.sa_stride
+    );
+    s.push_str("                }\n");
     s.push_str("            }\n");
 }
 
-fn emit_a_slow(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
+fn emit_a_slow(s: &mut String, t: &Tile, a_vecs: u32, kv: u32, sa: &str) {
     let _ = writeln!(s, "            for (var i = tid; i < {a_vecs}u; i = i + 256u) {{");
     let _ = writeln!(s, "                let rr = i / {kv}u;");
     let _ = writeln!(s, "                let kvi = i % {kv}u;");
@@ -234,26 +366,50 @@ fn emit_a_slow(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
     s.push_str("                    if (gk + 2u < d.k) { v.z = a[base + 2u]; }\n");
     s.push_str("                    if (gk + 3u < d.k) { v.w = a[base + 3u]; }\n");
     s.push_str("                }\n");
-    let _ = writeln!(s, "                sa[(rr * {}u) + kvi] = v;", t.sa_stride);
+    let _ = writeln!(s, "                {sa}[(rr * {}) + kvi] = v;", t.sa_stride);
     s.push_str("            }\n");
 }
 
-fn emit_b_fast(s: &mut String, t: &Tile, b_vecs: u32, base: &str, buf: &str) {
+/// `vec4_view` is `Some("b4")` for the GEMM/conv kernels (whose bindings
+/// carry a vec4 alias of `buf`) and `None` for the pos-conv kernel, which has
+/// no such binding: the branch is not emitted at all, since WGSL validates
+/// every referenced binding even under a dead condition.
+fn emit_b_fast(
+    s: &mut String,
+    t: &Tile,
+    b_vecs: u32,
+    base: &str,
+    buf: &str,
+    sb: &str,
+    vec4_view: Option<&str>,
+) {
     let _ = writeln!(s, "            for (var i = tid; i < {b_vecs}u; i = i + 256u) {{");
     let _ = writeln!(s, "                let rr = i / {}u;", t.sb_stride);
     let _ = writeln!(s, "                let cv = i % {}u;", t.sb_stride);
     s.push_str("                let gk = k0 + rr;\n");
     s.push_str("                let gn = n0 + cv * 4u;\n");
     let _ = writeln!(s, "                let base = {base};");
+    if let Some(view) = vec4_view {
+        s.push_str("                if (d.b_vec == 1u) {\n");
+        let _ = writeln!(
+            s,
+            "                    {sb}[(rr * {}u) + cv] = {view}[base / 4u];",
+            t.sb_stride
+        );
+        s.push_str("                } else {\n");
+    }
     let _ = writeln!(
         s,
-        "                sb[(rr * {}u) + cv] = vec4<f32>({buf}[base], {buf}[base + 1u], {buf}[base + 2u], {buf}[base + 3u]);",
+        "                    {sb}[(rr * {}u) + cv] = vec4<f32>({buf}[base], {buf}[base + 1u], {buf}[base + 2u], {buf}[base + 3u]);",
         t.sb_stride
     );
+    if vec4_view.is_some() {
+        s.push_str("                }\n");
+    }
     s.push_str("            }\n");
 }
 
-fn emit_b_slow(s: &mut String, t: &Tile, b_vecs: u32, base: &str, buf: &str) {
+fn emit_b_slow(s: &mut String, t: &Tile, b_vecs: u32, base: &str, buf: &str, sb: &str) {
     let _ = writeln!(s, "            for (var i = tid; i < {b_vecs}u; i = i + 256u) {{");
     let _ = writeln!(s, "                let rr = i / {}u;", t.sb_stride);
     let _ = writeln!(s, "                let cv = i % {}u;", t.sb_stride);
@@ -273,11 +429,11 @@ fn emit_b_slow(s: &mut String, t: &Tile, b_vecs: u32, base: &str, buf: &str) {
     let _ = writeln!(s, "                    if (gn + 2u < d.n) {{ v.z = {buf}[base + 2u]; }}");
     let _ = writeln!(s, "                    if (gn + 3u < d.n) {{ v.w = {buf}[base + 3u]; }}");
     s.push_str("                }\n");
-    let _ = writeln!(s, "                sb[(rr * {}u) + cv] = v;", t.sb_stride);
+    let _ = writeln!(s, "                {sb}[(rr * {}u) + cv] = v;", t.sb_stride);
     s.push_str("            }\n");
 }
 
-fn emit_im2col(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
+fn emit_im2col(s: &mut String, t: &Tile, a_vecs: u32, kv: u32, sa: &str) {
     let _ = writeln!(s, "            for (var i = tid; i < {a_vecs}u; i = i + 256u) {{");
     let _ = writeln!(s, "                let rr = i / {kv}u;");
     let _ = writeln!(s, "                let kvi = i % {kv}u;");
@@ -290,7 +446,11 @@ fn emit_im2col(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
     s.push_str("                    let src = gm * d.stride + t0;\n");
     s.push_str("                    if (kk + 3u < d.k && src < d.t_in && ci + 3u < d.c_in) {\n");
     s.push_str("                        let base = src * d.c_in + ci;\n");
-    s.push_str("                        v = vec4<f32>(x[base], x[base + 1u], x[base + 2u], x[base + 3u]);\n");
+    s.push_str("                        if (d.a_vec == 1u) {\n");
+    s.push_str("                            v = x4[base / 4u];\n");
+    s.push_str("                        } else {\n");
+    s.push_str("                            v = vec4<f32>(x[base], x[base + 1u], x[base + 2u], x[base + 3u]);\n");
+    s.push_str("                        }\n");
     s.push_str("                    } else {\n");
     for lane in 0..4u32 {
         let comp = ['x', 'y', 'z', 'w'][lane as usize];
@@ -311,29 +471,29 @@ fn emit_im2col(s: &mut String, t: &Tile, a_vecs: u32, kv: u32) {
     }
     s.push_str("                    }\n");
     s.push_str("                }\n");
-    let _ = writeln!(s, "                sa[(rr * {}u) + kvi] = v;", t.sa_stride);
+    let _ = writeln!(s, "                {sa}[(rr * {}u) + kvi] = v;", t.sa_stride);
     s.push_str("            }\n");
 }
 
-fn emit_fma(s: &mut String, t: &Tile, unroll: bool) {
+fn emit_fma(s: &mut String, t: &Tile, unroll: bool, sa: &str, sb: &str) {
     if unroll {
         for kv in 0..t.ks / 4 {
-            emit_fma_step(s, t, &format!("{kv}u"));
+            emit_fma_step(s, t, &format!("{kv}u"), sa, sb);
         }
     } else {
         let _ = writeln!(s, "        for (var kvi = 0u; kvi < {}u; kvi = kvi + 1u) {{", t.ks / 4);
-        emit_fma_step(s, t, "kvi");
+        emit_fma_step(s, t, "kvi", sa, sb);
         s.push_str("        }\n");
     }
 }
 
-fn emit_fma_step(s: &mut String, t: &Tile, kv: &str) {
+fn emit_fma_step(s: &mut String, t: &Tile, kv: &str, sa: &str, sb: &str) {
     s.push_str("        {\n");
     for lane in 0..4u32 {
         for col in 0..t.tn_vec {
             let _ = writeln!(
                 s,
-                "            let b_{lane}_{col} = sb[((({kv}) * 4u + {lane}u) * {}u) + lid.x + {}u];",
+                "            let b_{lane}_{col} = {sb}[((({kv}) * 4u + {lane}u) * {}u) + lid.x + {}u];",
                 t.sb_stride,
                 col * 16
             );
@@ -342,7 +502,7 @@ fn emit_fma_step(s: &mut String, t: &Tile, kv: &str) {
     for row in 0..t.tm {
         let _ = writeln!(
             s,
-            "            let a_{row} = sa[(row{row} * {}u) + ({kv})];",
+            "            let a_{row} = {sa}[(row{row} * {}u) + ({kv})];",
             t.sa_stride
         );
         for col in 0..t.tn_vec {
@@ -559,9 +719,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let _ = writeln!(s, "                sa[(rr * {}u) + kvi] = v;", t.sa_stride);
     s.push_str("            }\n");
     s.push_str("        }\n");
-    emit_b_fast(&mut s, &t, b_vecs, "(wid.y * d.k + gk) * d.n + gn", "w");
+    emit_b_fast(&mut s, &t, b_vecs, "(wid.y * d.k + gk) * d.n + gn", "w", "sb", None);
     s.push_str("        workgroupBarrier();\n");
-    emit_fma(&mut s, &t, true);
+    emit_fma(&mut s, &t, true, "sa", "sb");
     s.push_str("        workgroupBarrier();\n");
     s.push_str("    }\n");
     s.push_str("    if (m_full) {\n");
@@ -631,6 +791,26 @@ mod tests {
         }
         assert!(conv_gemm().contains("workgroupBarrier"));
         assert!(gemm_bias().contains("d.scale"));
+        // the double-buffered variants share the arithmetic but carry two
+        // banks: their source must stay balanced and inside the budget
+        for variant in [GemmVariant::Db16, GemmVariant::M64] {
+            for src in [gemm_variant(variant), conv_gemm_variant(variant)] {
+                assert!(src.contains("sa0") && src.contains("sa1"), "{variant:?}");
+                assert!(src.contains("workgroupBarrier"), "{variant:?}");
+                let mut depth = 0i32;
+                for c in src.chars() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    assert!(depth >= 0, "{variant:?}");
+                }
+                assert_eq!(depth, 0, "{variant:?}");
+            }
+        }
+        assert_eq!(2 * gemm_shared_bytes(MT, NT, 16), 45_056, "db16 banks");
+        assert_eq!(2 * gemm_shared_bytes(64, NT, KS), 34_816, "m64 banks");
         let pos = pos_conv();
         assert!(pos.contains("gelu(") && pos.contains("wid.y"));
         assert!(gemm_shared_bytes(POS_MT, POS_NT, POS_KS) <= 48 * 1024);

@@ -44,6 +44,14 @@ fn flat_grid(total: u32) -> (u32, u32) {
     }
 }
 
+/// 1 when a vec4 view of one operand is 16-byte aligned for this dispatch:
+/// the base offset, the row stride and the per-head z step are all multiples
+/// of 4, so `view[base / 4]` addresses every tile exactly. Otherwise the
+/// shader falls back to four scalar loads (same values, same order).
+fn vec4_ok(off: u32, stride: u32, z: u32) -> u32 {
+    u32::from(off % 4 == 0 && stride % 4 == 0 && z % 4 == 0)
+}
+
 /// `[out, in_pg, taps]` → `[group, tap * in_pg + ci, oc]`, oc contiguous.
 fn transpose_pos(w: &[f32], out_c: usize, in_pg: usize, taps: usize) -> Vec<f32> {
     debug_assert_eq!(w.len(), out_c * in_pg * taps);
@@ -79,6 +87,12 @@ struct GemmDims {
     c_z: u32,
     epilogue: u32,
     scale: f32,
+    /// 1 when every vec4 view of `a` (`a4[base/4]`) is 16-byte aligned for
+    /// this dispatch — off, stride and the per-head z step are all multiples
+    /// of 4. The scores GEMM's B (stride t) and the PV GEMM's A fail this.
+    a_vec: u32,
+    b_vec: u32,
+    _p0: u32,
 }
 
 #[repr(C)]
@@ -90,8 +104,10 @@ struct ConvDims {
     c_in: u32,
     stride: u32,
     t_in: u32,
-    _p0: u32,
-    _pad: u32,
+    /// c_in (512) and n (512) are multiples of 4, so both vec4 views are
+    /// always aligned for the conv stack.
+    a_vec: u32,
+    b_vec: u32,
 }
 
 #[repr(C)]
@@ -171,6 +187,11 @@ pub(crate) struct GpuModel {
     gpu: Gpu,
     pub cfg: Wav2Vec2Config,
     pipes: Pipe,
+    /// The picked GEMM tile (matches the compiled pipelines): every dispatch
+    /// grid is computed from these, so a variant with a different M tile
+    /// covers the same output with a different grid.
+    gemm_mt: u32,
+    gemm_nt: u32,
     conv0_w: wgpu::Buffer,
     conv_wt: Vec<wgpu::Buffer>,
     conv_b: Vec<wgpu::Buffer>,
@@ -201,6 +222,9 @@ pub(crate) struct GpuModel {
     zeros: wgpu::Buffer,
     /// Expanded trellis labels for the gathered alignment readback.
     labels: wgpu::Buffer,
+    /// 1 at the `<star>` states' indices, 0 elsewhere; the gather kernel
+    /// writes `CTC_STAR_SCORE` for those columns (see `shaders::gather`).
+    star_flags: wgpu::Buffer,
     /// Activation workspace reused across chunks of the same length.
     scratch: std::sync::Mutex<Option<Scratch>>,
 }
@@ -418,17 +442,22 @@ impl GpuModel {
         up.finish()?;
 
         let labels_buf = gpu.storage("trellis-labels", 65536 * 4);
+        let star_flags = gpu.storage("star-flags", 65536 * 4);
         let mk = |src: &str, entry: &str| -> Result<wgpu::ComputePipeline> {
             gpu.pipeline(entry, src, "main", None)
         };
-        // GEMM fills every shared element it reads. Skipping the WebGPU
+        // The GEMM fills every shared element it reads. Skipping the WebGPU
         // workgroup zero removes a serial prologue on Pascal.
         let mk_gemm = |src: &str, entry: &str| -> Result<wgpu::ComputePipeline> {
             gpu.pipeline_no_zero(entry, src, "main", None)
         };
+        // One GEMM schedule for the whole model, picked once at load; the
+        // swept result and why the alternatives lost live on `GemmVariant`.
+        let variant = shaders::pick_gemm_variant();
+        let (gemm_mt, gemm_nt) = shaders::gemm_tile(variant);
         let pipes = Pipe {
-            gemm: mk_gemm(&shaders::gemm_bias(), "gemm")?,
-            conv_gemm: mk_gemm(&shaders::conv_gemm(), "conv_gemm")?,
+            gemm: mk_gemm(&shaders::gemm_variant(variant), "gemm")?,
+            conv_gemm: mk_gemm(&shaders::conv_gemm_variant(variant), "conv_gemm")?,
             conv0: mk(&shaders::conv0(), "conv0")?,
             pos_conv: mk_gemm(&shaders::pos_conv(), "pos_conv")?,
             ln: mk(&shaders::layernorm(), "ln")?,
@@ -444,6 +473,8 @@ impl GpuModel {
             gpu,
             cfg,
             pipes,
+            gemm_mt,
+            gemm_nt,
             conv0_w,
             conv_wt: conv_wt_b,
             conv_b,
@@ -473,6 +504,7 @@ impl GpuModel {
             lm_b: lm_b_b,
             zeros,
             labels: labels_buf,
+            star_flags,
             scratch: std::sync::Mutex::new(None),
         })
     }
@@ -484,15 +516,25 @@ impl GpuModel {
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
-        self.forward_impl(input, None, false)
+        self.forward_impl(input, None, false, None, &[])
     }
 
     /// Same forward, but instead of the whole (T, V) log-prob matrix only
     /// the expanded trellis labels' values come back: (T, S), S =
     /// expanded.len().  The alignment Viterbi reads nothing else, and the
     /// 70 MB download of a 34 s chunk shrinks to ~30 KB.
-    pub fn forward_gathered(&self, input: &[f32], expanded: &[u32]) -> Result<Vec<f32>> {
-        self.forward_impl(input, Some(expanded), false)
+    ///
+    /// `keep` restricts the readback to a row range of the gathered block —
+    /// the windowed aligner keeps only the middle `win` rows of each chunk
+    /// and drops the context rows, so they are never downloaded.
+    pub fn forward_gathered(
+        &self,
+        input: &[f32],
+        expanded: &[u32],
+        keep: Option<(usize, usize)>,
+        stars: &[u32],
+    ) -> Result<Vec<f32>> {
+        self.forward_impl(input, Some(expanded), false, keep, stars)
     }
 
     /// Same forward, but the lm head and log-softmax never run: the host gets
@@ -501,7 +543,7 @@ impl GpuModel {
     /// ([`crate::wav2vec2::LmHeadCpu`]) when the DP needs trellis columns,
     /// which is what keeps a long transcript's emissions out of RAM.
     pub fn forward_hidden(&self, input: &[f32]) -> Result<Vec<f32>> {
-        self.forward_impl(input, None, true)
+        self.forward_impl(input, None, true, None, &[])
     }
 
     /// Columns per row of [`GpuModel::forward`]'s log-prob block.  The aligner
@@ -516,8 +558,20 @@ impl GpuModel {
         self.cfg.hidden_size
     }
 
-    fn forward_impl(&self, input: &[f32], gather: Option<&[u32]>, read_hidden: bool) -> Result<Vec<f32>> {
+    fn forward_impl(
+        &self,
+        input: &[f32],
+        gather: Option<&[u32]>,
+        read_hidden: bool,
+        keep: Option<(usize, usize)>,
+        stars: &[u32],
+    ) -> Result<Vec<f32>> {
         let gpu = &self.gpu;
+        // the GEMM pipelines were compiled with this tile; every grid below
+        // must tile with the same numbers or part of the output is never
+        // dispatched
+        let gemm_mt = self.gemm_mt;
+        let gemm_nt = self.gemm_nt;
         let hidden = self.cfg.hidden_size;
         let vocab = self.cfg.vocab_size;
         let heads = self.cfg.num_attention_heads;
@@ -539,7 +593,7 @@ impl GpuModel {
                 "sequence of {t} frames is too long for one GPU forward; use --window 30"
             );
         }
-        let (x_in, convs, staging, cached, mut act, ubuf) = {
+        let (x_in, convs, staging, cached, mut act, ubuf, gather_buf) = {
             let mut guard = self.scratch.lock().unwrap();
             let gathered = gather.is_some();
             let reuse = guard
@@ -577,6 +631,11 @@ impl GpuModel {
                     // the hidden readback never runs the head, so its logits
                     // buffer doubles as a (t, hidden) scratch
                     logits: st("logits", if read_hidden { t * hidden } else { t * vocab }),
+                    // the gather's (t, S) output lives here too: creating a
+                    // fresh 36 MB storage per chunk showed up as host time on
+                    // every window, and the dispatch can then join the
+                    // recorded graph instead of being re-recorded per call
+                    gather_out: gather.map(|e| st("gather-out", t * e.len())),
                     // the gathered readback never touches the MAP_READ staging;
                     // a 34 s chunk's full staging is 70 MB of dead VRAM there
                     staging: gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -619,6 +678,7 @@ impl GpuModel {
                     logits: s.logits.clone(),
                 },
                 s.ubuf.clone(),
+                s.gather_out.clone(),
             )
         };
 
@@ -761,10 +821,11 @@ impl GpuModel {
                     m: tout as u32, n: 512,
                     k: (self.cfg.conv_kernel[i] * 512) as u32,
                     c_in: 512, stride: self.cfg.conv_stride[i] as u32, t_in: rows as u32,
-                    _p0: 0, _pad: 0,
+                    a_vec: 1, b_vec: 1,
                 },
-                (tout as u32).div_ceil(shaders::MT), (512u32).div_ceil(shaders::NT),
+                (tout as u32).div_ceil(gemm_mt), (512u32).div_ceil(gemm_nt),
                 bind!(0, &convs[i - 1]), bind!(1, &self.conv_wt[i - 1]), bind!(2, &self.conv_b[i]), bind!(3, &convs[i]),
+                bind!(5, &convs[i - 1]), bind!(6, &self.conv_wt[i - 1]),
             );
             dispatch!(
                 P_LN,
@@ -789,9 +850,11 @@ impl GpuModel {
                 m: rows as u32, n: hidden as u32, k: 512,
                 a_stride: 512, b_stride: hidden as u32, c_stride: hidden as u32,
                 a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
+                a_vec: vec4_ok(0, 512, 0), b_vec: vec4_ok(0, hidden as u32, 0), _p0: 0,
             },
-            (rows as u32).div_ceil(shaders::MT), (hidden as u32).div_ceil(shaders::NT),
+            (rows as u32).div_ceil(gemm_mt), (hidden as u32).div_ceil(gemm_nt),
             bind!(0, &cur), bind!(1, &self.fp_wt), bind!(2, &self.fp_b), bind!(3, &act.x), bind!(5, &self.zeros),
+            bind!(6, &cur), bind!(7, &self.fp_wt),
         );
 
         // ---- positional conv + add. One group per workgroup-y, gelu fused.
@@ -851,9 +914,11 @@ impl GpuModel {
                     m: t_rows, n: 3 * cols, k: cols,
                     a_stride: cols, b_stride: 3 * cols, c_stride: 3 * cols,
                     a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
+                    a_vec: vec4_ok(0, cols, 0), b_vec: vec4_ok(0, 3 * cols, 0), _p0: 0,
                 },
-                t_rows.div_ceil(shaders::MT), (3 * cols).div_ceil(shaders::NT),
+                t_rows.div_ceil(gemm_mt), (3 * cols).div_ceil(gemm_nt),
                 bind!(0, &act.t1), bind!(1, &self.qkv_wt[li]), bind!(2, &self.qkv_b[li]), bind!(3, &act.qkv), bind!(5, &self.zeros),
+                bind!(6, &act.t1), bind!(7, &self.qkv_wt[li]),
             );
             // K^T: rows hidden, cols t, from qkv rows offset T*1024, stride 3072
             dispatch!(
@@ -863,7 +928,9 @@ impl GpuModel {
                 (t as u32).div_ceil(16), (hidden as u32).div_ceil(16),
                 bind!(0, &act.qkv), bind!(1, &act.kt),
             );
-            // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z
+            // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z.
+            // A is a vec4-able slice of qkv; B (kt) strides by t, which is odd
+            // for most windows, so b_vec computes to 0 and the scalar path runs
             dispatch_z!(
                 P_GEMM,
                 GemmDims {
@@ -874,9 +941,13 @@ impl GpuModel {
                     c_off: 0, c_z: t_rows * t_rows,
                     epilogue: 0,
                     scale: 0.125, // head_dim^-0.5: the attention scaling
+                    a_vec: vec4_ok(0, 3 * cols, head_dim as u32),
+                    b_vec: vec4_ok(0, t as u32, head_dim as u32 * t as u32),
+                    _p0: 0,
                 },
-                t_rows.div_ceil(shaders::MT), t_rows.div_ceil(shaders::NT), heads as u32,
+                t_rows.div_ceil(gemm_mt), t_rows.div_ceil(gemm_nt), heads as u32,
                 bind!(0, &act.qkv), bind!(1, &act.kt), bind!(2, &self.zeros), bind!(3, &act.scores), bind!(5, &self.zeros),
+                bind!(6, &act.qkv), bind!(7, &act.kt),
             );
             // softmax over each (head, query) row
             dispatch!(
@@ -885,7 +956,9 @@ impl GpuModel {
                 row_grid(heads as u32 * t_rows).0, row_grid(heads as u32 * t_rows).1,
                 bind!(0, &act.scores),
             );
-            // per-head weighted V, z-batched: attn_h = scores_h @ v_h
+            // per-head weighted V, z-batched: attn_h = scores_h @ v_h.
+            // B is a vec4-able slice of qkv; A (scores) strides by t, so
+            // a_vec computes to 0 and the scalar path runs
             dispatch_z!(
                 P_GEMM,
                 GemmDims {
@@ -896,9 +969,13 @@ impl GpuModel {
                     c_off: 0, c_z: head_dim as u32,
                     epilogue: 0,
                     scale: 1.0,
+                    a_vec: vec4_ok(0, t_rows, t_rows * t_rows),
+                    b_vec: vec4_ok((2 * hidden) as u32, 3 * cols, head_dim as u32),
+                    _p0: 0,
                 },
-                t_rows.div_ceil(shaders::MT), (head_dim as u32).div_ceil(shaders::NT), heads as u32,
+                t_rows.div_ceil(gemm_mt), (head_dim as u32).div_ceil(gemm_nt), heads as u32,
                 bind!(0, &act.scores), bind!(1, &act.qkv), bind!(2, &self.zeros), bind!(3, &act.attn_o), bind!(5, &self.zeros),
+                bind!(6, &act.scores), bind!(7, &act.qkv),
             );
             // out proj + residual
             dispatch!(
@@ -907,9 +984,11 @@ impl GpuModel {
                     m: t_rows, n: cols, k: cols,
                     a_stride: cols, b_stride: cols, c_stride: cols,
                     a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 2, scale: 1.0,
+                    a_vec: vec4_ok(0, cols, 0), b_vec: vec4_ok(0, cols, 0), _p0: 0,
                 },
-                t_rows.div_ceil(shaders::MT), cols.div_ceil(shaders::NT),
+                t_rows.div_ceil(gemm_mt), cols.div_ceil(gemm_nt),
                 bind!(0, &act.attn_o), bind!(1, &self.out_wt[li]), bind!(2, &self.out_b[li]), bind!(3, &act.t3), bind!(5, &act.x),
+                bind!(6, &act.attn_o), bind!(7, &self.out_wt[li]),
             );
             // FFN: t3 is the new residual; swap x <-> t3
             std::mem::swap(&mut act.x, &mut act.t3);
@@ -926,9 +1005,11 @@ impl GpuModel {
                     m: t_rows, n: self.cfg.intermediate_size as u32, k: cols,
                     a_stride: cols, b_stride: self.cfg.intermediate_size as u32, c_stride: self.cfg.intermediate_size as u32,
                     a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 1, scale: 1.0,
+                    a_vec: vec4_ok(0, cols, 0), b_vec: vec4_ok(0, self.cfg.intermediate_size as u32, 0), _p0: 0,
                 },
-                t_rows.div_ceil(shaders::MT), (self.cfg.intermediate_size as u32).div_ceil(shaders::NT),
+                t_rows.div_ceil(gemm_mt), (self.cfg.intermediate_size as u32).div_ceil(gemm_nt),
                 bind!(0, &act.t1), bind!(1, &self.ff1_wt[li]), bind!(2, &self.ff1_b[li]), bind!(3, &act.t2), bind!(5, &self.zeros),
+                bind!(6, &act.t1), bind!(7, &self.ff1_wt[li]),
             );
             dispatch!(
                 P_GEMM,
@@ -936,9 +1017,11 @@ impl GpuModel {
                     m: t_rows, n: cols, k: self.cfg.intermediate_size as u32,
                     a_stride: self.cfg.intermediate_size as u32, b_stride: cols, c_stride: cols,
                     a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 2, scale: 1.0,
+                    a_vec: vec4_ok(0, self.cfg.intermediate_size as u32, 0), b_vec: vec4_ok(0, cols, 0), _p0: 0,
                 },
-                t_rows.div_ceil(shaders::MT), cols.div_ceil(shaders::NT),
+                t_rows.div_ceil(gemm_mt), cols.div_ceil(gemm_nt),
                 bind!(0, &act.t2), bind!(1, &self.ff2_wt[li]), bind!(2, &self.ff2_b[li]), bind!(3, &act.t1), bind!(5, &act.x),
+                bind!(6, &act.t2), bind!(7, &self.ff2_wt[li]),
             );
             std::mem::swap(&mut act.x, &mut act.t1);
         }
@@ -959,9 +1042,11 @@ impl GpuModel {
                 m: t as u32, n: vocab as u32, k: hidden as u32,
                 a_stride: hidden as u32, b_stride: vocab as u32, c_stride: vocab as u32,
                 a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
+                a_vec: vec4_ok(0, hidden as u32, 0), b_vec: vec4_ok(0, vocab as u32, 0), _p0: 0,
             },
-            (t as u32).div_ceil(shaders::MT), (vocab as u32).div_ceil(shaders::NT),
+            (t as u32).div_ceil(gemm_mt), (vocab as u32).div_ceil(gemm_nt),
             bind!(0, &act.x), bind!(1, &self.lm_wt), bind!(2, &self.lm_b), bind!(3, &act.logits), bind!(5, &self.zeros),
+            bind!(6, &act.x), bind!(7, &self.lm_wt),
         );
         dispatch!(
             P_LOGSOFTMAX,
@@ -969,6 +1054,31 @@ impl GpuModel {
             row_grid(t as u32).0, row_grid(t as u32).1,
             bind!(0, &act.logits),
         );
+        }
+        // gathered alignment: one dispatch collecting the trellis labels'
+        // log-probs, so the readback below is (T, S) instead of (T, V). Part
+        // of the recorded graph: only the labels buffer's *contents* change
+        // per chunk, never its handle, so a replay reruns the dispatch as
+        // recorded against the scratch's gather-out buffer.
+        if let Some(expanded) = gather {
+            // S grows with the transcript, so T*S overflows a single
+            // dimension's 65535-workgroup limit on anything but a short
+            // transcript (15 m audio: T=1700, S=31130 -> 206595 groups).
+            // The gather kernel folds workgroups across x and y; see
+            // `flat_grid`.
+            anyhow::ensure!(
+                expanded.len() <= 65536,
+                "transcript too long for the labels buffer"
+            );
+            let total = u32::try_from(t * expanded.len()).context("gather size")?;
+            let (gx, gy) = flat_grid(total);
+            dispatch!(
+                P_GATHER,
+                Cfg4 { a: total, b: expanded.len() as u32, c: vocab as u32, d: 0 },
+                gx, gy,
+                bind!(0, &act.logits), bind!(1, &self.labels), bind!(2, gather_buf.as_ref().context("missing gather buffer")?),
+                bind!(4, &self.star_flags),
+            );
         }
         {
             let mut guard = self.scratch.lock().unwrap();
@@ -980,33 +1090,9 @@ impl GpuModel {
         }
         }
 
-        // gathered alignment: one dispatch collecting the trellis labels'
-        // log-probs, so the readback below is (T, S) instead of (T, V)
-        let gather_out = match gather {
-            Some(expanded) => {
-                // S grows with the transcript, so T*S overflows a single
-                // dimension's 65535-workgroup limit on anything but a short
-                // transcript (15 m audio: T=1700, S=31130 -> 206595 groups).
-                // The gather kernel folds workgroups across x and y; see
-                // `flat_grid`.
-                anyhow::ensure!(
-                    expanded.len() <= 65536,
-                    "transcript too long for the labels buffer"
-                );
-                let total = u32::try_from(t * expanded.len()).context("gather size")?;
-                let (gx, gy) = flat_grid(total);
-                let buf = gpu.storage("gather-out", (t * expanded.len() * 4) as u64);
-                dispatch!(
-                    P_GATHER,
-                    Cfg4 { a: total, b: expanded.len() as u32, c: vocab as u32, d: 0 },
-                    gx, gy,
-                    bind!(0, &act.logits), bind!(1, &self.labels), bind!(2, &buf),
-                );
-                Some(buf)
-            }
-            None => None,
-        };
-
+        // gathered alignment: read back the trellis columns the caller keeps
+        // (the middle `win` rows), not the context rows it drops — one 4-byte
+        // aligned range of the gather-out buffer, straight into f32s
         let prof_mode = std::env::var("CTC_PROFILE").ok();
         let prof = prof_mode.as_deref() == Some("1");
         // CTC_PROFILE=2 timestamps every dispatch of the first forward so the
@@ -1022,6 +1108,16 @@ impl GpuModel {
         gpu.upload(&x_in, bytemuck::cast_slice(input));
         if let Some(expanded) = gather {
             gpu.upload(&self.labels, bytemuck::cast_slice(expanded));
+            // the gather kernel stamps the star states' columns itself; the
+            // host loop this replaces walked every (frame, star) cell per
+            // chunk in column-major scattered writes
+            let mut flags = vec![0u32; expanded.len()];
+            for &s in stars {
+                if (s as usize) < expanded.len() {
+                    flags[s as usize] = 1;
+                }
+            }
+            gpu.upload(&self.star_flags, bytemuck::cast_slice(&flags));
         }
         if !uni.is_empty() {
             gpu.queue.write_buffer(&ubuf, 0, &uni);
@@ -1096,9 +1192,12 @@ impl GpuModel {
             let bytes = gpu.readback(&qbuf, qcount as u64 * 8)?;
             let ticks: &[u64] = bytemuck::cast_slice(&bytes);
             let period = gpu.queue.get_timestamp_period() as f64;
+            // indexed by pipeline id (P_*): gelu has no pipeline (fused into
+            // the LN and the GEMM epilogue), so the names after P_LN_SD were
+            // off by one slot until this list stopped carrying a gelu entry
             let names = [
-                "gemm", "conv_gemm", "conv0", "pos", "ln", "ln_sd", "gelu", "add", "softmax",
-                "logsoftmax", "transpose", "copy", "gather", "  scores", "  pv", "  gemm-main",
+                "gemm", "conv_gemm", "conv0", "pos", "ln", "ln_sd", "add", "softmax",
+                "logsoftmax", "transpose", "gather", "  scores", "  pv", "  gemm-main",
             ];
             let mut acc = [0f64; 16];
             let mut cnt = [0u32; 16];
@@ -1106,15 +1205,16 @@ impl GpuModel {
                 let dt = ticks[i * 2 + 1].saturating_sub(ticks[i * 2]) as f64 * period / 1e6;
                 if p < acc.len() {
                     // split the gemm pipeline by dispatch shape: pv is n=64
-                    // (gy=1), scores is n=t, everything else is a main GEMM
-                    let mut b = p;
+                    // (gy=1), scores is n=t, everything else is a main GEMM.
+                    // The three buckets are the last three names above.
+                    let mut b = p as usize;
                     if p == P_GEMM {
                         b = if gy == 1 {
-                            14
-                        } else if gy == (t as u32).div_ceil(shaders::NT) {
-                            13
+                            12
+                        } else if gy == (t as u32).div_ceil(gemm_nt) {
+                            11
                         } else {
-                            15
+                            13
                         };
                     }
                     acc[b] += dt;
@@ -1140,8 +1240,20 @@ impl GpuModel {
         // One copy and one map. Chunked 8 MB maps were a driver workaround
         // that cost a full poll per piece (~70 MB of logits).
         if let Some(expanded) = gather {
-            let bytes = gpu.readback(gather_out.as_ref().unwrap(), (t * expanded.len() * 4) as u64)?;
-            return Ok(bytemuck::cast_slice(&bytes).to_vec());
+            let states = expanded.len();
+            // clamp to the rows this forward actually produced (the caller's
+            // range is written for a full window; the last one may be short)
+            let (lo, hi) = keep
+                .map(|(lo, hi)| {
+                    let lo = lo.min(t);
+                    (lo, hi.min(t).max(lo))
+                })
+                .unwrap_or((0, t));
+            return gpu.readback_f32(
+                gather_buf.as_ref().context("missing gather buffer")?,
+                (lo * states * 4) as u64,
+                ((hi - lo) * states) as u64,
+            );
         }
         // the hidden readback needs the buffer the recorded final LN wrote —
         // `out_x` is saved when the graph is recorded (the local `act.x` it
@@ -1217,6 +1329,7 @@ struct Scratch {
     scores: wgpu::Buffer,
     attn_o: wgpu::Buffer,
     logits: wgpu::Buffer,
+    gather_out: Option<wgpu::Buffer>,
     staging: wgpu::Buffer,
     ubuf: wgpu::Buffer,
     jobs: Vec<Vec<Job>>,

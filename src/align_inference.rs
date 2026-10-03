@@ -497,7 +497,8 @@ impl Aligner {
                 let mut scratch = crate::wav2vec2::Scratch::default();
                 Ok(match form {
                     Form::Gathered => {
-                        let g = self.forward_gathered(&input, expanded, &star_state_idx, &mut scratch)?;
+                        let g =
+                            self.forward_gathered(&input, expanded, &star_state_idx, &mut scratch, None)?;
                         let f = g.len() / states;
                         Trellis::Gathered(GatheredChunks {
                             chunks: vec![g],
@@ -561,12 +562,19 @@ impl Aligner {
 
     /// Gathered scores of one z-normalised chunk; the CPU tower gathers from
     /// the full matrix, the GPU tower gathers on-device before readback.
+    ///
+    /// `keep` restricts the result to a row range of the chunk (the windowed
+    /// aligner keeps only the middle rows and drops the context rows on both
+    /// sides; the range is clamped to what the chunk produced, since the last
+    /// one may be short). Rows outside `keep` are never stamped, never copied
+    /// and, on the GPU tower, never downloaded.
     fn forward_gathered(
         &self,
         input: &[f32],
         expanded: &[usize],
         star_state_idx: &[usize],
         scratch: &mut crate::wav2vec2::Scratch,
+        keep: Option<(usize, usize)>,
     ) -> Result<Vec<f32>> {
         // The star's id is one past the last real column, so `expanded` carries
         // BLANK_ID there instead (see the caller). The reference scores that
@@ -579,16 +587,43 @@ impl Aligner {
         // landed on frame 0 instead of frame 6 and every later boundary with
         // it. So the star states are overwritten back to 0 here.
         let states = expanded.len();
-        let mut g = match &self.tower {
+        let g = match &self.tower {
             Tower::Cpu(m) => {
                 // The gathered epilogue is fused into the forward's lm head:
                 // the (t, vocab) log-prob matrix is never materialised.
-                let (g, _) = m.forward_gathered_with(input, &Default::default(), scratch, expanded)?;
+                let (mut g, _) =
+                    m.forward_gathered_with(input, &Default::default(), scratch, expanded)?;
+                if let Some((lo, hi)) = keep {
+                    let lo = lo.min(g.len() / states);
+                    let hi = hi.min(g.len() / states).max(lo);
+                    g.drain(hi * states..);
+                    g.drain(..lo * states);
+                }
+                // the star states' columns are the reference's appended zero
+                // column, not a real log-prob; stamped row-major — one row is
+                // `states * 4` bytes and stays in cache (the column-major
+                // loop this replaced wrote `frames` values at a stride of
+                // `states` floats per star, every write a fresh cache line).
+                // `star_state_idx` is already ascending.
+                let stars: Vec<usize> = star_state_idx
+                    .iter()
+                    .copied()
+                    .filter(|&si| si < states)
+                    .collect();
+                if !stars.is_empty() {
+                    for row in g.chunks_exact_mut(states) {
+                        for &si in &stars {
+                            row[si] = CTC_STAR_SCORE;
+                        }
+                    }
+                }
                 g
             }
             Tower::Gpu(gpu_model) => {
                 let exp32: Vec<u32> = expanded.iter().map(|&x| x as u32).collect();
-                gpu_model.forward_gathered(input, &exp32)?
+                let star32: Vec<u32> = star_state_idx.iter().map(|&x| x as u32).collect();
+                // the gather kernel stamps the star columns on-device
+                gpu_model.forward_gathered(input, &exp32, keep, &star32)?
             }
         };
         anyhow::ensure!(
@@ -596,14 +631,6 @@ impl Aligner {
             "gathered {} is not a whole number of {states}-state rows",
             g.len()
         );
-        let frames = g.len() / states;
-        for &si in star_state_idx {
-            if si < states {
-                for f in 0..frames {
-                    g[f * states + si] = CTC_STAR_SCORE;
-                }
-            }
-        }
         Ok(g)
     }
     /// Windowed encoding, gathered (port of `backend.log_probs_chunked`):
@@ -645,7 +672,13 @@ impl Aligner {
                     })
                 }
                 Form::Gathered => {
-                    let g = self.forward_gathered(&input, expanded, &star_state_idx, &mut scratch)?;
+                    let g = self.forward_gathered(
+                        &input,
+                        expanded,
+                        &star_state_idx,
+                        &mut scratch,
+                        None,
+                    )?;
                     let frames = g.len() / states;
                     Trellis::Gathered(GatheredChunks {
                         chunks: vec![g],
@@ -676,12 +709,14 @@ impl Aligner {
             // chunk = [ctx zeros | win real samples | ctx zeros], gathered from
             // the waveform with zero fill at the file edges
             let w_lo = start as i64 - ctx as i64; // waveform index of chunk sample 0
-            let mut chunk = vec![0.0f32; win + 2 * ctx];
-            for (i, slot) in chunk.iter_mut().enumerate() {
-                let wi = w_lo + i as i64;
-                if wi >= 0 && (wi as usize) < n {
-                    *slot = waveform[wi as usize];
-                }
+            let len = win + 2 * ctx;
+            let mut chunk = vec![0.0f32; len];
+            // one memcpy of the waveform overlap instead of a bounds-checked
+            // copy per sample; the zero padding at the file edges stays put
+            let (i_lo, i_hi) = (0i64.max(-w_lo), (len as i64).min(n as i64 - w_lo));
+            if i_lo < i_hi {
+                chunk[i_lo as usize..i_hi as usize]
+                    .copy_from_slice(&waveform[(w_lo + i_lo) as usize..(w_lo + i_hi) as usize]);
             }
             znorm(&mut chunk);
 
@@ -702,13 +737,16 @@ impl Aligner {
                     );
                 }
             } else {
-                let g = self.forward_gathered(&chunk, expanded, star_state_idx, &mut scratch)?;
-                let rows = g.len() / states;
-                let keep_lo = (ctx_frames * states).min(g.len());
-                let keep_hi = ((ctx_frames + win_frames).min(rows)) * states;
-                let mut block = Vec::with_capacity(keep_hi - keep_lo);
-                block.extend_from_slice(&g[keep_lo..keep_hi]);
-                blocks.push(block);
+                // the kept rows only: `forward_gathered` slices to the kept
+                // range before it returns, so what comes back is the block
+                let g = self.forward_gathered(
+                    &chunk,
+                    expanded,
+                    star_state_idx,
+                    &mut scratch,
+                    Some((ctx_frames, ctx_frames + win_frames)),
+                )?;
+                blocks.push(g);
                 if crate::alloc_stats::enabled() {
                     let (live, peak) = crate::alloc_stats::stats();
                     let c = blocks.len() - 1;
