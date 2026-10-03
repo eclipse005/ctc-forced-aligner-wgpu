@@ -38,6 +38,20 @@ fn main() -> anyhow::Result<()> {
         .map(|&s| if s % 2 == 1 && s >= 1 { (s - 1) / 2 } else { -1 })
         .collect();
 
+    // One row per SOURCE WORD, grouped by the tokenizer's `word_id` -- the same
+    // grouping the reference's `get_spans` produces, and the granularity the
+    // frame diff compares at when the star placement is the variable.
+    let mut word_spans: Vec<(usize, String, i64, i64)> = Vec::new();
+    for t in out.tokens.iter().filter(|t| t.piece != "<star>") {
+        match word_spans.last_mut() {
+            Some(w) if w.0 == t.word_id => {
+                w.1.push_str(&t.piece);
+                w.3 = t.end_frame;
+            }
+            _ => word_spans.push((t.word_id, t.piece.clone(), t.start_frame, t.end_frame)),
+        }
+    }
+
     let doc = serde_json::json!({
         "wav": wav,
         "frames": out.frames,
@@ -48,6 +62,11 @@ fn main() -> anyhow::Result<()> {
             "piece": t.piece,
             "start_frame": t.start_frame,
             "end_frame": t.end_frame,
+        })).collect::<Vec<_>>(),
+        "word_spans": word_spans.iter().map(|(_, text, a, b)| serde_json::json!({
+            "text": text,
+            "start_frame": a,
+            "end_frame": b,
         })).collect::<Vec<_>>(),
         "token_per_frame": token_per_frame,
         "blank_runs": out.blank_runs.iter().map(|(i, a, b)| serde_json::json!({
