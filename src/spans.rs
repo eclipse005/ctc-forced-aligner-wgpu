@@ -71,10 +71,17 @@ fn is_word_char(piece: &str) -> bool {
 pub fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
     let mut words: Vec<WordSpan> = Vec::new();
     let mut buf: Vec<&TokenAlignment> = Vec::new();
+    // Punctuation that follows the word it belongs to. It is held aside rather
+    // than pushed, so that it joins this word without also fusing the next one:
+    // "안녕.하세요" is the word "안녕." followed by the word "하세요", not one
+    // word. `fix_timestamp` already snapped these marks onto the preceding
+    // token's end, so attaching one invents no time of its own.
+    let mut tail: Vec<&TokenAlignment> = Vec::new();
 
     macro_rules! flush {
         () => {
-            if !buf.is_empty() {
+            if !buf.is_empty() || !tail.is_empty() {
+                buf.extend(tail.drain(..));
                 let text: String = buf.iter().map(|t| t.piece.as_str()).collect();
                 words.push(WordSpan {
                     index: words.len(),
@@ -102,12 +109,34 @@ pub fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
         }
         if is_word_char(&t.piece) {
             buf.push(t);
-        } else {
+            tail.clear();
+        } else if t.piece == "<star>" {
+            // A star is a boundary and not text: it closes the word, and the
+            // marks that trailed it go with it.
             flush!();
+        } else if !buf.is_empty() {
+            tail.push(t);
+        } else {
+            // Leading punctuation has no word to join, so it opens one.
+            buf.push(t);
         }
     }
     flush!();
     words
+}
+
+/// Whether `word` carries a sentence boundary.
+///
+/// The mark now belongs to the word it follows rather than sitting in the gap
+/// after it, so the boundary is in the word's own tail. A decimal point is in
+/// that tail too and is not a boundary.
+fn ends_sentence(word: &str) -> bool {
+    let mut rev = word.chars().rev();
+    let Some(last) = rev.next() else { return false };
+    if !SENTENCE_END.contains(&last) {
+        return false;
+    }
+    !rev.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 pub fn build_segments(tokens: &[TokenAlignment], words: &[WordSpan]) -> Vec<SegmentSpan> {
@@ -142,7 +171,7 @@ pub fn build_segments(tokens: &[TokenAlignment], words: &[WordSpan]) -> Vec<Segm
             .iter()
             .map(|t| t.piece.as_str())
             .collect();
-        if gap.chars().any(|ch| SENTENCE_END.contains(&ch)) {
+        if ends_sentence(&w.text) || gap.chars().any(|ch| SENTENCE_END.contains(&ch)) {
             flush!();
         }
     }

@@ -5,6 +5,11 @@
 //! `cues` are subtitle lines whose times stay on the spoken characters
 //! (CrisperWhisper / OneAsr standard cost model).
 
+use crate::spans::PUNCT;
+// The CJK ranges come from the tokenizer, so the alignment and the rendering
+// can never disagree about which script a text is in. They used to be spelled
+// out twice, and the two copies had drifted apart.
+use crate::vocab::is_cjk;
 use crate::viterbi::TokenAlignment;
 
 #[derive(Clone, Debug)]
@@ -23,12 +28,34 @@ pub struct CueOut {
     pub text: String,
 }
 
+/// Advance `ti` past any `<star>` targets and return the next real piece.
+///
+/// `<star>` is the reference's synthetic word-boundary marker, not a character
+/// of the transcript (see [`crate::vocab::Vocab::tokenise_with_stars`]), so a
+/// walk that pairs transcript characters with token pieces in lockstep has to
+/// step over it. It does not: `pieces[0]` is a star in BOTH placements — the
+/// `edges` star and the `segment` star — so an unskipped walk compares the
+/// transcript's first character against `"<star>"` for the whole file, never
+/// advances, and reports every character as unmatched.
+fn skip_stars(pieces: &[String], mut ti: usize) -> usize {
+    while ti < pieces.len() && pieces[ti] == "<star>" {
+        ti += 1;
+    }
+    ti
+}
+
+/// Whether `piece` is exactly the one character `ch` — the shape a kept
+/// transcript character has once the vocabulary has emitted it.
+fn piece_is_char(piece: &str, ch: char) -> bool {
+    piece.chars().next() == Some(ch) && piece.chars().nth(1).is_none()
+}
+
 pub fn skipped_chars(text: &str, pieces: &[String]) -> Vec<String> {
     let mut ti = 0usize;
     let mut skipped = Vec::new();
     for ch in text.chars() {
-        if ti < pieces.len() && pieces[ti].chars().next() == Some(ch) && pieces[ti].chars().nth(1).is_none()
-        {
+        ti = skip_stars(pieces, ti);
+        if ti < pieces.len() && piece_is_char(&pieces[ti], ch) {
             ti += 1;
         } else {
             skipped.push(ch.to_string());
@@ -37,28 +64,35 @@ pub fn skipped_chars(text: &str, pieces: &[String]) -> Vec<String> {
     skipped
 }
 
-pub fn resolve_split(text: &str, split: Option<&str>) -> String {
-    match split {
-        None | Some("auto") => {
-            if is_mostly_cjk(text) {
-                "char".to_string()
-            } else {
-                "word".to_string()
-            }
-        }
-        Some(s) if s == "word" || s == "char" || s == "sentence" => s.to_string(),
-        Some(s) => panic!("split must be word|char|sentence, got {s}"),
+/// Whether `text` is written without spaces between words.
+///
+/// The question this answers is not "is this CJK" — that asks about Unicode
+/// blocks and cannot tell a space-delimited script (Hangul, Kana) from an
+/// unspaced one (Han, Thai), even though they call for opposite treatment.
+/// What matters is whether splitting on whitespace yields *words*, and the
+/// length of what comes out answers it without a language table.
+///
+/// Measured on real transcripts: space-delimited scripts average 3.9-4.5
+/// characters per whitespace token, unspaced ones 33.4. A transcript mixes
+/// both, and so does the verdict — it takes the majority, which is what a
+/// single granularity for the whole file has to do.
+pub fn text_is_unspaced(text: &str) -> bool {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
     }
+    let chars: usize = tokens.iter().map(|t| t.chars().count()).sum();
+    chars * 8 > tokens.len() * 100
 }
 
-fn is_cjk(ch: char) -> bool {
-    matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF | 0xAC00..=0xD7AF)
-}
-
-fn is_mostly_cjk(text: &str) -> bool {
-    let cjk = text.chars().filter(|c| is_cjk(*c)).count();
-    let letters = text.chars().filter(|c| c.is_alphabetic()).count().max(1);
-    cjk > 0 && cjk * 10 > letters * 3
+/// `word` where the transcript separates words with spaces, `char` where it
+/// does not. One verdict for the whole text, chosen by [`text_is_unspaced`].
+pub fn auto_split(text: &str) -> &'static str {
+    if text_is_unspaced(text) {
+        "char"
+    } else {
+        "word"
+    }
 }
 
 fn r4(x: f64) -> f64 {
@@ -135,7 +169,8 @@ fn token_index(text: &str, pieces: &[String]) -> Vec<i64> {
     let mut ti = 0usize;
     let mut out = Vec::new();
     for ch in text.chars() {
-        if ti < pieces.len() && pieces[ti].chars().next() == Some(ch) && pieces[ti].chars().nth(1).is_none() {
+        ti = skip_stars(pieces, ti);
+        if ti < pieces.len() && piece_is_char(&pieces[ti], ch) {
             out.push(ti as i64);
             ti += 1;
         } else {
@@ -165,6 +200,15 @@ fn mid_end(this_end_frame: i64, next_start: i64) -> i64 {
     }
 }
 
+/// Segments of `text` over the whole file, with the leading and trailing
+/// silence folded in so the spans tile the timeline and no stretch of audio
+/// belongs to nobody.
+///
+/// `split` is the unit: `char` for a transcript that does not space its words,
+/// `word` for one that does. The caller normally passes [`auto_split`]; it
+/// stays a parameter because a library user with a mixed transcript may want
+/// to force one, and because a two-word test string has no statistical
+/// evidence either way.
 pub fn build_spans(
     text: &str,
     tokens: &[TokenAlignment],
@@ -172,8 +216,9 @@ pub fn build_spans(
     frame_rate: f64,
     frame_scores: &[f64],
     split: &str,
-    merge_threshold: f64,
 ) -> Vec<SpanOut> {
+    // `json` already carries `words` and `segments`, so the only thing spans
+    // add is the gapless timeline; the granularity is not a user choice.
     let pieces: Vec<String> = tokens.iter().map(|t| t.piece.clone()).collect();
     let owned = token_index(text, &pieces);
     let mut rows: Vec<(usize, usize, String, Vec<usize>)> = Vec::new();
@@ -220,8 +265,13 @@ pub fn build_spans(
             score,
         });
     }
+    // Spans already meet at the midpoint of the blank between them, so the
+    // only thing left to do is clamp the sub-frame overlaps that rounding
+    // leaves behind and make the timeline strictly contiguous. A user-tunable
+    // threshold used to sit here; the default did this and nothing else, and
+    // every other value was a guess about somebody's subtitle style.
     for i in 0..segments.len().saturating_sub(1) {
-        if segments[i + 1].start - segments[i].end < merge_threshold {
+        if segments[i + 1].start - segments[i].end < 0.0 {
             segments[i + 1].start = segments[i].end;
         }
     }
@@ -248,6 +298,12 @@ struct Tok {
     end: f64,
     token: String,
     space_before: bool,
+    /// Whether this token is a single character of a script that writes without
+    /// spaces, and so may be split further. Decided per token, not per file: a
+    /// file with one Han character in it was previously taken to be Chinese
+    /// throughout, and the line-breaker duly cut `alignment` into `alignm` and
+    /// `ent`.
+    splittable: bool,
 }
 
 const GRACE: f64 = 11.0;
@@ -330,51 +386,77 @@ fn discourse(word: &str) -> bool {
     )
 }
 
-fn cue_tokens(tokens: &[TokenAlignment]) -> (Vec<Tok>, bool) {
-    let cjk = tokens.iter().any(|t| t.piece.chars().any(is_cjk));
-    let mut out = Vec::new();
-    if cjk {
-        let mut pending = false;
-        for t in tokens {
-            if t.piece.trim().is_empty() {
-                pending = true;
-                continue;
-            }
-            out.push(Tok {
-                start: t.start,
-                end: t.end,
-                token: t.piece.clone(),
-                space_before: pending && !out.is_empty(),
-            });
-            pending = false;
-        }
-        return (merge_decimals(out), true);
-    }
+/// The line-breaking unit, decided per word.
+///
+/// A word whose characters are mostly from a script that writes without spaces
+/// is split into its characters; every other word is one unit. Deciding this
+/// per word rather than per file is what lets `你好这个` break between
+/// characters while `alignment` stays whole -- the previous one-flag-per-file
+/// test called any transcript containing a Han character Chinese throughout,
+/// and cut Latin words in half at the cue boundaries.
+fn cue_tokens(tokens: &[TokenAlignment]) -> Vec<Tok> {
+    let mut out: Vec<Tok> = Vec::new();
     let mut buf: Vec<&TokenAlignment> = Vec::new();
     let mut pending = false;
+
     let flush = |buf: &mut Vec<&TokenAlignment>, pending: &mut bool, out: &mut Vec<Tok>| {
         if buf.is_empty() {
             return;
         }
-        out.push(Tok {
-            start: buf[0].start,
-            end: buf[buf.len() - 1].end,
-            token: buf.iter().map(|t| t.piece.as_str()).collect(),
-            space_before: *pending && !out.is_empty(),
-        });
+        let text: String = buf.iter().map(|t| t.piece.as_str()).collect();
+        let letters = buf.iter().filter(|t| !t.piece.chars().all(|c| c.is_whitespace())).count();
+        let cjk = letters > 0
+            && buf.iter().filter(|t| t.piece.chars().any(is_cjk)).count() * 2 > letters;
+        let (start, end) = (buf[0].start, buf[buf.len() - 1].end);
+        let space_before = *pending && !out.is_empty();
+        if cjk {
+            // One unit per character, so the splitter can break between them.
+            for (n, t) in buf.iter().enumerate() {
+                out.push(Tok {
+                    start: t.start,
+                    end: t.end,
+                    token: t.piece.clone(),
+                    space_before: space_before && n == 0,
+                    splittable: true,
+                });
+            }
+        } else {
+            out.push(Tok { start, end, token: text, space_before, splittable: false });
+        }
         buf.clear();
         *pending = false;
     };
+
     for t in tokens {
-        if t.piece.trim().is_empty() {
+        // Two different boundary signals, and they arrive in different places.
+        //
+        // `<star>` and whitespace are markers that sit BETWEEN words, so
+        // discarding them loses nothing -- and the star has to go, or it is
+        // printed in the subtitle.
+        //
+        // A change of `word_id` arrives ON the first character of the next
+        // word: that character is real text. Treating it as a boundary threw
+        // away the first letter of every word, which is what turned
+        // "All right, we purse welcome" into "All ight, e urse elcome". Flush
+        // on the change and keep the token.
+        //
+        // The word id is the signal that works for every script. The star
+        // placement does not: English takes `edges`, which has exactly two
+        // stars in a whole file, so grouping on stars made the entire
+        // transcript one 3-minute cue with every space gone.
+        if t.piece == "<star>" || t.piece.trim().is_empty() {
             flush(&mut buf, &mut pending, &mut out);
             pending = true;
             continue;
         }
+        if t.word_id != buf.first().map(|b| b.word_id).unwrap_or(t.word_id) {
+            flush(&mut buf, &mut pending, &mut out);
+            pending = true;
+        }
         buf.push(t);
     }
     flush(&mut buf, &mut pending, &mut out);
-    (out, false)
+    merge_decimals(out)
 }
 
 fn merge_decimals(tokens: Vec<Tok>) -> Vec<Tok> {
@@ -393,6 +475,7 @@ fn merge_decimals(tokens: Vec<Tok>) -> Vec<Tok> {
                 end: tokens[i + 2].end,
                 token: format!("{}{}{}", tokens[i].token, tokens[i + 1].token, tokens[i + 2].token),
                 space_before: tokens[i].space_before,
+                splittable: false,
             });
             i += 3;
             continue;
@@ -402,14 +485,53 @@ fn merge_decimals(tokens: Vec<Tok>) -> Vec<Tok> {
             end: tokens[i].end,
             token: tokens[i].token.clone(),
             space_before: tokens[i].space_before,
+            splittable: tokens[i].splittable,
         });
         i += 1;
     }
     out
 }
 
-fn sentence_end(words: &[Tok], i: usize) -> bool {
-    let tok = &words[i].token;
+/// Whether `text` carries anything a viewer would read as speech.
+fn says_something(text: &str) -> bool {
+    text.chars().any(|c| !c.is_whitespace() && !PUNCT.contains(&c))
+}
+
+/// Fold cues that are nothing but punctuation into the cue they belong to.
+///
+/// These are splitter artifacts, not subtitles. A sentence-final mark gets
+/// `fix_timestamp`-snapped back onto the end of the token before it, which
+/// makes it a *point* (`start == end`); when it lands in a span of its own that
+/// span is a millisecond wide, and the SRT grows a cue reading `.` on screen
+/// for no time at all.
+///
+/// The mark is kept — dropping it would silently edit the transcript — and no
+/// duration is invented for it: it simply stops being a cue of its own. How
+/// long a subtitle should stay up is the player's business, not the aligner's.
+fn fold_bare_marks(raw: Vec<(f64, f64, String)>) -> Vec<(f64, f64, String)> {
+    let mut out: Vec<(f64, f64, String)> = Vec::with_capacity(raw.len());
+    for (s, e, t) in raw {
+        match out.last_mut() {
+            Some(last) if !says_something(&t) => {
+                last.1 = last.1.max(e);
+                last.2.push_str(&t);
+            }
+            _ => out.push((s, e, t)),
+        }
+    }
+    // A run of marks at the very start has no cue behind it to join; hand it
+    // forward to the first one that says something.
+    let head = out.iter().take_while(|(_, _, t)| !says_something(t)).count();
+    if head > 0 && head < out.len() {
+        let marks: String = out[..head].iter().map(|(_, _, t)| t.as_str()).collect();
+        out[head].0 = out[head - 1].0;
+        out[head].2.insert_str(0, &marks);
+        out.drain(..head);
+    }
+    out
+}
+
+fn sentence_end(words: &[Tok], i: usize) -> bool {    let tok = &words[i].token;
     if is_decimal(tok) {
         return false;
     }
@@ -460,14 +582,31 @@ fn boundary(words: &[Tok], i: usize) -> f64 {
     WORD_COST
 }
 
-fn units(tok: &str, cjk: bool) -> f64 {
-    let s = strip_tok(tok);
+/// Budget weight of one unit: a character of an unspaced script costs its
+/// character count, a space-delimited word costs one.
+fn units(t: &Tok) -> f64 {
+    let s = strip_tok(&t.token);
     if s.is_empty() {
         0.0
-    } else if cjk {
+    } else if t.splittable {
         s.chars().count() as f64
     } else {
         1.0
+    }
+}
+
+/// The budget a span is measured against, and the character ceiling that goes
+/// with it. A span of Chinese wants a character count and a span of Latin wants
+/// a word count; a mixed transcript has both, so the majority of the span's own
+/// units picks the budget rather than a flag decided for the whole file.
+fn span_budget(span: &[&Tok], latin_words: f64, latin_chars: f64, cjk_chars: f64)
+    -> (f64, Option<f64>)
+{
+    let splittable = span.iter().filter(|t| t.splittable).count();
+    if splittable * 2 > span.len() {
+        (cjk_chars, None)
+    } else {
+        (latin_words, Some(latin_chars))
     }
 }
 
@@ -479,14 +618,14 @@ fn dur(words: &[Tok], a: usize, b: usize) -> f64 {
     words[b].end - words[a].start
 }
 
-fn dp_split(words: &[Tok], target: f64, char_limit: Option<f64>, cjk: bool) -> Vec<usize> {
+fn dp_split(words: &[Tok], target: f64, char_limit: Option<f64>) -> Vec<usize> {
     let n = words.len();
     if n < 2 {
         return Vec::new();
     }
     let mut pre = vec![0.0; n + 1];
     for (k, w) in words.iter().enumerate() {
-        pre[k + 1] = pre[k] + units(&w.token, cjk);
+        pre[k + 1] = pre[k] + units(w);
     }
     let fits_chars = match char_limit {
         Some(lim) => dchars(words, 0, n - 1) as f64 <= lim,
@@ -530,7 +669,12 @@ fn dp_split(words: &[Tok], target: f64, char_limit: Option<f64>, cjk: bool) -> V
             if seg_u > 0.0 && seg_u <= 2.0 {
                 c += SHORT_PENALTY;
             }
-            let better = if cjk { c < dp[i] } else { c <= dp[i] };
+            // Ties resolve toward the later cut in Latin and toward the earlier
+            // one in Chinese, which is what the two scripts' line shapes want:
+            // Latin words are short, so an even split wins; a Han sentence has
+            // no natural break, so the greedy one that stays near the target
+            // does. `char_limit` is the signal for which regime this is.
+            let better = if char_limit.is_some() { c < dp[i] } else { c <= dp[i] };
             if better {
                 dp[i] = c;
                 prev[i] = j;
@@ -582,10 +726,10 @@ fn greedy(words: &[Tok], target: f64, char_limit: Option<f64>, pre: &[f64]) -> V
     cuts
 }
 
-fn join_seg(seg: &[Tok], cjk: bool) -> String {
-    if !cjk {
-        return seg.iter().map(|t| t.token.as_str()).collect::<Vec<_>>().join(" ");
-    }
+/// Render a segment. One rule for both scripts: a space goes where the
+/// tokenizer put a word boundary. A CJK run has none inside a word, so it
+/// renders tight; Latin words each carry one, so they render separated.
+fn join_seg(seg: &[Tok]) -> String {
     let mut s = String::new();
     for (i, t) in seg.iter().enumerate() {
         if i > 0 && t.space_before {
@@ -641,21 +785,21 @@ fn fmt_ms(mut total: i64) -> String {
 }
 
 pub struct CueDoc {
-    pub preset: String,
     pub script: String,
     pub cues: Vec<CueOut>,
 }
 
-pub fn build_cues(tokens: &[TokenAlignment], preset: &str) -> CueDoc {
-    let (latin_words, latin_chars, cjk_chars) = match preset {
-        "short" => (12.0, 66.0, 16.0),
-        "standard" => (16.0, 88.0, 22.0),
-        "loose" => (20.0, 110.0, 28.0),
-        other => panic!("preset must be short|standard|loose, got {other}"),
-    };
-    let (words, cjk) = cue_tokens(tokens);
-    let target = if cjk { cjk_chars } else { latin_words };
-    let char_limit = if cjk { None } else { Some(latin_chars) };
+pub fn build_cues(tokens: &[TokenAlignment]) -> CueDoc {
+    // Subtitle geometry. These are the long-form broadcast norms -- two lines
+    // of 44 columns, at most 7 s on screen -- and a CJK glyph is two columns
+    // wide, so 22 characters is the same width as 44 Latin ones. The
+    // short/loose variants that used to be selectable measured as a no-op on
+    // real material: a transcript that already has sentence punctuation, or
+    // simply many pauses, is split by those long before a length target
+    // binds, so the knob chose between 54 and 53 cues and nothing more.
+    let (latin_words, latin_chars, cjk_chars) = (16.0, 88.0, 22.0);
+    let words = cue_tokens(tokens);
+
     let mut spans: Vec<Vec<Tok>> = Vec::new();
     let mut cur = Vec::new();
     for i in 0..words.len() {
@@ -665,6 +809,7 @@ pub fn build_cues(tokens: &[TokenAlignment], preset: &str) -> CueDoc {
             end: words[i].end,
             token: words[i].token.clone(),
             space_before: words[i].space_before,
+            splittable: words[i].splittable,
         });
         if end {
             spans.push(std::mem::take(&mut cur));
@@ -675,7 +820,9 @@ pub fn build_cues(tokens: &[TokenAlignment], preset: &str) -> CueDoc {
     }
     let mut raw: Vec<(f64, f64, String)> = Vec::new();
     for span in &spans {
-        let cuts = dp_split(span, target, char_limit, cjk);
+        let refs: Vec<&Tok> = span.iter().collect();
+        let (target, char_limit) = span_budget(&refs, latin_words, latin_chars, cjk_chars);
+        let cuts = dp_split(span, target, char_limit);
         let mut bounds = vec![0];
         bounds.extend(cuts.iter().copied());
         bounds.push(span.len());
@@ -684,7 +831,7 @@ pub fn build_cues(tokens: &[TokenAlignment], preset: &str) -> CueDoc {
             if seg.is_empty() {
                 continue;
             }
-            let text = join_seg(seg, cjk);
+            let text = join_seg(seg);
             let text = text.trim();
             if text.is_empty() {
                 continue;
@@ -693,6 +840,7 @@ pub fn build_cues(tokens: &[TokenAlignment], preset: &str) -> CueDoc {
         }
     }
     raw.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)));
+    let raw = fold_bare_marks(raw);
     let mut ms: Vec<(i64, i64, String)> = raw
         .into_iter()
         .map(|(s, e, t)| ((s * 1000.0).round() as i64, (e * 1000.0).round() as i64, t))
@@ -716,8 +864,7 @@ pub fn build_cues(tokens: &[TokenAlignment], preset: &str) -> CueDoc {
         })
         .collect();
     CueDoc {
-        preset: preset.to_string(),
-        script: if cjk { "cjk" } else { "latin" }.to_string(),
+        script: if words.iter().any(|t| t.splittable) { "cjk" } else { "latin" }.to_string(),
         cues,
     }
 }
@@ -741,10 +888,17 @@ mod tests {
     use super::*;
 
     fn tok(i: usize, piece: &str, sf: i64, ef: i64) -> TokenAlignment {
+        tokw(i, piece, i, sf, ef)
+    }
+
+    /// A token that belongs to word `w`. The word id is what the tokenizer
+    /// assigns per whitespace-delimited word, and it is what `cue_tokens` now
+    /// groups on -- a star is the CTC anchor, not the word boundary.
+    fn tokw(i: usize, piece: &str, w: usize, sf: i64, ef: i64) -> TokenAlignment {
         TokenAlignment {
             index: i,
             token_id: 1,
-            word_id: i,
+            word_id: w,
             piece: piece.to_string(),
             start: sf as f64 / 50.0,
             end: (ef + 1) as f64 / 50.0,
@@ -754,11 +908,26 @@ mod tests {
         }
     }
 
+    /// A run of tokens laid out as words: `[["<star>", "你", "好"], ...]`.
+    fn words_from(groups: &[&[&str]]) -> Vec<TokenAlignment> {
+        let mut out = Vec::new();
+        for (w, g) in groups.iter().enumerate() {
+            for piece in *g {
+                if *piece == "<star>" {
+                    out.push(tokw(out.len(), piece, w, 10 + 10 * out.len() as i64, 12 + 10 * out.len() as i64));
+                } else {
+                    out.push(tokw(out.len(), piece, w, 10 + 10 * out.len() as i64, 12 + 10 * out.len() as i64));
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn spans_tile_like_python() {
         let tokens = vec![tok(0, "a", 10, 12), tok(1, "b", 20, 21)];
         let scores: Vec<f64> = (0..40).map(|t| t as f64).collect();
-        let segs = build_spans("ab", &tokens, 40, 50.0, &scores, "char", 0.0);
+        let segs = build_spans("ab", &tokens, 40, 50.0, &scores, "char");
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].text, "a");
         assert_eq!(segs[0].start, 0.0);
@@ -772,9 +941,8 @@ mod tests {
     #[test]
     fn cues_keep_decimal() {
         let pieces = ["达", "到", "2", ".", "5", "。"];
-        let tokens: Vec<_> = pieces.iter().enumerate().map(|(i, p)| tok(i, p, 10 + i as i64, 10 + i as i64)).collect();
-        let doc = build_cues(&tokens, "standard");
-        assert_eq!(doc.script, "cjk");
+        let tokens: Vec<_> = pieces.iter().enumerate().map(|(i, p)| tokw(i, p, 0, 10 + i as i64, 10 + i as i64)).collect();
+        let doc = build_cues(&tokens);
         assert_eq!(doc.cues.len(), 1);
         assert_eq!(doc.cues[0].text, "达到2.5。");
     }
@@ -783,5 +951,216 @@ mod tests {
     fn skipped_reports_missing_char() {
         let pieces = vec!["精".to_string(), "，".to_string()];
         assert_eq!(skipped_chars("精悍，", &pieces), vec!["悍".to_string()]);
+    }
+
+    /// Regression: the walk pairs transcript characters with token pieces, and
+    /// the real tokenizer interleaves `<star>` targets the transcript never
+    /// contains. Hand-built star-free pieces cannot catch that — they are what
+    /// let a desynchronising walk pass as green.
+    #[test]
+    fn stars_do_not_desync_the_transcript_walk() {
+        // "edges" placement: a star at each end of a space-delimited script.
+        let en: Vec<String> = ["<star>", "h", "i", "<star>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            skipped_chars("hi there", &en),
+            [" ", "t", "h", "e", "r", "e"].map(String::from)
+        );
+        assert_eq!(token_index("hi there", &en), vec![1, 2, -1, -1, -1, -1, -1, -1]);
+
+        // "segment" placement: a star before every word after the first.
+        let cjk: Vec<String> = ["<star>", "你", "<star>", "好", "<star>"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(skipped_chars("你好", &cjk), Vec::<String>::new());
+        assert_eq!(token_index("你好", &cjk), vec![1, 3]);
+    }
+
+    #[test]
+    fn a_bare_period_is_not_a_cue() {
+        // What the real run produced: the sentence carries one syllable that
+        // absorbed a long silence, `fix_timestamp` snapped the period onto its
+        // end, and the splitter gave the period a span of its own.
+        let raw = vec![
+            (60.82, 64.32, "아무래도 곡을 잘 아시니까 좀 더 날카롭게 보시겠".to_string()),
+            (64.32, 64.46, "네".to_string()),
+            (64.46, 72.94, "요".to_string()),
+            (72.94, 72.94, ".".to_string()),
+        ];
+        let out = fold_bare_marks(raw);
+        assert_eq!(out.len(), 3, "the lone period must not survive as a cue");
+        assert_eq!(out[2].2, "요.");
+        assert_eq!((out[2].0, out[2].1), (64.46, 72.94), "the span is untouched");
+        for (s, e, _) in &out {
+            assert!(e > s, "no cue may collapse to a point");
+        }
+    }
+
+    #[test]
+    fn leading_bare_marks_move_to_the_first_speaking_cue() {
+        let raw = vec![
+            (0.10, 0.10, "(".to_string()),
+            (0.10, 0.20, "안".to_string()),
+            (0.20, 0.30, "녕".to_string()),
+        ];
+        let out = fold_bare_marks(raw);
+        assert_eq!(out.len(), 2, "only the bare mark is folded, not the syllables");
+        assert_eq!(out[0].0, 0.10, "the leading mark does not shift the start");
+        assert_eq!(out[0].2, "(안");
+        assert_eq!(out[1].2, "녕");
+    }
+
+    #[test]
+    fn real_cue_text_is_never_rewritten() {
+        let raw = vec![(1.0, 2.0, "hello world".to_string())];
+        assert_eq!(fold_bare_marks(raw), vec![(1.0, 2.0, "hello world".to_string())]);
+    }
+
+    #[test]
+    fn the_granularity_comes_from_whitespace_not_unicode() {
+        // Space-delimited: the whitespace split yields words, whatever script.
+        assert!(!text_is_unspaced("hello world, this is a test"));
+        assert!(!text_is_unspaced("안녕하세요 반갑습니다 저는 학생이에요"));
+        // Unspaced: the split yields whole lines.
+        assert!(text_is_unspaced("你问我爱你有多深我爱你有几分我的情也真我的爱也真"));
+        // The point of the test: a space-delimited Hangul transcript and an
+        // unspaced Han one land on opposite sides, which a Unicode-block test
+        // cannot do -- both are "CJK" by block.
+        assert_eq!(auto_split("안녕하세요 반갑습니다 저는 학생이에요"), "word");
+        assert_eq!(auto_split("你问我爱你有多深我爱你有几分"), "char");
+        // Empty and single-token inputs must not panic or divide by zero.
+        assert_eq!(auto_split(""), "word");
+        assert_eq!(auto_split("   \n  "), "word");
+        assert_eq!(auto_split("hi"), "word");
+    }
+
+    #[test]
+    fn stars_never_reach_the_cue_text() {
+        // The `segment` placement the port picks for Hangul/Chinese puts a star
+        // in front of every word. It is the only word-boundary signal left
+        // (the tokenizer drops the transcript's spaces), so it has to become
+        // the boundary AND stay out of the rendered text.
+        let tokens = words_from(&[&["<star>", "你", "好"], &["<star>", "世", "界"]]);
+        let words = cue_tokens(&tokens);
+        assert!(words.iter().all(|w| w.splittable));
+        let text: String = words.iter().map(|w| w.token.as_str()).collect();
+        assert!(!text.contains("<star>"), "marker leaked into {text:?}");
+        assert_eq!(text, "你好世界");
+        assert!(!words[0].space_before, "the leading star is not a space");
+        assert!(!words[1].space_before, "no boundary inside a word");
+        assert!(words[2].space_before, "the inter-word star is a boundary");
+        assert!(!words[3].space_before, "no boundary inside a word");
+        // rendered the way join_seg renders a cue
+        let mut s = String::new();
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 && w.space_before {
+                s.push(' ');
+            }
+            s.push_str(&w.token);
+        }
+        assert_eq!(s, "你好 世界");
+    }
+
+    /// A transcript that mixes scripts: the unit is decided per word, so the
+    /// Han run breaks between characters and the Latin words stay whole.
+    ///
+    /// This is the case a single file-wide flag got wrong. Any file containing
+    /// one Han character was taken to be Chinese throughout, and the
+    /// line-breaker duly cut `alignment` into `alignm` and `ent`.
+    #[test]
+    fn mixed_script_breaks_between_characters_and_never_inside_a_word() {
+        let tokens = words_from(&[&["<star>", "你", "好", "这", "个"], &["<star>", "a", "l", "i", "g", "n"], &["<star>", "工", "具"]]);
+        let words = cue_tokens(&tokens);
+        let text: String = join_seg(&words);
+        assert_eq!(text, "你好这个 align 工具");
+        assert!(!text.contains("<star>"));
+
+        let han: Vec<&Tok> = words.iter().filter(|t| t.splittable).collect();
+        let latin: Vec<&Tok> = words.iter().filter(|t| !t.splittable).collect();
+        assert_eq!(han.len(), 6, "the Han words are one unit per character");
+        assert_eq!(latin.len(), 1, "the Latin word is a single unit");
+        assert_eq!(latin[0].token, "align");
+
+        // The budget follows the span, not the file: a mostly-Han span is
+        // measured in characters, a mostly-Latin one in words.
+        let all: Vec<&Tok> = words.iter().collect();
+        let (t, lim) = span_budget(&all, 16.0, 88.0, 22.0);
+        assert_eq!((t, lim), (22.0, None));
+        let only_latin: Vec<&Tok> = words.iter().filter(|t| !t.splittable).collect();
+        let (t2, lim2) = span_budget(&only_latin, 16.0, 88.0, 22.0);
+        assert_eq!((t2, lim2), (16.0, Some(88.0)));
+    }
+
+    /// End to end: the line-breaker must not split a Latin word even when the
+    /// budget forces a cut nearby.
+    #[test]
+    fn cue_cutting_leaves_latin_words_intact() {
+        // One very long Latin sentence: the splitter has to break it somewhere,
+        // and every break must land between words.
+        let sentence = "the quick brown fox jumps over the lazy dog and then it keeps running \
+                        for a while until somebody finally calls it back to the yard again";
+        let words: Vec<String> = sentence.split_whitespace().map(String::from).collect();
+        // the layout the tokenizer actually produces: every word carries a
+        // word id, and the star placement is whatever the script gets
+        let groups: Vec<Vec<&str>> = vec![vec!["<star>"]]
+            .into_iter()
+            .chain(words.iter().map(|w| vec!["<star>", w.as_str()]))
+            .collect();
+        let borrowed: Vec<&[&str]> = groups.iter().map(|g| g.as_slice()).collect();
+        let tokens = words_from(&borrowed);
+        let chars: usize = words.iter().map(|w| w.chars().count()).sum();
+        let doc = build_cues(&tokens);
+        assert!(doc.cues.len() > 1, "a long sentence must be cut");
+        let mut rejoined = String::new();
+        for (i, c) in doc.cues.iter().enumerate() {
+            if i > 0 {
+                rejoined.push(' ');
+            }
+            rejoined.push_str(&c.text.replace('\n', " "));
+        }
+        for w in &words {
+            assert!(
+                rejoined.contains(w.as_str()),
+                "cue text lost the word {w:?}: {rejoined:?}"
+            );
+        }
+        assert!(chars > 0);
+    }
+
+    #[test]
+    fn leading_and_trailing_stars_stay_out_of_latin_words() {
+        // `edges` placement: one star at each end, both must vanish.
+        let names = ["<star>", "h", "i", "<star>"];
+        let tokens: Vec<TokenAlignment> = names
+            .iter()
+            .enumerate()
+            .map(|(i, p)| tokw(i, p, 0, 10 + 10 * i as i64, 12 + 10 * i as i64))
+            .collect();
+        let words = cue_tokens(&tokens);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].token, "hi");
+        assert!(!words[0].space_before);
+        assert!(!words[0].splittable, "a Latin word is one unit");
+    }
+
+    #[test]
+    fn spans_survive_star_targets() {
+        // The full shape: a leading star, letters, an inter-word star, letters,
+        // a trailing star -- what `tokenise_with_stars` actually emits.
+        let names = ["<star>", "你", "<star>", "好", "<star>"];
+        let tokens: Vec<TokenAlignment> = names
+            .iter()
+            .enumerate()
+            .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
+            .collect();
+        let scores: Vec<f64> = (0..80).map(|t| t as f64).collect();
+        let segs = build_spans("你好", &tokens, 80, 50.0, &scores, "char");
+        assert_eq!(segs.len(), 2, "star targets must not empty the span list");
+        assert_eq!(segs[0].text, "你");
+        assert_eq!(segs[1].text, "好");
+        assert!(segs[0].end <= segs[1].start);
     }
 }
