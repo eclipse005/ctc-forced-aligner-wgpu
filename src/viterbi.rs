@@ -60,6 +60,13 @@ pub(crate) struct AlignmentResult {
     /// Per-frame log-prob of the winning label, including blanks.
     /// Empty when there are no tokens. Not part of the JSON.
     pub frame_scores: Vec<f64>,
+    /// The blank runs the boundary padding consumed, as
+    /// `(before_token_index, first_frame, last_frame)`. `before_token_index == l`
+    /// is the trailing run. Exposed so the boundary rule can be diffed against
+    /// the reference frame by frame -- a one- or two-frame output difference is
+    /// otherwise indistinguishable between "the midpoint was taken over a
+    /// different range" and "the range itself differs". Not part of the JSON.
+    pub blank_runs: Vec<(usize, i64, i64)>,
 }
 
 impl AlignmentResult {
@@ -937,6 +944,7 @@ fn align_with(
             log_prob: 0.0,
             frame_path: None,
             frame_scores: vec![],
+            blank_runs: vec![],
         });
     }
     if t_len < l {
@@ -1043,7 +1051,7 @@ fn align_with(
     // `word_ids` is not a parameter here: [`align_with_word_ids`] puts it in the
     // `WORD_IDS` side channel for the duration of this call, and `collapse`
     // reads it from there. This call site therefore has nothing to pass.
-    let tokens = collapse(
+    let (tokens, blank_runs) = collapse(
         &states, &frame_scores, token_ids, pieces, frame_rate,
     );
 
@@ -1054,6 +1062,7 @@ fn align_with(
         log_prob: total,
         frame_path: if return_path { Some(states) } else { None },
         frame_scores,
+        blank_runs,
     })
 }
 
@@ -1064,7 +1073,7 @@ fn collapse(
     token_ids: &[usize],
     pieces: Option<&[String]>,
     frame_rate: f64,
-) -> Vec<TokenAlignment> {
+) -> (Vec<TokenAlignment>, Vec<(usize, i64, i64)>) {
     let l = token_ids.len();
     // The word each target came from, when the caller supplied it. Absent (the
     // synthetic paths in the tests) every target is its own word, which is the
@@ -1198,7 +1207,15 @@ fn collapse(
             },
         })
         .collect();
-    tokens
+    // The runs as the padding consumed them, for the frame-level diff.
+    let blank_runs: Vec<(usize, i64, i64)> = (0..=l)
+        .filter_map(|i| {
+            let (a, b) = blank_before[i];
+            if a >= 0 { Some((i, a, b)) } else { None }
+        })
+        .collect();
+
+    (tokens, blank_runs)
 }
 
 #[cfg(test)]
@@ -1226,7 +1243,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         // leading run 0..=3: mid(0, 3) = 1, so the first word starts at 1 --
         // 3 frames of padding into a 4-frame run.
@@ -1260,7 +1277,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         // run 3..=8: mid(3, 8) = 5, so `a` ends at 5 and `b` starts at 5 too --
         // the reference's spans SHARE that frame, they do not tile.
@@ -1311,7 +1328,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         let run_start = 3i64;
         let run_end = run_start + gap - 1;
@@ -1343,7 +1360,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         // A occupied frame 2 and would have been padded to frame 502 -- halfway
         // through 20 seconds of nothing. The bound is 1.0 s = 50 frames.

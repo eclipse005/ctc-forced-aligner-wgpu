@@ -112,6 +112,17 @@ pub struct AlignOutput {
     /// blank runs are cut from. Diagnostic only — not serialised.
     #[serde(skip)]
     pub frame_path: Vec<i32>,
+    /// The blank runs the boundary padding consumed, as
+    /// `(before_token_index, first_frame, last_frame)`, with `before_token_index
+    /// == tokens.len()` for the trailing run.
+    ///
+    /// Diagnostic only, and only populated by `align_with_path`: a one- or
+    /// two-frame difference in the output cannot otherwise be told apart from a
+    /// midpoint taken over a different range, and the per-frame diff against the
+    /// Python reference needs the ranges themselves. `examples/dump_path.rs`
+    /// writes it out.
+    #[serde(skip)]
+    pub blank_runs: Vec<(usize, i64, i64)>,
 }
 
 /// The JSON form of [`AlignOutput::tokens`]: one row per timed unit.
@@ -436,6 +447,7 @@ impl Aligner {
             align_s,
             frame_scores: res.frame_scores,
             frame_path: res.frame_path.unwrap_or_default(),
+            blank_runs: res.blank_runs,
         })
     }
 
