@@ -1234,144 +1234,17 @@ fn collapse(
         cursor = cursor.max(ends[i] + 1);
     }
 
-    // PAD THE WORD BOUNDARIES OUT INTO THE ADJACENT BLANK.
-    //
-    // Why this matters: a CTC path assigns frames to characters, and the
-    // silence around a word is a blank run. Taking a word's boundary as its
-    // first/last character frame therefore reports the span of the PHONATION
-    // only and systematically under-reports the word -- the silence belongs to
-    // the word, and a human annotator puts the boundary in the middle of the
-    // pause. Measured against Buckeye's hand marks this was worth ~35% of the
-    // boundary MAE.
-    //
-    // The rule is ONE rule, applied everywhere: a boundary sits at the MIDPOINT
-    // of the blank run beside it.
-    //
-    // The Python reference instead special-cases the two utterance edges -- the
-    // front of the first word takes the blank run's whole start, the back of the
-    // last word its whole end. That is not a better rule, it is an unprincipled
-    // one, and it is measurable: against the hand marks it left the first word
-    // starting 25 ms LATE and the last word ending 56 ms EARLY, i.e. both edges
-    // pulled INWARD, while the interior boundaries it padded correctly were only
-    // 13 ms off. The symmetric midpoint has no such bias by construction --
-    // there is no reason for a pause at the start of a clip to be treated
-    // differently from a pause in the middle of it, and the marks do not treat
-    // it differently either.
-    //
-    // The asymmetry that is real, and kept: the START of a word is padded toward
-    // the blank on its left, the END toward the blank on its right, and the
-    // midpoint is taken of the run on THAT side. Adjacent words therefore share
-    // the midpoint of the pause between them instead of each claiming all of it.
-    // NO CAP. A cap on the padding was tried and measured, and it was wrong:
-    // capping at 8 frames pulled every boundary back toward the phonation, and
-    // the port's error structure split along exactly that seam -- every START
-    // went late and every END went early, because the cap shrank the word from
-    // both sides at once:
-    //
-    //     boundary        python bias   capped-port bias   delta
-    //     mid   start        +13.0 ms        +42.9 ms       +29.9
-    //     last  start         +4.0 ms        +46.4 ms       +42.4
-    //     mid   end          +19.8 ms         +6.3 ms       -13.5
-    //     last end          -56.6 ms        -26.4 ms       +30.2
-    //
-    // The rationale for the cap was that the word-start error grew with the
-    // length of the preceding pause. That observation was real, but the
-    // conclusion drawn from it was not: it measured the port's own already-capped
-    // output, not the reference's, so it described the cap rather than the gold.
-    // Midpoint is the reference rule and it is kept unmodified.
-    let mid = |a: i64, b: i64| -> i64 { (a + b) / 2 };
+    // Where the path last sat on each token, before any rule moved it. The
+    // boundary rule needs it to tell "this end is the token's own" from "this
+    // end is silence it absorbed".
     let own_ends: Vec<i64> = ends.clone();
-    for i in 0..l {
-        if starts[i] < 0 {
-            continue;
-        }
-        // front: midpoint of the blank run before token i
-        {
-            let (a, b) = blank_before[i];
-            if a >= 0 {
-                let pad = mid(a, b);
-                if pad < starts[i] {
-                    starts[i] = pad;
-                }
-            }
-        }
-        // back: midpoint of the blank run after token i.
-        //
-        // The `+ 1` that turns a frame index into a time lives in ONE place
-        // only: the `end` field below is `(ends[i] + 1) * inv`, mirroring the
-        // reference's `seg_end_idx = span[-1].end + 1`. The padding here
-        // therefore sets the frame index to the MIDPOINT itself and adds
-        // nothing. An extra `+ 1` here double-counted it and pushed every word
-        // end one frame (20 ms) past where it belongs.
-        {
-            let (a, b) = blank_before[i + 1];
-            if a >= 0 {
-                let pad = mid(a, b);
-                if pad > ends[i] {
-                    ends[i] = pad;
-                }
-            }
-        }
-    }
 
-    // How far past its own last frame a token may claim the following blank
-    // run. Measured, not guessed, and not taken from another model: over
-    // 15,722 aligned characters spanning seven languages, the depth a token's
-    // tail reaches past the last detected speech has median 0.00 s, p99 0.00 s
-    // and a maximum of 1.57 s. Read speech simply does not produce long tails,
-    // so a bound set at the top of that range is nearly free, and on material
-    // that DOES have long pauses it is the difference between a subtitle that
-    // ends when the speaker stops and one that ends halfway through the silence
-    // that follows.
-    //
-    // A multiple of the mean token duration cannot do this job. Measured both
-    // ways, a 1.5x-mean rule fired on 7.9% of this corpus and cut more real
-    // speech than it released, because in read speech the long spans it caught
-    // were held vowels. FireRedASR2 caps by a multiple; its model is not this
-    // one and neither is its number.
-    //
-    // 1.0 s is where the two sets of evidence meet. On broadcast material it
-    // takes the worst end error from 8.4 s to 1.7 s and the end MAE from
-    // 896 ms to 486 ms, with every start boundary bit-identical -- the bound is
-    // one-sided and never reaches a start. On an 89 s Japanese variety-show
-    // clip, dense speech with no gap over 1.85 s, it is inert and produces
-    // output identical to no cap at all.
-    const MAX_PADDING_SEC: f64 = 1.0;
-    let max_pad = (MAX_PADDING_SEC * frame_rate).round() as i64;
-    for i in 0..l {
-        if starts[i] < 0 {
-            continue;
-        }
-        // `own_ends[i]` is where the path last sat on this token, before the
-        // midpoint rule reached it forward. Clamping to that plus a bound
-        // leaves the token's own timing untouched and only limits how much of
-        // the pause it may absorb.
-        if ends[i] - own_ends[i] > max_pad {
-            ends[i] = own_ends[i] + max_pad;
-        }
-    }
-
-    // There is deliberately NO disjointness sweep here. The reference does not
-    // enforce one, and its spans TILE rather than overlap: on a real utterance
-    // every gap between consecutive words is exactly zero --
-    //
-    //     every 2..10   time 10..18   i 18..22   fan 22..33 ...
-    //
-    // so word k's end frame and word k+1's start frame are the same number. An
-    // earlier version of this file "fixed" a perceived one-frame overlap by
-    // pushing each start to `prev_end + 1`, and that alone cost the port 30-43
-    // ms of systematic bias on every interior word start: the P50 start error
-    // sat at 43 ms where the reference reads 13 ms. Neither tiling nor overlap
-    // needs a sweep here; the padding already lands the boundary on the shared
-    // frame, and the only guard below is for a genuinely inverted timeline.
-    //
-    // A monotonicity guard, not a disjointness one: a start before the previous
-    // word's start would be an inverted timeline, which is always a bug.
-    for i in 1..l {
-        if starts[i] >= 0 && starts[i] < starts[i - 1] {
-            starts[i] = starts[i - 1];
-        }
-    }
+    // Rule 1 of crate::timeline: the boundary rule, its bound and its
+    // monotonicity guard all live there, with the measurements that chose
+    // them. What this function owns is reading the PATH -- which frames each
+    // token sat on, and where the blank runs are -- and turning the result
+    // back into seconds.
+    crate::timeline::pad_into_silence(&mut starts, &mut ends, &own_ends, &blank_before, frame_rate);
 
     // The runs as the padding consumed them, for the frame-level diff.
     let blank_runs: Vec<(usize, i64, i64)> = (0..=l)

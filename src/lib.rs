@@ -20,7 +20,6 @@
 
 pub mod align_inference;
 pub mod alloc_stats;
-pub mod fix_timestamp;
 pub mod audio;
 pub mod config;
 pub mod gpu;
@@ -28,6 +27,7 @@ pub mod resample_sinc;
 pub mod shaders;
 pub mod simd;
 pub mod spans;
+pub mod timeline;
 pub mod viterbi;
 pub mod views;
 pub mod vocab;
