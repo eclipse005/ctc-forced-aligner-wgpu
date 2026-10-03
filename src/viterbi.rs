@@ -145,7 +145,7 @@ const PAR_ROW_MIN_STATES: usize = 16_384;
 
 fn dp_row_par(
     prev: &[f64],
-    emit: &[f64],
+    emit: &[f32],
     skip_dead: &[u64],
     next: &mut [f64],
     back: Option<&mut [u8]>,
@@ -166,7 +166,7 @@ fn dp_row_par(
 /// the traceback indexes them exactly as the full-width run packed them.
 fn dp_row_range(
     prev: &[f64],
-    emit: &[f64],
+    emit: &[f32],
     skip_dead: &[u64],
     next: &mut [f64],
     mut back: Option<&mut [u8]>,
@@ -208,7 +208,7 @@ fn dp_row_range(
 /// States `[st0, end)` of one row, split across threads when wide enough.
 fn dp_row_body(
     prev: &[f64],
-    emit: &[f64],
+    emit: &[f32],
     skip_dead: &[u64],
     next: &mut [f64],
     back: Option<&mut [u8]>,
@@ -248,7 +248,7 @@ fn dp_row_body(
 /// States `[st0, st0 + next.len())` of one row, serial within.
 fn dp_range(
     prev: &[f64],
-    emit: &[f64],
+    emit: &[f32],
     skip_dead: &[u64],
     next: &mut [f64],
     back: Option<&mut [u8]>,
@@ -266,7 +266,7 @@ fn dp_range(
 
 fn dp_range_scalar(
     prev: &[f64],
-    emit: &[f64],
+    emit: &[f32],
     skip_dead: &[u64],
     next: &mut [f64],
     mut back: Option<&mut [u8]>,
@@ -293,7 +293,7 @@ fn dp_range_scalar(
 #[target_feature(enable = "avx2")]
 unsafe fn dp_range_avx2(
     prev: &[f64],
-    emit: &[f64],
+    emit: &[f32],
     skip_dead: &[u64],
     next: &mut [f64],
     mut back: Option<&mut [u8]>,
@@ -301,8 +301,8 @@ unsafe fn dp_range_avx2(
 ) {
     use std::arch::x86_64::{
         _mm256_add_pd, _mm256_and_pd, _mm256_blendv_pd, _mm256_castsi256_pd, _mm256_cmp_pd,
-        _mm256_loadu_pd, _mm256_loadu_si256, _mm256_movemask_pd, _mm256_set1_pd, _mm256_storeu_pd,
-        _CMP_GE_OQ,
+        _mm256_cvtps_pd, _mm256_loadu_pd, _mm256_loadu_si256, _mm256_movemask_pd,
+        _mm256_set1_pd, _mm256_storeu_pd, _mm_loadu_ps, _CMP_GE_OQ,
     };
     let end = st0 + next.len();
     debug_assert!(st0 >= 2, "the vector loop reads prev[st-2]; the driver starts at 4");
@@ -321,7 +321,9 @@ unsafe fn dp_range_avx2(
         let adv_ge_skip = _mm256_cmp_pd(adv, skip, _CMP_GE_OQ);
         let adv_or_skip = _mm256_blendv_pd(skip, adv, adv_ge_skip);
         let best = _mm256_blendv_pd(adv_or_skip, stay, stay_wins);
-        let out = _mm256_add_pd(best, _mm256_loadu_pd(emit.as_ptr().add(st)));
+        // the f32 emission converts exactly to f64 — the same value the f64
+        // staging row used to hold, loaded straight from the narrower row
+        let out = _mm256_add_pd(best, _mm256_cvtps_pd(_mm_loadu_ps(emit.as_ptr().add(st))));
         _mm256_storeu_pd(next.as_mut_ptr().add(st - st0), out);
         if let Some(row) = back.as_deref_mut() {
             // 2 bits per state, four states to a byte: stay = 0b00, advance =
@@ -356,7 +358,7 @@ unsafe fn dp_range_avx2(
 /// One state of the row: returns its packed choice and writes the new score
 /// to `next[0]` — callers pass the sub-slice for state `st`, which is what lets
 /// a parallel chunk own a contiguous piece of the row.
-fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [f64]) -> u8 {
+fn dp_one(st: usize, prev: &[f64], emit: &[f32], skip_dead: &[u64], next: &mut [f64]) -> u8 {
     let stay = prev[st];
     let adv = if st >= 1 { prev[st - 1] } else { f64::NEG_INFINITY };
     let skip = if st >= 2 && skip_dead[st] == 0 {
@@ -371,7 +373,7 @@ fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [
     } else {
         (2, skip)
     };
-    next[0] = best + emit[st];
+    next[0] = best + emit[st] as f64;
     choice
 }
 
@@ -405,11 +407,11 @@ pub(crate) fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec
 /// columns on demand ([`ctc_forced_align_emissions`]).
 pub(crate) trait Emissions {
     /// Fill `emit[0..num_states]` with frame `t`'s state scores.
-    fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]);
+    fn fill_emit(&self, t: usize, emit: &mut [f32], token_ids: &[usize]);
     /// Fill `emit[lo..=hi]` — the band the banded DP reads.  The default
     /// fills the whole row (of which the band is a subset); sources that pay
     /// per-column work override it to touch the band only.
-    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, token_ids: &[usize]) {
+    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, token_ids: &[usize]) {
         let _ = (lo, hi);
         self.fill_emit(t, emit, token_ids)
     }
@@ -429,7 +431,7 @@ pub(crate) trait Emissions {
 }
 
 impl<T: Emissions + ?Sized> Emissions for &T {
-    fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]) {
+    fn fill_emit(&self, t: usize, emit: &mut [f32], token_ids: &[usize]) {
         (**self).fill_emit(t, emit, token_ids)
     }
     fn score(&self, t: usize, st: usize) -> f32 {
@@ -447,25 +449,25 @@ struct FullRows<'a> {
 
 #[cfg(test)]
 impl Emissions for FullRows<'_> {
-    fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]) {
+    fn fill_emit(&self, t: usize, emit: &mut [f32], token_ids: &[usize]) {
         let row = &self.log_probs[t * self.vocab..(t + 1) * self.vocab];
-        emit.fill(row[self.blank_id] as f64);
+        emit.fill(row[self.blank_id]);
         for (i, &tok) in token_ids.iter().enumerate() {
-            emit[2 * i + 1] = row[tok] as f64;
+            emit[2 * i + 1] = row[tok];
         }
     }
     /// Banded: blank over the band, then the token states that fall inside
     /// it — the same values the full row holds on `[lo, hi]`.
-    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, token_ids: &[usize]) {
+    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, token_ids: &[usize]) {
         let row = &self.log_probs[t * self.vocab..(t + 1) * self.vocab];
-        emit[lo..=hi].fill(row[self.blank_id] as f64);
+        emit[lo..=hi].fill(row[self.blank_id]);
         for (i, &tok) in token_ids.iter().enumerate() {
             let st = 2 * i + 1;
             if st > hi {
                 break;
             }
             if st >= lo {
-                emit[st] = row[tok] as f64;
+                emit[st] = row[tok];
             }
         }
     }
@@ -482,18 +484,14 @@ struct GatheredRows<'a> {
 
 #[cfg(test)]
 impl Emissions for GatheredRows<'_> {
-    fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
+    fn fill_emit(&self, t: usize, emit: &mut [f32], _token_ids: &[usize]) {
         let row = &self.gathered[t * self.num_states..(t + 1) * self.num_states];
-        for (e, &v) in emit.iter_mut().zip(row) {
-            *e = v as f64;
-        }
+        emit.copy_from_slice(row);
     }
-    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, _token_ids: &[usize]) {
+    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, _token_ids: &[usize]) {
         let s = self.num_states;
         let row = &self.gathered[t * s..(t + 1) * s];
-        for (e, &v) in emit[lo..=hi].iter_mut().zip(row[lo..=hi].iter()) {
-            *e = v as f64;
-        }
+        emit[lo..=hi].copy_from_slice(&row[lo..=hi]);
     }
     fn score(&self, t: usize, st: usize) -> f32 {
         self.gathered[t * self.num_states + st]
@@ -552,19 +550,15 @@ impl GatheredChunks {
 }
 
 impl Emissions for GatheredChunks {
-    fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
+    fn fill_emit(&self, t: usize, emit: &mut [f32], _token_ids: &[usize]) {
         let s = self.num_states;
         let row = &self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s..(t % self.frames_per_chunk + 1) * s];
-        for (e, &v) in emit.iter_mut().zip(row) {
-            *e = v as f64;
-        }
+        emit.copy_from_slice(row);
     }
-    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, _token_ids: &[usize]) {
+    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, _token_ids: &[usize]) {
         let s = self.num_states;
         let row = &self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s..(t % self.frames_per_chunk + 1) * s];
-        for (e, &v) in emit[lo..=hi].iter_mut().zip(row[lo..=hi].iter()) {
-            *e = v as f64;
-        }
+        emit[lo..=hi].copy_from_slice(&row[lo..=hi]);
     }
     fn score(&self, t: usize, st: usize) -> f32 {
         let s = self.num_states;
@@ -672,7 +666,7 @@ struct Dp<'a, E: Emissions + ?Sized> {
     band: bool,
     /// all-ones lane => the skip arc is illegal (forced to -inf)
     skip_dead: Vec<u64>,
-    emit: Vec<f64>,
+    emit: Vec<f32>,
     prev: Vec<f64>,
     next: Vec<f64>,
 
@@ -716,7 +710,7 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
             t_len,
             band,
             skip_dead,
-            emit: vec![0.0f64; s],
+            emit: vec![0.0f32; s],
             prev,
             next: vec![0.0f64; s],
 

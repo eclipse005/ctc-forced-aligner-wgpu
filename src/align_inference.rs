@@ -1348,26 +1348,22 @@ impl<'a> LazyEmissions<'a> {
 }
 
 impl Emissions for LazyEmissions<'_> {
-    fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
+    fn fill_emit(&self, t: usize, emit: &mut [f32], _token_ids: &[usize]) {
         let s = self.blocks.num_states;
         let (block, lo, _) = self.slice_at(t);
         let r = t % self.blocks.frames_per_chunk - lo;
         let row = &block[r * s..][..s];
-        for (e, &v) in emit.iter_mut().zip(row) {
-            *e = v as f64;
-        }
+        emit.copy_from_slice(row);
     }
 
     /// The band `[lo, hi]` only — on an hour's trellis the mid-file band is
     /// the whole row, but the two ramps shrink the copy with it.
-    fn fill_emit_band(&self, t: usize, emit: &mut [f64], lo: usize, hi: usize, _token_ids: &[usize]) {
+    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, _token_ids: &[usize]) {
         let s = self.blocks.num_states;
         let (block, slice_lo, _) = self.slice_at(t);
         let r = t % self.blocks.frames_per_chunk - slice_lo;
         let row = &block[r * s..][..s];
-        for (e, &v) in emit[lo..=hi].iter_mut().zip(row[lo..=hi].iter()) {
-            *e = v as f64;
-        }
+        emit[lo..=hi].copy_from_slice(&row[lo..=hi]);
     }
 
     /// One column of `t`'s row.  The slice holding `t` has to have been
