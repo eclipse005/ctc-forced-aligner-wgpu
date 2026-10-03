@@ -803,8 +803,9 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
 }
 
 /// Frames per linear-space segment: the largest length whose checkpoints plus
-/// segment backpointers still fit the budget, or the whole file when the
-/// backpointers fit on their own (no recompute at all) or nothing does.
+/// segment backpointers still fit the budget, the whole file when the
+/// backpointers fit on their own (no recompute at all), or — when even the
+/// vertex does not fit — the vertex itself.
 ///
 /// The trade is `(t_len/seg)·S·8 + seg·S/4` bytes — U-shaped, so halving from
 /// the whole file walks down the long side to the largest segment that fits.
@@ -835,9 +836,17 @@ fn segment_len(t_len: usize, s: usize, rb: usize) -> usize {
         }
         seg = next;
     }
-    // nothing fits: keep the plain single pass, whose backpointers are the
-    // smallest of the options (a checkpoint per frame would be 8x worse)
-    best.unwrap_or(whole)
+    best.unwrap_or_else(|| {
+        // Nothing fits the budget: take the U's vertex anyway. AM-GM makes it
+        // the smallest of *every* option — `need(whole)`, the plain single
+        // pass the old fallback took, is never below it. The difference is not
+        // academic: a 3 h file with a 373 k-state transcript put 51.9 GB of
+        // full backpointers (`need(whole)`) on the pagefile, where the vertex
+        // holds 788 MB and the traceback recomputes ~4.2 k frames a segment.
+        let a = (t_len as u128) * (s as u128) * 8;
+        let b = rb.max(1) as u128;
+        (((a / b) as f64).sqrt() as usize).clamp(1, whole)
+    })
 }
 
 fn align(
