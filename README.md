@@ -6,7 +6,7 @@
 
 A lightweight, cross-platform Rust implementation of CTC forced alignment for [OmniLingual / omniASR-CTC](https://huggingface.co/aadel4/omniASR-CTC-300M-v2) checkpoints, using [wgpu](https://github.com/gfx-rs/wgpu) for GPU acceleration.
 
-The goal is simple: given audio **and** its transcript, produce the start and end time of every character — **locally and natively**, without Python or vendor-specific GPU runtimes. The alignment is token-identical to the Python reference it was ported from, verified frame by frame.
+The goal is simple: given audio **and** its transcript, produce the start and end time of every token — **locally and natively**, without Python or vendor-specific GPU runtimes. The Viterbi and the boundary rules are ported from the Python reference and verified against it frame by frame; where this differs on purpose, it says so and says why.
 
 ### Features
 
@@ -16,7 +16,7 @@ The goal is simple: given audio **and** its transcript, produce the start and en
 * 🖥️ Windows / macOS / Linux
 * ⚡ CPU fallback
 * 📦 Offline local inference
-* ⏱️ Character- and word-level start / end timestamps
+* ⏱️ Per-token and per-sentence start / end timestamps
 * 🗣️ Multilingual — whatever the checkpoint's vocabulary covers
 * 📄 JSON / SRT / ASS karaoke output
 * 🧩 CLI + Rust library
@@ -164,6 +164,8 @@ The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that impl
    | **all 124** | **−0.2570** | −0.4301 |
 
    The gap lands exactly where the mechanism says it should: large on scripts that space their words, nil on the ones that do not, where a "word" is a whole line and both placements insert about as many stars. The whole-file `log_prob` cannot compare the two — it sums over the path, and two stars is fewer terms — so the per-frame mean is the number quoted.
+
+   **Measuring this against the Python reference needs care, and getting it wrong is easy.** The reference's own dump script hard-codes `edges`, so comparing this port against a reference dump compares two different target sequences and the number that comes out is about the star placement rather than about the port. On two Buckeye utterances, the port against an `edges` reference reads 1.91 and 1.59 frames of mean |d_start| — and the reference against *itself* with only the placement changed reads 1.36 and 1.71. Re-dumped on the port's own placement, the same comparison is 0.55 and 0.59. Anyone re-measuring this should re-dump the reference first, and `examples/dump_path.rs` writes the word-level spans that comparison needs.
 
 2. **A token may claim at most 1.0 s of the following silence.**
    The midpoint rule hands a whole pause to the token in front of it, and one syllable was measured swallowing 8.4 s. The bound comes from the same corpus: over 15,722 characters the depth a token's tail reaches past the last detected speech has median 0.00 s, p99 0.00 s and a maximum of 1.57 s, so it is nearly free on read speech, and on material with long pauses it takes the worst end error from 8.4 s to 1.7 s and the end MAE from 896 ms to 486 ms — with **every start boundary bit-identical**, because the bound is one-sided and never reaches a start.
