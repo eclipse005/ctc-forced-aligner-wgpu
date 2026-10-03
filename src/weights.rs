@@ -1,7 +1,7 @@
 //! Checkpoint access: mmap the safetensors file, zero-copy.
 //!
 //! The omniASR-CTC checkpoint is stored f32; f16/bf16 tensors are accepted and
-//! widened (exact) for the CPU path. GPU uploads go through [`Gpu::uploader`].
+//! widened (exact) for the CPU path. GPU uploads go through `gpu`'s uploader.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -14,7 +14,7 @@ use safetensors::Dtype;
 
 /// One tensor as it sits in the file.
 #[derive(Debug, Clone)]
-pub struct RawTensor {
+pub(crate) struct RawTensor {
     pub data: Bytes,
     pub shape: Vec<usize>,
     pub dtype: Dtype,
@@ -88,7 +88,7 @@ impl f16 {
 }
 
 /// mmap every safetensors shard, zero-copy.
-pub fn load_tensors(model_dir: &Path) -> Result<HashMap<String, RawTensor>> {
+pub(crate) fn load_tensors(model_dir: &Path) -> Result<HashMap<String, RawTensor>> {
     let index = model_dir.join("model.safetensors.index.json");
     if index.exists() {
         let idx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&index)?)?;
@@ -132,7 +132,7 @@ fn load_shard(path: &Path) -> Result<HashMap<String, RawTensor>> {
     Ok(out)
 }
 
-pub fn get_f32(
+pub(crate) fn get_f32(
     w: &HashMap<String, RawTensor>,
     name: &str,
 ) -> Result<(Vec<f32>, Vec<usize>)> {
@@ -140,6 +140,3 @@ pub fn get_f32(
     t.as_f32()
 }
 
-pub fn get_f32_vector(w: &HashMap<String, RawTensor>, name: &str) -> Result<Vec<f32>> {
-    Ok(get_f32(w, name)?.0)
-}

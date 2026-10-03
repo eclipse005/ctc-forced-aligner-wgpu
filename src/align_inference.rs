@@ -2,14 +2,13 @@
 //! timestamps.  Orchestration port of `omni_align/aligner.py` +
 //! `backend.log_probs_chunked`, producing the same JSON schema.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
 use crate::audio::{load_audio, znorm, TARGET_SR};
 use crate::timeline::{anchor_marks, place_unmeasured};
-use crate::config::Wav2Vec2Config;
 use crate::gpu::DeviceSelector;
 use crate::spans::{build_segments, build_words};
 use crate::viterbi::{
@@ -23,7 +22,7 @@ use crate::wav2vec2_gpu::GpuModel;
 
 /// The model on one backend. Both towers are token-identical to the
 /// Python reference (see tests/golden.rs).
-pub enum Tower {
+pub(crate) enum Tower {
     Cpu(Model),
     Gpu(GpuModel),
 }
@@ -46,23 +45,22 @@ pub enum Tower {
 const CTC_STAR_SCORE: f32 = -1.0;
 
 pub struct Aligner {
-    pub tower: Tower,
-    pub vocab: Vocab,
-    pub model_dir: PathBuf,
+    pub(crate) tower: Tower,
+    pub(crate) vocab: Vocab,
     /// Host-side lm head weights, loaded for the GPU tower only: its hidden
     /// form stores the encoder stream and re-runs the head per window
     /// ([`RowGather::Head`]).  `None` on the CPU tower, which owns a full
     /// [`Model`].
-    pub gpu_lm_head: Option<LmHeadCpu>,
+    pub(crate) gpu_lm_head: Option<LmHeadCpu>,
     /// Input samples per output frame, from the feature extractor's conv
     /// strides. Not a constant: it is a property of the checkpoint, and
     /// hardcoding it would silently mis-time every frame of a model whose
     /// extractor downsamples differently.
-    pub subsampling: usize,
+    pub(crate) subsampling: usize,
     /// Timestamps per second, i.e. `TARGET_SR / subsampling`.
-    pub frame_rate: f64,
+    pub(crate) frame_rate: f64,
     /// The CTC blank, i.e. the checkpoint's `pad_token_id`.
-    pub blank_id: usize,
+    pub(crate) blank_id: usize,
 }
 
 /// One alignment, as JSON: the transcript, and where in the audio it is said.
@@ -103,7 +101,7 @@ pub struct AlignOutput {
     /// the unit is decided per word with no language table: a whole word where
     /// the script spaces its words, a single character where it does not. A
     /// mixed transcript gets both, in the same file. See
-    /// [`serialize_token_rows`].
+    /// `serialize_token_rows`.
     #[serde(serialize_with = "serialize_token_rows")]
     pub tokens: Vec<TokenAlignment>,
     /// Winning-label log-prob per frame, including blanks. Diagnostic only —
@@ -222,7 +220,6 @@ impl Aligner {
         Ok(Self {
             tower,
             vocab,
-            model_dir: model_dir.to_path_buf(),
             gpu_lm_head,
             subsampling,
             frame_rate,
@@ -244,7 +241,11 @@ impl Aligner {
         }
     }
 
-    pub fn config(&self) -> &Wav2Vec2Config {
+    /// The checkpoint's own configuration. The golden test reads the frame
+    /// rate and vocabulary size from here rather than hardcoding them, because
+    /// hardcoding them is the bug the config module exists to prevent.
+    #[cfg(test)]
+    pub(crate) fn config(&self) -> &crate::config::Wav2Vec2Config {
         match &self.tower {
             Tower::Cpu(m) => &m.cfg,
             Tower::Gpu(g) => &g.cfg,
@@ -287,7 +288,7 @@ impl Aligner {
         self.align_impl(audio_path, text, window_sec, context_sec, false)
     }
 
-    /// [`align`], but the per-frame trellis path is kept on the output.
+    /// `align`, but the per-frame trellis path is kept on the output.
     ///
     /// The path is what the blank runs are cut from, and a blank run is what the
     /// word boundary is padded into, so it is the only way to tell a midpoint
@@ -799,7 +800,7 @@ impl std::fmt::Debug for LazyBlocks {
     }
 }
 
-pub enum Trellis {
+pub(crate) enum Trellis {
     /// One (kept_frames × S) block per window — used when the trellis is
     /// narrower than the vocabulary (a short transcript).
     Gathered(GatheredChunks),
@@ -813,7 +814,7 @@ pub enum Trellis {
 
 /// Per-window blocks plus the row window the DP is allowed to read: the same
 /// kept frames the gathered path keeps, addressed inside the wider block.
-pub struct LazyBlocks {
+pub(crate) struct LazyBlocks {
     blocks: Vec<Vec<f32>>,
     /// what a row of a block is, and how wide it is
     kind: BlockKind,

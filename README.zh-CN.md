@@ -99,8 +99,7 @@ align --audio speech.wav --text transcript.txt --format srt --output out.srt
 ### 库
 
 ```rust
-use ctc_forced_aligner_wgpu::align_inference::Aligner;
-use ctc_forced_aligner_wgpu::gpu::DeviceSelector;
+use ctc_forced_aligner_wgpu::{Aligner, DeviceSelector};
 
 let aligner = Aligner::load_on(std::path::Path::new("model"),
                                DeviceSelector::parse("auto")?)?;
@@ -110,7 +109,22 @@ for t in &out.tokens {
 }
 ```
 
+API 就这些：`Aligner` 加载与运行、`AlignOutput` 读结果、`TokenAlignment` 一个时间单元、`DeviceSelector` 选设备、`list_targets` 列设备。字幕是 `views::build_cues` 经 `render::srt` 或 `render::ass` 渲染。**其余一律 `pub(crate)`**——模型、Viterbi、边界规则、词句切分，全都不是对 crate 之外的承诺。
+
 `align` 的窗口与上下文长度以秒为单位（窗口传 `None` 表示整文件一次前向）。`TokenAlignment` 携带 `piece`、`start`、`end`、`start_frame`、`end_frame`、`word_id` 以及逐帧均值 `score`。`align_with_path` 额外返回逐帧状态路径——与参考实现对拍时比对的就是它。完整 API 见 `cargo doc`。
+
+### 代码怎么分层
+
+四层，每层只依赖它上面的层：
+
+| 层 | 模块 | 它知道什么 |
+|---|---|---|
+| base | `config` `weights` `vocab` `simd` `shaders` `gpu` `resample_sinc` `audio` | 权重、核、设备——完全不知道对齐是什么 |
+| model | `wav2vec2` `wav2vec2_gpu` | 编码器塔及其 CPU 孪生：音频进，逐帧打分出 |
+| align | `viterbi` `timeline` | 路径，以及**唯一决定时间戳的地方** |
+| text | `spans` `views` | 原文自己的词与句，以及字幕在哪里断行 |
+
+`timeline` 是值得了解的那部分：Viterbi 选定帧之后，三条规则把它变成字幕显示的区间——边界落在旁边静音的中点；标点没有音素，所以是前一个声音末尾的一个点；词表里没有的字落在它已定位的邻居之间。它们原本散在三个文件里，顺序靠注释维持；现在是一份有序清单，每条都带着选出它的实测。Viterbi 之后谁都不许再写 `start` 或 `end`——这就是 `--format srt`、`--format ass` 和 json 三者永远不会对不上的原因。
 
 ### 音频输入
 

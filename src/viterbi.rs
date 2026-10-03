@@ -49,7 +49,7 @@ impl TokenAlignment {
 }
 
 #[derive(Debug, Clone)]
-pub struct AlignmentResult {
+pub(crate) struct AlignmentResult {
     pub tokens: Vec<TokenAlignment>,
     pub frames: usize,
     pub frame_rate: f64,
@@ -60,21 +60,11 @@ pub struct AlignmentResult {
     /// Per-frame log-prob of the winning label, including blanks.
     /// Empty when there are no tokens. Not part of the JSON.
     pub frame_scores: Vec<f64>,
-    /// The blank runs the boundary padding consumed, as
-    /// `(before_token_index, first_frame, last_frame)`. `before_token_index == l`
-    /// is the trailing run. Exposed so the boundary rule can be diffed against
-    /// the reference frame by frame -- a one- or two-frame output difference is
-    /// otherwise indistinguishable between "the midpoint was taken over a
-    /// different range" and "the range itself differs". Not part of the JSON.
-    pub blank_runs: Vec<(usize, i64, i64)>,
 }
 
 impl AlignmentResult {
     pub fn mean_frame_score(&self) -> f64 {
         self.log_prob / self.frames.max(1) as f64
-    }
-    pub fn text(&self) -> String {
-        self.tokens.iter().map(|t| t.piece.as_str()).collect()
     }
 }
 
@@ -384,10 +374,10 @@ fn dp_one(st: usize, prev: &[f64], emit: &[f64], skip_dead: &[u64], next: &mut [
 /// carrying this id is a blank for every purpose the reference's own
 /// `prev_seg.label == blank` test cares about. See the blank-run collection in
 /// [`collapse`].
-pub const BLANK_TOKEN_ID: usize = 0;
+pub(crate) const BLANK_TOKEN_ID: usize = 0;
 
 /// `l' = [blank, t1, blank, ..., tL, blank]`
-pub fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec<usize> {
+pub(crate) fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec<usize> {
     let mut out = Vec::with_capacity(2 * token_ids.len() + 1);
     for &t in token_ids {
         out.push(blank_id);
@@ -406,7 +396,7 @@ pub fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec<usize>
 /// Public so the aligner can plug in its own source: for a long transcript it
 /// keeps the lm-head logits per window instead of the trellis and gathers the
 /// columns on demand ([`ctc_forced_align_emissions`]).
-pub trait Emissions {
+pub(crate) trait Emissions {
     /// Fill `emit[0..num_states]` with frame `t`'s state scores.
     fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]);
     /// Fill `emit[lo..=hi]` — the band the banded DP reads.  The default
@@ -440,6 +430,7 @@ impl<T: Emissions + ?Sized> Emissions for &T {
     }
 }
 
+#[cfg(test)]
 struct FullRows<'a> {
     log_probs: &'a [f32],
     vocab: usize,
@@ -447,6 +438,7 @@ struct FullRows<'a> {
     blank_id: usize,
 }
 
+#[cfg(test)]
 impl Emissions for FullRows<'_> {
     fn fill_emit(&self, t: usize, emit: &mut [f64], token_ids: &[usize]) {
         let row = &self.log_probs[t * self.vocab..(t + 1) * self.vocab];
@@ -475,11 +467,13 @@ impl Emissions for FullRows<'_> {
     }
 }
 
+#[cfg(test)]
 struct GatheredRows<'a> {
     gathered: &'a [f32],
     num_states: usize,
 }
 
+#[cfg(test)]
 impl Emissions for GatheredRows<'_> {
     fn fill_emit(&self, t: usize, emit: &mut [f64], _token_ids: &[usize]) {
         let row = &self.gathered[t * self.num_states..(t + 1) * self.num_states];
@@ -503,7 +497,7 @@ impl Emissions for GatheredRows<'_> {
 /// collects each chunk's gathered matrix as it is produced and runs the DP
 /// straight over them, so the frames never sit in a second contiguous copy.
 #[derive(Debug, Clone, Default)]
-pub struct GatheredChunks {
+pub(crate) struct GatheredChunks {
     /// per window: (kept_frames × S) row-major
     pub chunks: Vec<Vec<f32>>,
     /// kept frames per window (the last window matches — the tail padding is
@@ -573,7 +567,8 @@ impl Emissions for GatheredChunks {
 
 /// Force-align `token_ids` against `log_probs` ((T, V) row-major, f32).
 #[allow(clippy::too_many_arguments)]
-pub fn ctc_forced_align(
+#[cfg(test)]
+pub(crate) fn ctc_forced_align(
     log_probs: &[f32],
     num_frames: usize,
     vocab: usize,
@@ -592,7 +587,8 @@ pub fn ctc_forced_align(
 /// S = 2·L+1 states in the expanded-label order: even states are the
 /// blank, odd state 2i+1 emits `token_ids[i]`. `gathered[t * S + st]`
 /// must equal the full matrix's `log_probs[t * V + labels[st]]`.
-pub fn ctc_forced_align_gathered(
+#[cfg(test)]
+pub(crate) fn ctc_forced_align_gathered(
     gathered: &[f32],
     num_frames: usize,
     num_states: usize,
@@ -624,7 +620,8 @@ pub fn ctc_forced_align_gathered(
 /// Same DP over [`GatheredChunks`]: the per-window blocks the aligner
 /// collects on the fly.  Values must match the contiguous gather exactly
 /// (they are the same f32s, so the alignment is bit-identical).
-pub fn ctc_forced_align_gathered_chunks(
+#[cfg(test)]
+pub(crate) fn ctc_forced_align_gathered_chunks(
     chunks: &GatheredChunks,
     token_ids: &[usize],
     frame_rate: f64,
@@ -644,49 +641,7 @@ pub fn ctc_forced_align_gathered_chunks(
     align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
 }
 
-/// [`ctc_forced_align_gathered_chunks`], but keeps the per-frame trellis state.
-///
-/// The path is what the blank runs are cut from, and a blank run is what the
-/// word boundary is padded into. Comparing outputs cannot tell "the midpoint
-/// was taken over a different range" from "the range differs", so the range
-/// itself has to be inspectable. Diagnostic only — the aligner does not use it.
-pub fn ctc_forced_align_gathered_chunks_with_path(
-    chunks: &GatheredChunks,
-    token_ids: &[usize],
-    frame_rate: f64,
-    pieces: Option<&[String]>,
-) -> anyhow::Result<AlignmentResult> {
-    let num_states = chunks.num_states;
-    anyhow::ensure!(
-        num_states == 2 * token_ids.len() + 1,
-        "gathered states {num_states} != 2·{}+1",
-        token_ids.len()
-    );
-    chunks.validate()?;
-    let num_frames = chunks.total_frames();
-    let labels: Vec<usize> = (0..num_states)
-        .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
-        .collect();
-    align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, true)
-}
 
-/// The same DP over any [`Emissions`] source.  The aligner uses it for the
-/// lazy-logits trellis, which produces the identical f32 values the gathered
-/// blocks hold — it just materialises a window's columns only when the DP
-/// reaches it.
-pub fn ctc_forced_align_emissions(
-    em: &impl Emissions,
-    num_frames: usize,
-    token_ids: &[usize],
-    frame_rate: f64,
-    pieces: Option<&[String]>,
-) -> anyhow::Result<AlignmentResult> {
-    let num_states = 2 * token_ids.len() + 1;
-    let labels: Vec<usize> = (0..num_states)
-        .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
-        .collect();
-    align(em, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
-}
 
 /// The Viterbi recursion over one emissions source: two alpha rows, the
 /// emissions row, and the skip mask.  Split out of `align` so the same step
@@ -893,7 +848,7 @@ fn align(
 
 /// [ctc_forced_align_gathered_chunks], additionally told which source word
 /// each target came from.
-pub fn ctc_forced_align_gathered_with_word_ids(
+pub(crate) fn ctc_forced_align_gathered_with_word_ids(
     chunks: &GatheredChunks,
     token_ids: &[usize],
     frame_rate: f64,
@@ -919,7 +874,7 @@ pub fn ctc_forced_align_gathered_with_word_ids(
 
 /// [ctc_forced_align_emissions], additionally told which source word each
 /// target came from.
-pub fn ctc_forced_align_emissions_with_word_ids(
+pub(crate) fn ctc_forced_align_emissions_with_word_ids(
     em: &impl Emissions,
     t_len: usize,
     token_ids: &[usize],
@@ -933,28 +888,6 @@ pub fn ctc_forced_align_emissions_with_word_ids(
     })
 }
 
-/// [lign], additionally told which source word each target came from.
-///
-/// The target sequence lays every word's letters end to end with nothing
-/// between the words, so the DP cannot recover where one word stopped and the
-/// next began. uild_words needs that information and it has to arrive from
-/// the side: a space token between words would be a target the reference never
-/// had, and it lengthens the sequence past what the frame count can carry.
-pub fn align_with_word_ids(
-    em: &impl Emissions,
-    t_len: usize,
-    labels: &[usize],
-    blank_id: usize,
-    token_ids: &[usize],
-    frame_rate: f64,
-    pieces: Option<&[String]>,
-    word_ids: &[usize],
-) -> anyhow::Result<AlignmentResult> {
-    with_word_ids(word_ids, || {
-        align_with(em, t_len, labels, blank_id, token_ids, frame_rate,
-                   pieces, false, None, None)
-    })
-}
 
 /// Install word_ids for the duration of , then restore the previous value
 /// so a nested or repeated call cannot leak one run's words into another's.
@@ -1004,7 +937,6 @@ fn align_with(
             log_prob: 0.0,
             frame_path: None,
             frame_scores: vec![],
-            blank_runs: vec![],
         });
     }
     if t_len < l {
@@ -1111,7 +1043,7 @@ fn align_with(
     // `word_ids` is not a parameter here: [`align_with_word_ids`] puts it in the
     // `WORD_IDS` side channel for the duration of this call, and `collapse`
     // reads it from there. This call site therefore has nothing to pass.
-    let (tokens, blank_runs) = collapse(
+    let tokens = collapse(
         &states, &frame_scores, token_ids, pieces, frame_rate,
     );
 
@@ -1122,7 +1054,6 @@ fn align_with(
         log_prob: total,
         frame_path: if return_path { Some(states) } else { None },
         frame_scores,
-        blank_runs,
     })
 }
 
@@ -1133,7 +1064,7 @@ fn collapse(
     token_ids: &[usize],
     pieces: Option<&[String]>,
     frame_rate: f64,
-) -> (Vec<TokenAlignment>, Vec<(usize, i64, i64)>) {
+) -> Vec<TokenAlignment> {
     let l = token_ids.len();
     // The word each target came from, when the caller supplied it. Absent (the
     // synthetic paths in the tests) every target is its own word, which is the
@@ -1246,14 +1177,6 @@ fn collapse(
     // back into seconds.
     crate::timeline::pad_into_silence(&mut starts, &mut ends, &own_ends, &blank_before, frame_rate);
 
-    // The runs as the padding consumed them, for the frame-level diff.
-    let blank_runs: Vec<(usize, i64, i64)> = (0..=l)
-        .filter_map(|i| {
-            let (a, b) = blank_before[i];
-            if a >= 0 { Some((i, a, b)) } else { None }
-        })
-        .collect();
-
     let inv = 1.0 / frame_rate;
     let tokens: Vec<TokenAlignment> = (0..l)
         .map(|i| TokenAlignment {
@@ -1275,7 +1198,7 @@ fn collapse(
             },
         })
         .collect();
-    (tokens, blank_runs)
+    tokens
 }
 
 #[cfg(test)]
@@ -1303,7 +1226,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         // leading run 0..=3: mid(0, 3) = 1, so the first word starts at 1 --
         // 3 frames of padding into a 4-frame run.
@@ -1337,7 +1260,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         // run 3..=8: mid(3, 8) = 5, so `a` ends at 5 and `b` starts at 5 too --
         // the reference's spans SHARE that frame, they do not tile.
@@ -1388,7 +1311,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         let run_start = 3i64;
         let run_end = run_start + gap - 1;
@@ -1420,7 +1343,7 @@ mod tests {
         let token_ids = vec![7usize, 9usize];
         let pieces = vec!["a".to_string(), "b".to_string()];
 
-        let (toks, _) = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
+        let toks = collapse(&states, &frame_scores, &token_ids, Some(&pieces), 50.0);
 
         // A occupied frame 2 and would have been padded to frame 502 -- halfway
         // through 20 seconds of nothing. The bound is 1.0 s = 50 frames.

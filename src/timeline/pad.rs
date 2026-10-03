@@ -29,7 +29,7 @@
 /// one-sided and never reaches a start. On an 89 s Japanese variety-show
 /// clip, dense speech with no gap over 1.85 s, it is inert and produces
 /// output identical to no cap at all.
-pub const MAX_PADDING_SEC: f64 = 1.0;
+pub(crate) const MAX_PADDING_SEC: f64 = 1.0;
 
 /// Move every boundary into the silence beside it, then bound how much of
 /// that silence one token may keep.
@@ -42,7 +42,7 @@ pub const MAX_PADDING_SEC: f64 = 1.0;
 /// This is rule 1 of [`crate::timeline`] and it runs first, because
 /// [`super::anchor_marks`] and [`super::place_unmeasured`] both read the ends
 /// it leaves.
-pub fn pad_into_silence(
+pub(crate) fn pad_into_silence(
     starts: &mut [i64],
     ends: &mut [i64],
     own_ends: &[i64],

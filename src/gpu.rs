@@ -8,14 +8,12 @@
 use anyhow::{bail, Context, Result};
 
 /// A wgpu device plus the queue, adapter info and negotiated limits.
-pub struct Gpu {
+pub(crate) struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub info: wgpu::AdapterInfo,
-    pub limits: wgpu::Limits,
+    pub(crate) info: wgpu::AdapterInfo,
     pub features: wgpu::Features,
     pub pipeline_cache: Option<wgpu::PipelineCache>,
-    pub pipeline_cache_path: Option<std::path::PathBuf>,
 }
 
 /// One device: `auto`, `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring.
@@ -29,7 +27,7 @@ pub enum DeviceSelector {
     Name(String),
 }
 
-pub const RUNTIMES: &[(&str, wgpu::Backend)] = &[
+pub(crate) const RUNTIMES: &[(&str, wgpu::Backend)] = &[
     ("vulkan", wgpu::Backend::Vulkan),
     ("metal", wgpu::Backend::Metal),
     ("dx12", wgpu::Backend::Dx12),
@@ -129,7 +127,7 @@ fn is_real_gpu(info: &wgpu::AdapterInfo) -> bool {
 
 /// `auto` found no GPU. The aligner then uses the host tower.
 #[derive(Debug)]
-pub struct NoGpuError;
+pub(crate) struct NoGpuError;
 
 impl std::fmt::Display for NoGpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -220,14 +218,6 @@ pub async fn list_targets() -> Vec<String> {
 }
 
 impl Gpu {
-    pub async fn new(prefer: Option<&str>) -> Result<Self> {
-        let sel = match prefer {
-            Some(p) => DeviceSelector::parse(p)?,
-            None => DeviceSelector::Auto,
-        };
-        Self::new_with(sel).await
-    }
-
     pub async fn new_with(selector: DeviceSelector) -> Result<Self> {
         if selector == DeviceSelector::Cpu {
             bail!("DeviceSelector::Cpu is the host backend, not a wgpu device");
@@ -297,7 +287,7 @@ impl Gpu {
         }));
 
         let cache_supported = features.contains(wgpu::Features::PIPELINE_CACHE);
-        let (pipeline_cache, pipeline_cache_path) = match pipeline_cache_path(&info) {
+        let (pipeline_cache, _path) = match pipeline_cache_path(&info) {
             Some(path) if cache_supported => {
                 let seed = std::fs::read(&path).ok();
                 let cache = unsafe {
@@ -316,25 +306,9 @@ impl Gpu {
             device,
             queue,
             info,
-            limits,
             features,
             pipeline_cache,
-            pipeline_cache_path,
         })
-    }
-
-    pub fn save_pipeline_cache(&self) -> Result<()> {
-        let (Some(cache), Some(path)) = (&self.pipeline_cache, &self.pipeline_cache_path) else {
-            return Ok(());
-        };
-        let Some(data) = cache.get_data() else {
-            return Ok(());
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, &data)?;
-        Ok(())
     }
 
     pub fn describe(&self) -> String {
@@ -510,7 +484,7 @@ fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
 /// multi-GiB model load never overflows VRAM on WDDM.
 const STAGING_BUDGET: u64 = 256 << 20;
 
-pub struct BulkUpload<'a> {
+pub(crate) struct BulkUpload<'a> {
     gpu: &'a Gpu,
     pending: u64,
 }

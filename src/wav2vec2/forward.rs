@@ -17,7 +17,7 @@ use super::{ConvLayer, Model, StageSet, Stages};
 /// every buffer is fully overwritten before it is read, so stale contents
 /// from a previous (longer) forward are harmless.
 #[derive(Default)]
-pub struct Scratch {
+pub(crate) struct Scratch {
     ln: Vec<f32>,
     /// LayerNorm of the conv stack's last output, on its way into feat_proj.
     conv_ln: Vec<f32>,
@@ -95,6 +95,7 @@ enum Tail<'a> {
 
 impl Model {
     /// Full forward on one z-normalised waveform. Returns log_probs (T, V).
+#[cfg(test)]
     pub fn forward(&self, input: &[f32], stages: &StageSet) -> Result<(Vec<f32>, Stages)> {
         let mut scratch = Scratch::default();
         self.forward_with(input, stages, &mut scratch)
@@ -711,28 +712,7 @@ impl Model {
         conv_ln_gelu(y, cout, &cl.bias, &cl.ln);
     }
 
-    /// Allocating wrapper around [`Model::conv_step_into`]; the forward pass
-    /// uses the scratch-backed variant instead.
-    pub fn conv_step(&self, cl: &ConvLayer, x: &[f32], t_in: usize) -> Vec<f32> {
-        let t_out = (t_in - cl.k) / cl.stride + 1;
-        let mut y = vec![0.0f32; t_out * cl.out];
-        let mut a = vec![0.0f32; t_out * cl.in_ * cl.k];
-        self.conv_step_into(cl, x, t_out, &mut y, &mut a);
-        y
-    }
 
-    /// Allocating wrapper around [`Model::pos_conv_into`]; the forward pass
-    /// uses the scratch-backed variant.
-    pub fn pos_conv(&self, h: &[f32], t: usize) -> Vec<f32> {
-        let hidden = self.cfg.hidden_size;
-        let k = self.cfg.num_conv_pos_embeddings;
-        let pad = k / 2;
-        let mut hp = vec![0.0f32; (t + 2 * pad) * hidden];
-        let mut out = vec![0.0f32; t * hidden];
-        let mut acc = vec![0.0f32; t * hidden];
-        self.pos_conv_into(h, t, &mut hp, &mut out, &mut acc);
-        out
-    }
 
     /// Depthwise positional conv over time, writing into caller-owned buffers.
     ///

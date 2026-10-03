@@ -20,21 +20,21 @@
 //! final token timestamps to the Python reference.
 //!
 //! Layout: this file holds the model types and checkpoint loading,
-//! [`kernels`] the elementwise / GEMM wrappers, [`forward`] the forward
+//! `kernels` the elementwise / GEMM wrappers, `forward` the forward
 //! pass and its scratch buffers.
 
 mod forward;
 mod kernels;
 pub(crate) mod prof;
 
-pub use forward::Scratch;
+pub(crate) use forward::Scratch;
 
 use anyhow::Result;
 
 use crate::config::Wav2Vec2Config;
 use crate::weights::{get_f32, RawTensor};
 
-pub struct Linear {
+pub(crate) struct Linear {
     /// `[out, in]` exactly as stored in the checkpoint.
     pub w: Vec<f32>,
     pub b: Vec<f32>,
@@ -42,13 +42,13 @@ pub struct Linear {
     pub in_: usize,
 }
 
-pub struct LayerNorm {
+pub(crate) struct LayerNorm {
     pub w: Vec<f32>,
     pub b: Vec<f32>,
     pub eps: f64,
 }
 
-pub struct ConvLayer {
+pub(crate) struct ConvLayer {
     /// `[out, in, k]`
     pub weight: Vec<f32>,
     pub bias: Vec<f32>,
@@ -59,7 +59,7 @@ pub struct ConvLayer {
     pub ln: LayerNorm,
 }
 
-pub struct EncoderLayer {
+pub(crate) struct EncoderLayer {
     /// Fused q/k/v projection: rows `0..hidden` are Q, then K, then V.
     pub qkv: Linear,
     pub out_proj: Linear,
@@ -69,7 +69,7 @@ pub struct EncoderLayer {
     pub ln2: LayerNorm,
 }
 
-pub struct Model {
+pub(crate) struct Model {
     pub cfg: Wav2Vec2Config,
     pub conv: Vec<ConvLayer>,
     pub feat_proj_ln: LayerNorm,
@@ -83,7 +83,7 @@ pub struct Model {
 
 /// Which intermediate stages `forward` should collect (golden diffing).
 #[derive(Debug, Clone, Default)]
-pub struct StageSet {
+pub(crate) struct StageSet {
     pub conv: bool,
     pub proj: bool,
     pub pos_conv: bool,
@@ -93,7 +93,7 @@ pub struct StageSet {
 }
 
 #[derive(Default)]
-pub struct Stages {
+pub(crate) struct Stages {
     pub conv: Vec<Vec<f32>>, // per conv layer, (T, C) row-major
     pub proj: Vec<f32>,
     pub pos_conv: Vec<f32>,
@@ -240,7 +240,7 @@ impl Model {
 /// transcript no longer needs a full CPU [`Model`] on the side.  Same
 /// [`Linear`], same GEMM call as the CPU tower's hidden-form path, so the
 /// recomputed logits are bit-identical given the same hidden rows.
-pub struct LmHeadCpu {
+pub(crate) struct LmHeadCpu {
     pub linear: Linear,
 }
 

@@ -26,7 +26,7 @@ pub use gemm_kernel::{
 /// projection, final LN); [`layernorm_sd`] reads `src` and writes `dst`,
 /// which lets the encoder layers LN the residual stream without a staging
 /// copy.
-pub fn layernorm() -> String {
+pub(crate) fn layernorm() -> String {
     emit_ln(
         "
 @group(0) @binding(0) var<storage, read_write> h: array<vec4<f32>>;
@@ -39,7 +39,7 @@ pub fn layernorm() -> String {
 }
 
 /// Source/destination variant; uniform sits at binding 4.
-pub fn layernorm_sd() -> String {
+pub(crate) fn layernorm_sd() -> String {
     emit_ln(
         "
 @group(0) @binding(0) var<storage, read> src: array<vec4<f32>>;
@@ -120,7 +120,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 /// `out[i] = a[i] + b[i]`
-pub fn add() -> String {
+pub(crate) fn add() -> String {
     r#"
 struct Cfg { n: u32, _p0: u32, _p1: u32, _p2: u32 }
 @group(0) @binding(0) var<storage, read> a: array<f32>;
@@ -148,7 +148,7 @@ fn main(
 /// Columns up to 2048 stay in named registers: one coalesced load, the same
 /// strided sum order as the scalar loop, then one store. Longer rows fall
 /// back to the three-pass loop.
-pub fn softmax() -> String {
+pub(crate) fn softmax() -> String {
     r#"
 struct Cfg { rows: u32, cols: u32, _p0: u32, _p1: u32 }
 @group(0) @binding(0) var<storage, read_write> h: array<f32>;
@@ -281,7 +281,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 /// Row log_softmax over `cols` (two-pass, in-place).
-pub fn log_softmax() -> String {
+pub(crate) fn log_softmax() -> String {
     r#"
 struct Cfg { rows: u32, cols: u32, _p0: u32, _p1: u32 }
 @group(0) @binding(0) var<storage, read_write> h: array<f32>;
@@ -332,7 +332,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 /// lp[t * V + labels[s]].  The forced-alignment Viterbi only ever reads
 /// those T*S values, so the GPU downloads ~30 KB instead of the whole
 /// T*10288 matrix (70 MB for a 34 s chunk).
-pub fn gather() -> String {
+pub(crate) fn gather() -> String {
     r#"
 struct Cfg { total: u32, s: u32, v: u32, _p0: u32 }
 @group(0) @binding(0) var<storage, read> lp: array<f32>;
@@ -358,7 +358,7 @@ fn main(
 }
 
 /// (rows, cols) -> (cols, rows)
-pub fn transpose() -> String {
+pub(crate) fn transpose() -> String {
     r#"
 struct Cfg { rows: u32, cols: u32, a_stride: u32, a_off: u32 }
 @group(0) @binding(0) var<storage, read> a: array<f32>;
@@ -378,7 +378,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 /// conv layer 0: raw waveform (1 channel) -> (T_out, 512).
-pub fn conv0() -> String {
+pub(crate) fn conv0() -> String {
     r#"
 struct Cfg { t_out: u32, c: u32, k: u32, stride: u32 }
 @group(0) @binding(0) var<storage, read> x: array<f32>;   // (n,)

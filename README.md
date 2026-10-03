@@ -99,8 +99,7 @@ Nothing points at anything else. A consumer who wants timings reads `tokens` and
 ### Library
 
 ```rust
-use ctc_forced_aligner_wgpu::align_inference::Aligner;
-use ctc_forced_aligner_wgpu::gpu::DeviceSelector;
+use ctc_forced_aligner_wgpu::{Aligner, DeviceSelector};
 
 let aligner = Aligner::load_on(std::path::Path::new("model"),
                                DeviceSelector::parse("auto")?)?;
@@ -110,7 +109,22 @@ for t in &out.tokens {
 }
 ```
 
+That is the whole of the API: `Aligner` to load and run, `AlignOutput` to read, `TokenAlignment` for one unit, `DeviceSelector` to pick a device, `list_targets` to list them. Subtitles are `views::build_cues` rendered by `render::srt` or `render::ass`. **Everything else is `pub(crate)`** — the model, the Viterbi, the boundary rules, the word and sentence grouping, all of it, because none of it is a promise to anyone but this crate.
+
 `align` takes the window and context lengths in seconds (`None` for the window runs the whole file in one pass). `TokenAlignment` carries `piece`, `start`, `end`, `start_frame`, `end_frame`, `word_id` and a per-frame mean `score`. `align_with_path` additionally returns the per-frame state path, which is what the reference comparison is made against. See `cargo doc` for the full API.
+
+### How it is put together
+
+Four layers, each depending only on the ones above it:
+
+| layer | modules | what it knows |
+|---|---|---|
+| base | `config` `weights` `vocab` `simd` `shaders` `gpu` `resample_sinc` `audio` | checkpoints, kernels, devices — no idea what an alignment is |
+| model | `wav2vec2` `wav2vec2_gpu` | the encoder tower and its CPU twin: audio in, per-frame scores out |
+| align | `viterbi` `timeline` | the path, and **the one place a timestamp is decided** |
+| text | `spans` `views` | the transcript's own words and sentences, and where a subtitle line breaks |
+
+`timeline` is the part worth knowing: after the Viterbi picks frames, three rules turn that into the spans a subtitle shows — a boundary sits in the middle of the pause beside it, a mark has no sound so it becomes a point at the end of the one before, and a character the vocabulary had no target for lies between its placed neighbours. They used to live in three files with the order between them held up by comments; they are now one list, in order, each with the measurement that chose it. Nothing downstream of the Viterbi may write a `start` or an `end`, which is what keeps `--format srt`, `--format ass` and the JSON from ever disagreeing.
 
 ### Audio input
 

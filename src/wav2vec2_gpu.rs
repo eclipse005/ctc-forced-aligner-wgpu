@@ -167,7 +167,7 @@ fn uni_binding(p: usize) -> u32 {
     }
 }
 
-pub struct GpuModel {
+pub(crate) struct GpuModel {
     gpu: Gpu,
     pub cfg: Wav2Vec2Config,
     pipes: Pipe,
@@ -481,9 +481,6 @@ impl GpuModel {
         self.gpu.describe()
     }
 
-    pub fn adapter_name(&self) -> String {
-        self.gpu.info.name.clone()
-    }
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {

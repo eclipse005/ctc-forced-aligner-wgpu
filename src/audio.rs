@@ -4,10 +4,10 @@
 
 use anyhow::{Context, Result};
 
-pub const TARGET_SR: u32 = 16000;
+pub(crate) const TARGET_SR: u32 = 16000;
 
 /// Decode a WAV file to mono f32, resampling to [`TARGET_SR`] when needed.
-pub fn load_audio(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
+pub(crate) fn load_audio(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
     let mut reader = hound::WavReader::open(path)
         .with_context(|| format!("open wav {}", path.display()))?;
     let spec = reader.spec();
@@ -54,7 +54,7 @@ pub fn load_audio(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
 
 /// Wav2Vec2FeatureExtractor's z-normalisation: biased variance, eps inside
 /// the sqrt, computed per chunk (the Python path normalises each chunk too).
-pub fn znorm(w: &mut [f32]) {
+pub(crate) fn znorm(w: &mut [f32]) {
     let n = w.len() as f32;
     let mean = w.iter().sum::<f32>() / n;
     let var = w.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
@@ -66,7 +66,7 @@ pub fn znorm(w: &mut [f32]) {
 
 /// Resample by sinc interpolation with a Hann window, torchaudio's
 /// `sinc_interp_hann` default (lowpass_filter_width=6, rolloff=0.99).
-pub fn resample(input: &[f32], orig_freq: u32, new_freq: u32) -> Vec<f32> {
+pub(crate) fn resample(input: &[f32], orig_freq: u32, new_freq: u32) -> Vec<f32> {
     crate::resample_sinc::resample(input, orig_freq, new_freq)
 }
 

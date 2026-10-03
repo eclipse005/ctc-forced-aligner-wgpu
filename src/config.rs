@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-pub struct Wav2Vec2Config {
+pub(crate) struct Wav2Vec2Config {
     pub conv_dim: Vec<usize>,
     pub conv_kernel: Vec<usize>,
     pub conv_stride: Vec<usize>,

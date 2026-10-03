@@ -15,7 +15,7 @@ use std::path::Path;
 /// ("hello 你好") still needs the segment rule, and Thai / Kana / Hangul are
 /// spaced inconsistently enough that treating them as word-delimited would put
 /// a star where the reference has none.
-pub fn is_cjk(c: char) -> bool {
+pub(crate) fn is_cjk(c: char) -> bool {
     let n = c as u32;
     (0x3040..=0x30FF).contains(&n)      // kana
         || (0x3400..=0x4DBF).contains(&n)  // CJK ext A
@@ -25,7 +25,7 @@ pub fn is_cjk(c: char) -> bool {
         || (0x20000..=0x2A6DF).contains(&n) // CJK ext B
 }
 
-pub struct Vocab {
+pub(crate) struct Vocab {
     pub char_to_id: HashMap<char, usize>,
     pub unk_id: usize,
     pub size: usize,
@@ -64,6 +64,7 @@ impl Vocab {
         Ok(Self { char_to_id, unk_id, size, star_id })
     }
 
+#[cfg(test)]
     pub fn tokenise(&self, text: &str) -> (Vec<usize>, Vec<String>) {
         let mut ids = Vec::new();
         let mut pieces = Vec::new();
@@ -207,6 +208,7 @@ impl Vocab {
         (ids, pieces, word_ids, src)
     }
 
+#[cfg(test)]
     pub fn tokenise_with_stars(&self, text: &str) -> (Vec<usize>, Vec<String>) {
 
         // Words are split on whitespace and their letters concatenated, with a

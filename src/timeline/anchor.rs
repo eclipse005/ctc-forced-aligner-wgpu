@@ -31,7 +31,7 @@ fn owns_time(piece: &str) -> bool {
 /// and the frame fields name its end frame. Applying this twice changes
 /// nothing, which is what lets it sit in a pipeline rather than being a
 /// correction somebody has to remember to apply.
-pub fn anchor_marks(tokens: &mut [TokenAlignment]) {
+pub(crate) fn anchor_marks(tokens: &mut [TokenAlignment]) {
     let mut anchor: Option<(f64, i64)> = None;
     for token in tokens.iter_mut() {
         if owns_time(&token.piece) {

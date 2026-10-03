@@ -5,7 +5,7 @@
 
 /// Resample `input` from `orig_freq` to `new_freq` (defaults: width 6,
 /// rolloff 0.99, Hann window).
-pub fn resample(input: &[f32], orig_freq: u32, new_freq: u32) -> Vec<f32> {
+pub(crate) fn resample(input: &[f32], orig_freq: u32, new_freq: u32) -> Vec<f32> {
     const LOWPASS_WIDTH: f32 = 6.0;
     const ROLLOFF: f32 = 0.99;
 

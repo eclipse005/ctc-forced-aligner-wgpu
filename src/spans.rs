@@ -32,18 +32,17 @@ use crate::viterbi::TokenAlignment;
 /// Buckeye dev that turned 135 gold words into 146 predictions, and only 85 of
 /// them matched a gold label, because the stray `s`/`t`/`m` fragments had
 /// nothing to pair with.
-pub const PUNCT: &[char] = &[
+pub(crate) const PUNCT: &[char] = &[
     ' ', '\t', '\n', '.', ',', '!', '?', ';', ':', '"', '(', ')', '[', ']', '{', '}', '<',
     '>', '«', '»', '„', '“', '”', '‘', '’', '…', '、', '，', '。', '！', '？', '；', '：', '（',
     '）', '【', '】', '《', '》', '〈', '〉', '·', '～', '~', '-', '—', '–',
 ];
 
 /// Characters that terminate a segment.
-pub const SENTENCE_END: &[char] = &['.', '!', '?', '…', '。', '！', '？', '；', ';'];
+pub(crate) const SENTENCE_END: &[char] = &['.', '!', '?', '…', '。', '！', '？', '；', ';'];
 
 #[derive(Debug, Clone)]
-pub struct WordSpan {
-    pub index: usize,
+pub(crate) struct WordSpan {
     pub text: String,
     pub start: f64,
     pub end: f64,
@@ -60,20 +59,13 @@ pub struct WordSpan {
     pub space_before: bool,
 }
 
-impl WordSpan {
-    pub fn duration(&self) -> f64 {
-        self.end - self.start
-    }
-}
-
+/// A sentence: a run of words, with the span its first and last character
+/// cover.
 #[derive(Debug, Clone)]
-pub struct SegmentSpan {
-    pub index: usize,
+pub(crate) struct SegmentSpan {
     pub text: String,
     pub start: f64,
     pub end: f64,
-    /// Indices into the word list.
-    pub words: Vec<usize>,
 }
 
 /// Whether a run of characters belongs to a script that writes without spaces
@@ -91,7 +83,7 @@ pub struct SegmentSpan {
 /// blocks the tokenizer copy still had, so a text of extension-B ideographs
 /// could be called Chinese by one and not by the other. One function, one
 /// answer.
-pub fn splits_between_characters(run: &[&TokenAlignment]) -> bool {
+pub(crate) fn splits_between_characters(run: &[&TokenAlignment]) -> bool {
     use crate::vocab::is_cjk;
     let letters = run
         .iter()
@@ -113,7 +105,7 @@ pub fn splits_between_characters(run: &[&TokenAlignment]) -> bool {
 /// The one rule: a mark joins the unit in front of it only when the transcript
 /// wrote them in the SAME word. `ね。 (笑い声)` has a space before the bracket,
 /// so that bracket opens a word of its own and must not be glued to `。`.
-pub fn mark_groups(run: &[&TokenAlignment]) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn mark_groups(run: &[&TokenAlignment]) -> Vec<std::ops::Range<usize>> {
     let mut out: Vec<std::ops::Range<usize>> = Vec::new();
     // the word the current group belongs to, which is the one that opened it
     let mut word = usize::MAX;
@@ -131,11 +123,11 @@ pub fn mark_groups(run: &[&TokenAlignment]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// Whether a piece is a mark rather than something with a sound.
-pub fn is_mark(piece: &str) -> bool {
+pub(crate) fn is_mark(piece: &str) -> bool {
     !piece.is_empty() && piece.chars().all(|c| PUNCT.contains(&c))
 }
 
-pub fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
+pub(crate) fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
     let mut words: Vec<WordSpan> = Vec::new();
     let mut buf: Vec<&TokenAlignment> = Vec::new();
 
@@ -152,7 +144,6 @@ pub fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
                     for (n, g) in mark_groups(&buf).iter().enumerate() {
                         let span = &buf[g.clone()];
                         words.push(WordSpan {
-                            index: words.len(),
                             text: span.iter().map(|t| t.piece.as_str()).collect(),
                             start: span[0].start,
                             end: span[span.len() - 1].end,
@@ -166,7 +157,6 @@ pub fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
                 } else {
                     let text: String = buf.iter().map(|t| t.piece.as_str()).collect();
                     words.push(WordSpan {
-                        index: words.len(),
                         text,
                         start: buf[0].start,
                         end: buf[buf.len() - 1].end,
@@ -231,7 +221,7 @@ fn ends_sentence(word: &str) -> bool {
     !rev.next().is_some_and(|c| c.is_ascii_digit())
 }
 
-pub fn build_segments(tokens: &[TokenAlignment], words: &[WordSpan]) -> Vec<SegmentSpan> {
+pub(crate) fn build_segments(tokens: &[TokenAlignment], words: &[WordSpan]) -> Vec<SegmentSpan> {
     let mut segments: Vec<SegmentSpan> = Vec::new();
     let mut cur: Vec<&WordSpan> = Vec::new();
 
@@ -251,11 +241,9 @@ pub fn build_segments(tokens: &[TokenAlignment], words: &[WordSpan]) -> Vec<Segm
                     text.push_str(&w.text);
                 }
                 segments.push(SegmentSpan {
-                    index: segments.len(),
                     text,
                     start: cur[0].start,
                     end: cur[cur.len() - 1].end,
-                    words: cur.iter().map(|w| w.index).collect(),
                 });
                 cur.clear();
             }

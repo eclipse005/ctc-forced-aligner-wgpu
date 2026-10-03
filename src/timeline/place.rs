@@ -20,7 +20,7 @@ use std::collections::HashMap;
 ///
 /// It runs after [`super::anchor_marks`] and before anything reads the spans,
 /// so the only thing that can own time here is speech.
-pub fn place_unmeasured(
+pub(crate) fn place_unmeasured(
     tokens: &[TokenAlignment],
     text: &str,
     src: &[usize],

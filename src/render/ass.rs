@@ -264,7 +264,11 @@ pub fn cues_to_karaoke(doc: &CueDoc, tokens: &[TokenAlignment], st: &KaraokeStyl
 /// The text of the karaoke file with its markup removed, for checking it
 /// against the transcript: every character the alignment produced must appear
 /// exactly once, and the words must come back in order.
-pub fn karaoke_plain_text(ass: &str) -> String {
+///
+/// Test-only: it exists to check a rendered file, and nothing in the library
+/// renders one in order to check it.
+#[cfg(test)]
+pub(crate) fn karaoke_plain_text(ass: &str) -> String {
     let mut out = String::new();
     for line in ass.lines().filter(|l| l.starts_with("Dialogue:")) {
         // ten comma-separated fields, and the text may itself contain commas

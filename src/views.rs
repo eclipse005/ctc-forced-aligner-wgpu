@@ -8,13 +8,6 @@
 use crate::spans::{splits_between_characters, PUNCT};
 use crate::viterbi::TokenAlignment;
 
-#[derive(Clone, Debug)]
-pub struct SpanOut {
-    pub start: f64,
-    pub end: f64,
-    pub text: String,
-    pub score: f64,
-}
 
 #[derive(Clone, Debug)]
 pub struct CueOut {
@@ -24,254 +17,16 @@ pub struct CueOut {
     pub text: String,
 }
 
-/// Advance `ti` past any `<star>` targets and return the next real piece.
-///
-/// `<star>` is the reference's synthetic word-boundary marker, not a character
-/// of the transcript (see [`crate::vocab::Vocab::tokenise_with_stars`]), so a
-/// walk that pairs transcript characters with token pieces in lockstep has to
-/// step over it. It does not: `pieces[0]` is a star in BOTH placements — the
-/// `edges` star and the `segment` star — so an unskipped walk compares the
-/// transcript's first character against `"<star>"` for the whole file, never
-/// advances, and reports every character as unmatched.
-fn skip_stars(pieces: &[String], mut ti: usize) -> usize {
-    while ti < pieces.len() && pieces[ti] == "<star>" {
-        ti += 1;
-    }
-    ti
-}
 
-/// Whether `piece` is exactly the one character `ch` — the shape a kept
-/// transcript character has once the vocabulary has emitted it.
-fn piece_is_char(piece: &str, ch: char) -> bool {
-    piece.chars().next() == Some(ch) && piece.chars().nth(1).is_none()
-}
 
-/// Whether `text` is written without spaces between words.
-///
-/// The question this answers is not "is this CJK" — that asks about Unicode
-/// blocks and cannot tell a space-delimited script (Hangul, Kana) from an
-/// unspaced one (Han, Thai), even though they call for opposite treatment.
-/// What matters is whether splitting on whitespace yields *words*, and the
-/// length of what comes out answers it without a language table.
-///
-/// Measured on real transcripts: space-delimited scripts average 3.9-4.5
-/// characters per whitespace token, unspaced ones 33.4. A transcript mixes
-/// both, and so does the verdict — it takes the majority, which is what a
-/// single granularity for the whole file has to do.
-pub fn text_is_unspaced(text: &str) -> bool {
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-    if tokens.is_empty() {
-        return false;
-    }
-    let chars: usize = tokens.iter().map(|t| t.chars().count()).sum();
-    chars * 8 > tokens.len() * 100
-}
 
-/// `word` where the transcript separates words with spaces, `char` where it
-/// does not. One verdict for the whole text, chosen by [`text_is_unspaced`].
-pub fn auto_split(text: &str) -> &'static str {
-    if text_is_unspaced(text) {
-        "char"
-    } else {
-        "word"
-    }
-}
 
-fn r4(x: f64) -> f64 {
-    (x * 10000.0).round() / 10000.0
-}
 
-fn chunk_ranges(text: &str, split: &str) -> Vec<(usize, usize, String)> {
-    let chars: Vec<char> = text.chars().collect();
-    // byte offsets are not needed; we index by char.
-    if split == "char" {
-        return chars
-            .iter()
-            .enumerate()
-            .filter(|(_, ch)| !ch.is_whitespace())
-            .map(|(i, ch)| (i, i + 1, ch.to_string()))
-            .collect();
-    }
-    if split == "word" {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i].is_whitespace() {
-                i += 1;
-                continue;
-            }
-            let a = i;
-            while i < chars.len() && !chars[i].is_whitespace() {
-                i += 1;
-            }
-            out.push((a, i, chars[a..i].iter().collect()));
-        }
-        return out;
-    }
-    // sentence, keeping a decimal point inside a number
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    let mut i = 0usize;
-    let closers: Vec<char> = "»”’）】》]'\"）".chars().collect();
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '.' && i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit()
-        {
-            i += 1;
-            continue;
-        }
-        if " .!?…。！？；;".contains(ch) && ch != ' ' {
-            let mut j = i + 1;
-            while j < chars.len() && closers.contains(&chars[j]) {
-                j += 1;
-            }
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            let raw: String = chars[pos..j].iter().collect();
-            if raw.chars().any(|c| !c.is_whitespace()) {
-                out.push((pos, j, raw.trim().to_string()));
-            }
-            pos = j;
-            i = j;
-            continue;
-        }
-        i += 1;
-    }
-    if pos < chars.len() {
-        let raw: String = chars[pos..].iter().collect();
-        if raw.chars().any(|c| !c.is_whitespace()) {
-            out.push((pos, chars.len(), raw.trim().to_string()));
-        }
-    }
-    out
-}
 
-fn token_index(text: &str, pieces: &[String]) -> Vec<i64> {
-    let mut ti = 0usize;
-    let mut out = Vec::new();
-    for ch in text.chars() {
-        ti = skip_stars(pieces, ti);
-        if ti < pieces.len() && piece_is_char(&pieces[ti], ch) {
-            out.push(ti as i64);
-            ti += 1;
-        } else {
-            out.push(-1);
-        }
-    }
-    out
-}
 
-fn mid_start(prev_end_frame: i64, this_start: i64) -> i64 {
-    let blank_lo = prev_end_frame + 1;
-    let blank_hi = this_start - 1;
-    if blank_hi >= blank_lo {
-        (blank_lo + blank_hi) / 2
-    } else {
-        this_start
-    }
-}
 
-fn mid_end(this_end_frame: i64, next_start: i64) -> i64 {
-    let blank_lo = this_end_frame + 1;
-    let blank_hi = next_start - 1;
-    if blank_hi >= blank_lo {
-        (blank_lo + blank_hi) / 2 + 1
-    } else {
-        this_end_frame + 1
-    }
-}
 
-/// Segments of `text` over the whole file, with the leading and trailing
-/// silence folded in so the spans tile the timeline and no stretch of audio
-/// belongs to nobody.
-///
-/// `split` is the unit: `char` for a transcript that does not space its words,
-/// `word` for one that does. The caller normally passes [`auto_split`]; it
-/// stays a parameter because a library user with a mixed transcript may want
-/// to force one, and because a two-word test string has no statistical
-/// evidence either way.
-pub fn build_spans(
-    text: &str,
-    tokens: &[TokenAlignment],
-    frames: usize,
-    frame_rate: f64,
-    frame_scores: &[f64],
-    split: &str,
-) -> Vec<SpanOut> {
-    // `json` already carries `words` and `segments`, so the only thing spans
-    // add is the gapless timeline; the granularity is not a user choice.
-    let pieces: Vec<String> = tokens.iter().map(|t| t.piece.clone()).collect();
-    let owned = token_index(text, &pieces);
-    let mut rows: Vec<(usize, usize, String, Vec<usize>)> = Vec::new();
-    for (a, b, display) in chunk_ranges(text, split) {
-        let idxs: Vec<usize> = (a..b).filter_map(|i| if owned[i] >= 0 { Some(owned[i] as usize) } else { None }).collect();
-        if idxs.is_empty() {
-            continue;
-        }
-        let lo = *idxs.first().unwrap();
-        let hi = *idxs.last().unwrap();
-        rows.push((lo, hi, display, idxs));
-    }
-    let mut segments = Vec::new();
-    for i in 0..rows.len() {
-        let lo = rows[i].0;
-        let hi = rows[i].1;
-        let display = rows[i].2.clone();
-        let idxs = rows[i].3.clone();
-        let start_f = if i == 0 {
-            0
-        } else {
-            mid_start(tokens[rows[i - 1].1].end_frame, tokens[lo].start_frame)
-        };
-        let end_f = if i + 1 == rows.len() {
-            frames as i64
-        } else {
-            mid_end(tokens[hi].end_frame, tokens[rows[i + 1].0].start_frame)
-        };
-        let score = if !frame_scores.is_empty() && end_f > start_f {
-            let a = start_f.max(0) as usize;
-            let b = (end_f as usize).min(frame_scores.len());
-            if b > a {
-                frame_scores[a..b].iter().sum::<f64>() / (b - a) as f64
-            } else {
-                0.0
-            }
-        } else {
-            idxs.iter().map(|&k| tokens[k].score).sum::<f64>() / idxs.len() as f64
-        };
-        segments.push(SpanOut {
-            start: start_f as f64 / frame_rate,
-            end: end_f as f64 / frame_rate,
-            text: display.clone(),
-            score,
-        });
-    }
-    // Spans already meet at the midpoint of the blank between them, so the
-    // only thing left to do is clamp the sub-frame overlaps that rounding
-    // leaves behind and make the timeline strictly contiguous. A user-tunable
-    // threshold used to sit here; the default did this and nothing else, and
-    // every other value was a guess about somebody's subtitle style.
-    for i in 0..segments.len().saturating_sub(1) {
-        if segments[i + 1].start - segments[i].end < 0.0 {
-            segments[i + 1].start = segments[i].end;
-        }
-    }
-    for seg in &mut segments {
-        seg.start = r4(seg.start);
-        seg.end = r4(seg.end);
-        seg.score = r4(seg.score);
-    }
-    segments
-}
 
-pub fn spans_to_txt(spans: &[SpanOut]) -> String {
-    let mut s = String::new();
-    for sp in spans {
-        s.push_str(&format!("{}-{}: {}\n", sp.start, sp.end, sp.text));
-    }
-    s
-}
 
 // --- cues -----------------------------------------------------------------
 
@@ -848,22 +603,8 @@ pub fn build_cues(tokens: &[TokenAlignment]) -> CueDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{tok, tokw, words_from};
+    use crate::testutil::{tokw, words_from};
 
-    #[test]
-    fn spans_tile_like_python() {
-        let tokens = vec![tok(0, "a", 10, 12), tok(1, "b", 20, 21)];
-        let scores: Vec<f64> = (0..40).map(|t| t as f64).collect();
-        let segs = build_spans("ab", &tokens, 40, 50.0, &scores, "char");
-        assert_eq!(segs.len(), 2);
-        assert_eq!(segs[0].text, "a");
-        assert_eq!(segs[0].start, 0.0);
-        assert_eq!(segs[0].end, 0.34);
-        assert_eq!(segs[1].start, 0.34);
-        assert_eq!(segs[1].end, 0.8);
-        assert_eq!(segs[0].score, 8.0);
-        assert_eq!(segs[1].score, 27.5);
-    }
 
     #[test]
     fn cues_keep_decimal() {
@@ -874,26 +615,6 @@ mod tests {
         assert_eq!(doc.cues[0].text, "达到2.5。");
     }
 
-    /// Regression: the walk pairs transcript characters with token pieces, and
-    /// the real tokenizer interleaves `<star>` targets the transcript never
-    /// contains. Hand-built star-free pieces cannot catch that — they are what
-    /// let a desynchronising walk pass as green.
-    #[test]
-    fn stars_do_not_desync_the_transcript_walk() {
-        // "edges" placement: a star at each end of a space-delimited script.
-        let en: Vec<String> = ["<star>", "h", "i", "<star>"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(token_index("hi there", &en), vec![1, 2, -1, -1, -1, -1, -1, -1]);
-
-        // "segment" placement: a star before every word after the first.
-        let cjk: Vec<String> = ["<star>", "你", "<star>", "好", "<star>"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(token_index("你好", &cjk), vec![1, 3]);
-    }
 
     #[test]
     fn a_bare_period_is_not_a_cue() {
@@ -935,23 +656,6 @@ mod tests {
         assert_eq!(fold_bare_marks(raw), vec![(1.0, 2.0, "hello world".to_string())]);
     }
 
-    #[test]
-    fn the_granularity_comes_from_whitespace_not_unicode() {
-        // Space-delimited: the whitespace split yields words, whatever script.
-        assert!(!text_is_unspaced("hello world, this is a test"));
-        assert!(!text_is_unspaced("안녕하세요 반갑습니다 저는 학생이에요"));
-        // Unspaced: the split yields whole lines.
-        assert!(text_is_unspaced("你问我爱你有多深我爱你有几分我的情也真我的爱也真"));
-        // The point of the test: a space-delimited Hangul transcript and an
-        // unspaced Han one land on opposite sides, which a Unicode-block test
-        // cannot do -- both are "CJK" by block.
-        assert_eq!(auto_split("안녕하세요 반갑습니다 저는 학생이에요"), "word");
-        assert_eq!(auto_split("你问我爱你有多深我爱你有几分"), "char");
-        // Empty and single-token inputs must not panic or divide by zero.
-        assert_eq!(auto_split(""), "word");
-        assert_eq!(auto_split("   \n  "), "word");
-        assert_eq!(auto_split("hi"), "word");
-    }
 
     #[test]
     fn stars_never_reach_the_cue_text() {
@@ -1062,21 +766,4 @@ mod tests {
         assert!(!words[0].splittable, "a Latin word is one unit");
     }
 
-    #[test]
-    fn spans_survive_star_targets() {
-        // The full shape: a leading star, letters, an inter-word star, letters,
-        // a trailing star -- what `tokenise_with_stars` actually emits.
-        let names = ["<star>", "你", "<star>", "好", "<star>"];
-        let tokens: Vec<TokenAlignment> = names
-            .iter()
-            .enumerate()
-            .map(|(i, p)| tok(i, p, 10 + 10 * i as i64, 12 + 10 * i as i64))
-            .collect();
-        let scores: Vec<f64> = (0..80).map(|t| t as f64).collect();
-        let segs = build_spans("你好", &tokens, 80, 50.0, &scores, "char");
-        assert_eq!(segs.len(), 2, "star targets must not empty the span list");
-        assert_eq!(segs[0].text, "你");
-        assert_eq!(segs[1].text, "好");
-        assert!(segs[0].end <= segs[1].start);
-    }
 }

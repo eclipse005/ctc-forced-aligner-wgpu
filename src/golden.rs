@@ -5,14 +5,16 @@
 //!
 //! Directories: `$CTC_GOLDEN_DIR` (default `<repo>/golden`) and
 //! `$CTC_MODEL_DIR` (default the local omniASR checkpoint path).
+use crate::gpu::DeviceSelector;
+
 
 use std::path::PathBuf;
 
 use rayon::prelude::*;
-use ctc_forced_aligner_wgpu::align_inference::Aligner;
-use ctc_forced_aligner_wgpu::audio::{load_audio, znorm};
-use ctc_forced_aligner_wgpu::viterbi::ctc_forced_align;
-use ctc_forced_aligner_wgpu::wav2vec2::StageSet;
+use crate::align_inference::{Aligner, Tower};
+use crate::audio::{load_audio, znorm};
+use crate::viterbi::{build_expanded_labels, ctc_forced_align};
+use crate::wav2vec2::{Scratch, StageSet};
 
 fn golden_dir() -> PathBuf {
     std::env::var_os("CTC_GOLDEN_DIR")
@@ -104,7 +106,7 @@ fn golden_stages_and_tokens() {
 
     let aligner = Aligner::load(&model_dir()).unwrap();
     let model = match &aligner.tower {
-        ctc_forced_aligner_wgpu::align_inference::Tower::Cpu(m) => m,
+        Tower::Cpu(m) => m,
         _ => unreachable!(),
     };
 
@@ -191,12 +193,12 @@ fn golden_stages_and_tokens() {
     // fused path must agree with a gather from the full log_probs above to
     // within the GEMM's destination-add rounding.
     {
-        let expanded = ctc_forced_aligner_wgpu::viterbi::build_expanded_labels(&ids, blank_id);
+        let expanded = build_expanded_labels(&ids, blank_id);
         let (g, _) = model
             .forward_gathered_with(
                 &input,
                 &StageSet::default(),
-                &mut ctc_forced_aligner_wgpu::wav2vec2::Scratch::default(),
+                &mut Scratch::default(),
                 &expanded,
             )
             .unwrap();
@@ -223,7 +225,7 @@ fn golden_stages_and_tokens() {
             let logits = model
                 .forward_logits(
                     &input,
-                    &mut ctc_forced_aligner_wgpu::wav2vec2::Scratch::default(),
+                    &mut Scratch::default(),
                 )
                 .unwrap();
             let s = expanded.len();
@@ -361,7 +363,7 @@ fn golden_stages_and_tokens() {
         &std::fs::read_to_string(root.join("alignment_sdpa.json")).unwrap(),
     )
     .unwrap();
-    let words = ctc_forced_aligner_wgpu::spans::build_words(&res.tokens);
+    let words = crate::spans::build_words(&res.tokens);
     let py_words = py["words"].as_array().unwrap();
     // The apostrophe fix can legitimately change the word COUNT against a
     // reference produced by the old splitter (`it's` was `it` + `s`), so only
@@ -388,7 +390,7 @@ fn golden_stages_and_tokens() {
             );
         }
     }
-    let segments = ctc_forced_aligner_wgpu::spans::build_segments(&res.tokens, &words);
+    let segments = crate::spans::build_segments(&res.tokens, &words);
     let py_segs = py["segments"].as_array().unwrap();
     assert_eq!(segments.len(), py_segs.len(), "segment count");
     for (s, ps) in segments.iter().zip(py_segs) {
@@ -435,8 +437,8 @@ fn gpu_golden_tokens() {
         }
     }
 
-    let selector = ctc_forced_aligner_wgpu::DeviceSelector::parse("auto").unwrap();
-    let aligner = match ctc_forced_aligner_wgpu::Aligner::load_on(&model_dir(), selector) {
+    let selector = DeviceSelector::parse("auto").unwrap();
+    let aligner = match Aligner::load_on(&model_dir(), selector) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("no usable GPU adapter, skipping: {e:#}");
@@ -446,10 +448,10 @@ fn gpu_golden_tokens() {
     println!("backend: {}", aligner.backend_name());
 
     // production-path log_probs, diffed against the golden directly
-    let (wave, sr) = ctc_forced_aligner_wgpu::audio::load_audio(&wav_path).unwrap();
+    let (wave, sr) = load_audio(&wav_path).unwrap();
     assert_eq!(sr, 16000);
     let mut input = wave.clone();
-    ctc_forced_aligner_wgpu::audio::znorm(&mut input);
+    znorm(&mut input);
     let t0 = std::time::Instant::now();
     let lp = aligner.forward_pub(&input).unwrap();
     println!("gpu forward: {:.2}s ({} frames)", t0.elapsed().as_secs_f64(), lp.len() / 10288);
@@ -541,7 +543,7 @@ fn gpu_golden_tokens() {
     let py_words = py["words"].as_array().unwrap().len();
     // `words` is no longer a field of the output; the golden comparison is
     // against the reference's own segmentation, so build the same view here.
-    let our_words = ctc_forced_aligner_wgpu::spans::build_words(&out.tokens);
+    let our_words = crate::spans::build_words(&out.tokens);
     if our_words.len() != py_words {
         println!(
             "word count {py_words} in the reference vs {} here: expected, the \
@@ -550,7 +552,7 @@ fn gpu_golden_tokens() {
         );
     }
     let our_segments =
-        ctc_forced_aligner_wgpu::spans::build_segments(&out.tokens, &our_words);
+        crate::spans::build_segments(&out.tokens, &our_words);
     assert_eq!(
         our_segments.len(),
         py["segments"].as_array().unwrap().len(),
