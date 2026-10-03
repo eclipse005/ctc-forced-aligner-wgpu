@@ -58,6 +58,7 @@ mod tests {
             end,
             start_frame: frame,
             end_frame: frame,
+            inferred: false,
             score: 0.0,
         }
     }

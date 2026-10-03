@@ -31,6 +31,12 @@ pub struct TokenAlignment {
     pub end_frame: i64,
     /// Mean per-frame log-probability over the token's frames.
     pub score: f64,
+    /// True when no target existed for this character and its span was
+    /// interpolated from its neighbours. Forced alignment is a monotone path,
+    /// so a character between two placed ones must lie between them -- the
+    /// midpoint is the only choice available without more information -- but
+    /// nothing was measured here, and a consumer may want to know that.
+    pub inferred: bool,
 }
 
 impl TokenAlignment {
@@ -1388,6 +1394,7 @@ fn collapse(
             end: (ends[i] + 1) as f64 * inv,
             start_frame: starts[i],
             end_frame: ends[i],
+            inferred: false,
             score: if counts[i] > 0 {
                 sums[i] / counts[i] as f64
             } else {

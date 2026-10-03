@@ -102,6 +102,7 @@ impl Vocab {
     /// speech in some FLEURS English clips, and believing it inverts the
     /// result), the per-frame path score:
     ///
+    /// ```text
     ///     Spanish   -0.1308 vs -0.3896
     ///     French    -0.2605 vs -0.5315
     ///     German    -0.3322 vs -0.5347
@@ -109,6 +110,7 @@ impl Vocab {
     ///     Japanese  -0.2348 vs -0.2346
     ///     Chinese   -0.1993 vs -0.1987
     ///     all 124   -0.2570 vs -0.4301      (one star per word wins 91)
+    /// ```
     ///
     /// The gap is exactly where the mechanism says it should be: large on
     /// scripts that space their words, nil on the ones that do not, where a
@@ -126,45 +128,83 @@ impl Vocab {
     /// `word_id`, which the tokenizer assigns per whitespace-delimited word and
     /// which is correct for every script. Reading boundaries off the stars
     /// instead put the whole English transcript into one cue.
-    /// [`tokenise_with_stars`], plus the source word index of every target.
+    /// The source word index of every target, plus the index in `text` of the
+    /// character each one came from.
+    ///
+    /// The character index is what lets a character the vocabulary has no id
+    /// for be put BACK into the output afterwards. The aligner exists to time
+    /// text, not to edit it: dropping an unknown character silently rewrites
+    /// the transcript, and the subtitle ends up saying something the speaker
+    /// did not. See [`crate::align_inference::fill_unaligned_characters`].
+    ///
+    /// A `<star>` has no source character and is recorded as [`usize::MAX`].
     pub fn tokenise_with_word_ids(
         &self,
         text: &str,
-    ) -> (Vec<usize>, Vec<String>, Vec<usize>) {
+    ) -> (Vec<usize>, Vec<String>, Vec<usize>, Vec<usize>) {
         let mut ids: Vec<usize> = Vec::new();
         let mut pieces: Vec<String> = Vec::new();
         let mut word_ids: Vec<usize> = Vec::new();
+        let mut src: Vec<usize> = Vec::new();
         let star = self.star_id;
         let push_star = |ids: &mut Vec<usize>, pieces: &mut Vec<String>,
-                             word_ids: &mut Vec<usize>, w: usize| {
+                             word_ids: &mut Vec<usize>, src: &mut Vec<usize>,
+                             w: usize, star: usize| {
             ids.push(star);
             pieces.push("<star>".to_string());
             word_ids.push(w);
+            src.push(usize::MAX);
         };
         // a leading star belongs to no word; use a sentinel nothing else takes
-        push_star(&mut ids, &mut pieces, &mut word_ids, usize::MAX);
+        push_star(&mut ids, &mut pieces, &mut word_ids, &mut src, usize::MAX, star);
         let mut wi = 0usize;
-        for w in text.split_whitespace() {
-            let letters: Vec<(usize, String)> = w.chars().filter_map(|c| {
-                let id = *self.char_to_id.get(&c)?;
-                if id == self.unk_id { None } else { Some((id, c.to_string())) }
-            }).collect();
-            // the id counts only words that survive tokenisation: a word the
-            // vocabulary dropped entirely must not leave a hole in the numbering,
-            // or the ids would not be consecutive and the boundary would fall
-            // in the wrong place.
-            if letters.is_empty() { continue; }
-            if wi > 0 {
-                push_star(&mut ids, &mut pieces, &mut word_ids, wi);
+        // Words are the maximal runs of non-whitespace. Each character is
+        // matched against the vocabulary here, so a word the vocabulary dropped
+        // entirely contributes nothing -- and the word counter must skip it, or
+        // the ids would not be consecutive and the boundary would fall in the
+        // wrong place. Its characters are recovered afterwards from `text`.
+        let mut word: Vec<(usize, char)> = Vec::new();
+        let take = |word: &mut Vec<(usize, char)>,
+                        wi: &mut usize,
+                        ids: &mut Vec<usize>,
+                        pieces: &mut Vec<String>,
+                        word_ids: &mut Vec<usize>,
+                        src: &mut Vec<usize>| {
+            let letters: Vec<(usize, String, usize)> = word
+                .iter()
+                .filter_map(|(at, c)| match self.char_to_id.get(c) {
+                    Some(&id) if id != self.unk_id => Some((id, c.to_string(), *at)),
+                    _ => None,
+                })
+                .collect();
+            if letters.is_empty() {
+                return;
             }
-            wi += 1;
-            for (id, c) in letters {
+            if *wi > 0 {
+                push_star(ids, pieces, word_ids, src, *wi, star);
+            }
+            *wi += 1;
+            for (id, c, at) in letters {
                 ids.push(id);
                 pieces.push(c);
-                word_ids.push(wi);
+                word_ids.push(*wi);
+                src.push(at);
+            }
+        };
+        for (at, ch) in text.char_indices() {
+            if ch.is_whitespace() {
+                if !word.is_empty() {
+                    take(&mut word, &mut wi, &mut ids, &mut pieces, &mut word_ids, &mut src);
+                    word.clear();
+                }
+            } else {
+                word.push((at, ch));
             }
         }
-        (ids, pieces, word_ids)
+        if !word.is_empty() {
+            take(&mut word, &mut wi, &mut ids, &mut pieces, &mut word_ids, &mut src);
+        }
+        (ids, pieces, word_ids, src)
     }
 
     pub fn tokenise_with_stars(&self, text: &str) -> (Vec<usize>, Vec<String>) {
