@@ -29,7 +29,12 @@ usage: align --audio <wav> (--text <text|file>) [options]
   --window <sec>           memory/throughput only; it does not move timestamps (default: 30)
   --context <sec>          encoder context each side of a window, at least 1.3 (default: 2)
   --device <spec>          one device: auto (default, cpu if no gpu), cpu, vulkan[:i], dx12[:i], #n, or a name substring
-  --format <json|srt>     json is the full alignment (default); srt is subtitles
+  --format <json|srt|ass>
+                           json is the full alignment (default); srt is subtitles,
+                           ass is karaoke (one sweep per character)
+  --ass-res <WxH>          ass only: the VIDEO's resolution (default 1920x1080).
+                           The aligner only sees a waveform and cannot know it
+  --ass-font <name>        ass only: font family (default Malgun Gothic); size is fixed at 64
   --output <path>          write here (default: print to stdout)
   --list-devices           list wgpu adapters and exit
 ";
@@ -43,6 +48,8 @@ fn main() -> Result<()> {
     let mut device = String::from("auto");
     let mut format = String::from("json");
     let mut output: Option<PathBuf> = None;
+    let mut karaoke_font: Option<String> = None;
+    let mut ass_res: Option<String> = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -67,6 +74,8 @@ fn main() -> Result<()> {
             }
             "--format" => format = it.next().context("--format needs a value")?,
             "--device" => device = it.next().context("--device needs a value")?,
+            "--ass-font" => karaoke_font = Some(it.next().context("--ass-font needs a value")?),
+            "--ass-res" => ass_res = Some(it.next().context("--ass-res needs a value")?),
             "--output" | "-o" => {
                 output = Some(PathBuf::from(it.next().context("--output needs a value")?))
             }
@@ -104,7 +113,26 @@ fn main() -> Result<()> {
     let out = aligner.align(&audio, &text, window, context)?;
     let rtfx = out.duration / (out.encode_s + out.align_s).max(1e-9);
 
-    let body = render(&out, &format)?;
+    // The karaoke style carries only what a user might genuinely need to
+    // change; everything else has a default that reads on normal footage.
+    let mut karaoke = views::KaraokeStyle {
+        title: output
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Karaoke".to_string()),
+        ..views::KaraokeStyle::default()
+    };
+    if let Some(f) = karaoke_font {
+        karaoke.font = f;
+    }
+    if let Some(res) = &ass_res {
+        let mut it = res.splitn(2, 'x');
+        let w: i64 = it.next().and_then(|s| s.trim().parse().ok()).context("--ass-res wants WxH, e.g. 1280x720")?;
+        let h: i64 = it.next().and_then(|s| s.trim().parse().ok()).context("--ass-res wants WxH, e.g. 1280x720")?;
+        karaoke.set_play_res(w, h);
+    }
+    let body = render(&out, &format, &karaoke)?;
     match &output {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -117,10 +145,12 @@ fn main() -> Result<()> {
         None => println!("{body}"),
     }
     eprintln!(
-        "{}: {:.2}s audio, {} chars | encode {:.3}s, align {:.3}s, RTFx {:.1}x | load {:.1}s | {}{}",
+        "{}: {:.2}s audio, {} tokens | encode {:.3}s, align {:.3}s, RTFx {:.1}x | load {:.1}s | {}{}",
         audio.display(),
         out.duration,
-        out.chars.len(),
+        // the transcript's characters, which is what the JSON's `tokens` array
+        // holds; the `<star>` targets are not part of it
+        out.tokens.iter().filter(|t| t.piece != "<star>").count(),
         out.encode_s,
         out.align_s,
         rtfx,
@@ -134,11 +164,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn render(out: &AlignOutput, format: &str) -> Result<String> {
+fn render(out: &AlignOutput, format: &str, karaoke: &views::KaraokeStyle) -> Result<String> {
     match format {
-        "json" => Ok(serde_json::to_string_pretty(out)?),
+        // Compact, not pretty. This is a machine-read format and a 73-minute
+        // Japanese transcript spent 6.1 MB of its 16.4 on indentation alone --
+        // 37% of the file, saying nothing. An editor can re-indent it.
+        "json" => Ok(serde_json::to_string(out)?),
         "srt" => Ok(views::cues_to_srt(&views::build_cues(&out.tokens))),
-        other => anyhow::bail!("unknown --format {other:?}; expected json or srt"),
+        "ass" => {
+            let doc = views::build_cues(&out.tokens);
+            Ok(views::cues_to_karaoke(&doc, &out.tokens, karaoke))
+        }
+        other => anyhow::bail!("unknown --format {other:?}; expected json, srt, or ass"),
     }
 }
 

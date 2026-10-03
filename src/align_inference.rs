@@ -17,7 +17,6 @@ use crate::viterbi::{
     ctc_forced_align_gathered_with_word_ids,
     Emissions, GatheredChunks, TokenAlignment,
 };
-use crate::views::skipped_chars;
 use crate::vocab::Vocab;
 use crate::wav2vec2::{LmHeadCpu, Model};
 use crate::wav2vec2_gpu::GpuModel;
@@ -66,48 +65,271 @@ pub struct Aligner {
     pub blank_id: usize,
 }
 
-/// One output JSON, mirroring `omni_align.cli.to_json_obj` field for field.
+/// One alignment, as JSON: the transcript, and where in the audio it is said.
+///
+/// Three things, all at the top level and none inside another:
+/// `text` is the transcript, `tokens` is where each unit of it is said, and
+/// `segments` is the same thing read a sentence at a time. None of them points
+/// at another, so a consumer who only wants timings reads one array and stops,
+/// and one who wants sentences reads the other. Carrying the intermediate
+/// views as well -- words, subtitle cues, a gapless timeline -- made the file
+/// 39% larger and added copies of every character to keep in step.
 #[derive(serde::Serialize)]
 pub struct AlignOutput {
     pub audio: String,
+    /// The transcript as given, unchanged. Every character of it is in
+    /// `tokens`, in this order.
     pub text: String,
     pub duration: f64,
     pub frames: usize,
     pub frame_rate: f64,
     pub mean_frame_score: f64,
     pub log_prob: f64,
-    /// Transcript characters the vocabulary dropped, in order.
-    pub skipped: Vec<String>,
-    pub chars: Vec<serde_json::Value>,
-    pub words: Vec<serde_json::Value>,
+    /// Whole sentences, each a `text` with a `start` and an `end`, cut at the
+    /// transcript's own sentence-final punctuation.
+    ///
+    /// Readable, and derived from `tokens` -- a consumer whose idea of a
+    /// sentence differs groups them again themselves.
     pub segments: Vec<serde_json::Value>,
-    /// The same transcript as `words`/`segments` but with the leading and
-    /// trailing silence folded in, so the spans tile the whole file and no
-    /// stretch of audio belongs to nobody. Granularity is chosen from the
-    /// transcript, not asked for.
-    pub spans: Vec<serde_json::Value>,
-    /// The same line-breaking the SRT writer uses -- sentence ends, pause and
-    /// duration costs, the width budget -- as data. `--format srt` renders
-    /// exactly these, so exposing them as a field rather than a second format
-    /// means one computation, one set of numbers, and no way for the two to
-    /// disagree.
-    pub cues: Vec<serde_json::Value>,
     /// Encoder time. Omitted from JSON so the schema stays the Python one.
     #[serde(skip)]
     pub encode_s: f64,
     /// Viterbi time. Omitted from JSON for the same reason.
     #[serde(skip)]
     pub align_s: f64,
-    /// Tight character alignments. Not serialized; `chars` is the JSON form.
-    #[serde(skip)]
+    /// The alignment itself, one entry per CTC target.
+    ///
+    /// In JSON this is not one row per target but one row per TIMED UNIT, and
+    /// the unit is decided per word with no language table: a whole word where
+    /// the script spaces its words, a single character where it does not. A
+    /// mixed transcript gets both, in the same file. See
+    /// [`serialize_token_rows`].
+    #[serde(serialize_with = "serialize_token_rows")]
     pub tokens: Vec<TokenAlignment>,
-    /// Winning-label log-prob per frame, including blanks. Used by spans.
+    /// Winning-label log-prob per frame, including blanks. Diagnostic only —
+    /// `mean_frame_score` is the part worth reading.
     #[serde(skip)]
     pub frame_scores: Vec<f64>,
     /// Per-frame trellis state (even = blank, odd = token), the path the
     /// blank runs are cut from. Diagnostic only — not serialised.
     #[serde(skip)]
     pub frame_path: Vec<i32>,
+}
+
+/// The JSON form of [`AlignOutput::tokens`]: one row per timed unit.
+///
+/// A unit is a word, and which kind of word is decided per word with no
+/// language table: where the script spaces its words a row is the whole word,
+/// and where it does not a row is a single character -- a Chinese "word" is a
+/// whole sentence, and the test applies inside it. A transcript with both gets
+/// both, which is the point of deciding it per word rather than per file.
+///
+/// The `<star>` targets the tokenizer puts between words are not rows: they are
+/// DP anchors rather than transcript text, they carry a constant score, and a
+/// `<star>` printed into a subtitle is a bug.
+///
+/// Nothing else is written. `duration` is `end - start`, `mid` is
+/// `(start + end) / 2`, a row's position is its index in the array, the frame
+/// numbers are `start * frame_rate`, and `token_id` is a raw vocabulary index
+/// whose only useful question -- was this measured? -- is what `inferred`
+/// answers.
+fn serialize_token_rows<S: serde::Serializer>(
+    tokens: &[TokenAlignment],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let words = build_words(tokens);
+    let mut seq = s.serialize_seq(Some(words.len()))?;
+    for w in &words {
+        let span = &tokens[w.char_start..=w.char_end];
+        let measured: Vec<&TokenAlignment> = span.iter().filter(|t| !t.inferred).collect();
+        seq.serialize_element(&serde_json::json!({
+            "text": w.text,
+            "start": r4(w.start),
+            "end": r4(w.end),
+            // the transcript had whitespace in front of this unit. Without it
+            // the rows cannot be rendered back into the text they came from,
+            // and the obvious guess -- join with spaces -- is what put a space
+            // between every character of a Japanese or Chinese sentence.
+            "space_before": w.space_before,
+            // the mean per-frame log-probability of the characters that were
+            // measured, and `null` when none of them was. A zero would not do:
+            // an interpolated character carries no score, and a log-prob of 0
+            // is a probability of 1 -- the best possible confidence, said about
+            // the one row that has no evidence at all.
+            "score": match measured.is_empty() {
+                true => serde_json::Value::Null,
+                false => {
+                    let mean = measured.iter().map(|t| t.score).sum::<f64>() / measured.len() as f64;
+                    serde_json::json!(r4(mean))
+                }
+            },
+            // the vocabulary had no target for at least one character of this
+            // unit, so part of its span is the midpoint of what the neighbours
+            // leave open rather than something measured
+            "inferred": span.iter().any(|t| t.inferred),
+        }))?;
+    }
+    seq.end()
+}
+
+/// Put back the transcript characters the vocabulary had no target for.
+///
+/// The aligner exists to put times on a transcript, not to edit one. A
+/// character outside the checkpoint's vocabulary has no CTC target, so it never
+/// reaches the DP -- and if it is simply left out, the subtitle goes on saying
+/// something the speaker did not. A 3,793-character Chinese transcript that
+/// mentions 悍 four times would ship a subtitle with the word mangled, and the
+/// only trace would be a flag on a character nobody was looking for.
+///
+/// The span is not a guess dressed up as a measurement. Forced alignment is a
+/// monotone path, so a character sitting between two placed ones MUST fall
+/// between them; the midpoint is the only value available without more
+/// evidence, and it satisfies that constraint exactly. [`TokenAlignment::inferred`]
+/// records that nothing was measured, so a consumer can tell the two apart.
+///
+/// This runs AFTER the DP, so the alignment is untouched: no target, no cost,
+/// and no change to any character that had one. A run of unplaced characters
+/// takes the word id of the placed character that closes its word, so `贅沢`
+/// stays one word even though `贅` is the character with no target; a run the
+/// source closed with whitespace is a whole word the vocabulary dropped, and it
+/// keeps an id of its own so that it does not glue itself onto the next one.
+fn fill_unaligned_characters(
+    tokens: &[TokenAlignment],
+    text: &str,
+    src: &[usize],
+    frame_rate: f64,
+    duration: f64,
+) -> Vec<TokenAlignment> {
+    let star = |t: &TokenAlignment| t.piece == "<star>";
+    let mut placed: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(src.len());
+    let mut t = 0usize;
+    for &at in src {
+        while t < tokens.len() && star(&tokens[t]) {
+            t += 1;
+        }
+        if at != usize::MAX && t < tokens.len() {
+            placed.entry(at).or_insert(t);
+            t += 1;
+        }
+    }
+
+    let mut out: Vec<TokenAlignment> = Vec::with_capacity(tokens.len() + 8);
+    // the last placed token, and the next one, as indices into `tokens`
+    let mut prev: Option<&TokenAlignment> = None;
+    let mut next = 0usize;
+    // unplaced characters waiting for a right-hand bound
+    let mut gap: Vec<(char, bool)> = Vec::new();  // (character, starts a word)
+    // Ids for the words the vocabulary dropped whole, which have to be ones no
+    // real word holds. The leading star's `usize::MAX` is a sentinel saying
+    // "belongs to no word", not an id, and taking the maximum over it wrapped
+    // the counter to 0 in a release build -- so a dropped word was handed the
+    // first real word's id and fused with it, and a debug build panicked on the
+    // overflow instead of showing it.
+    let mut next_synthetic_word = tokens
+        .iter()
+        .filter(|t| t.word_id != usize::MAX)
+        .map(|t| t.word_id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut after_space = true;
+
+    let mut flush = |gap: &mut Vec<(char, bool)>, prev: Option<&TokenAlignment>,
+                     upto: Option<&TokenAlignment>, out: &mut Vec<TokenAlignment>| {
+        if gap.is_empty() {
+            return;
+        }
+        // The monotone constraint: everything in the gap lies between prev's
+        // end and the next placed character's start.
+        //
+        // That upper bound is the next character's START, never prev's end.
+        // The midpoint rule pads a token's end forward to the middle of the
+        // pause, so a neighbour can start BEFORE that padded end -- measured:
+        // `拉` ends at frame 3575 and `就` starts at 3575, with a two-character
+        // run between them. Splitting [next.start, prev.end] between those two
+        // put the second one's start a frame past `就`, and the sequence ran
+        // backwards. Capping at the next onset costs a degenerate span in that
+        // case and nothing at all when there is room.
+        let (lo, hi) = match (prev, upto) {
+            (Some(p), Some(n)) => (p.end.min(n.start), n.start),
+            (Some(p), None) => (p.end, duration),
+            (None, Some(n)) => (0.0, n.start),
+            (None, None) => (0.0, duration),
+        };
+        let n = gap.len() as f64;
+        let run: Vec<(char, bool)> = std::mem::take(gap);
+        // The word a character belongs to is the word it was WRITTEN in, and the
+        // only way to know that is to look at what closes it. A run that ends at
+        // a placed character with no whitespace in between is inside that
+        // character's word and takes its id -- `贅沢` is one word even though
+        // `贅` had no target and `沢` did, and giving `贅` an id of its own
+        // split the word in two and printed a space the transcript does not
+        // have. A run the source closed with whitespace is a word the
+        // vocabulary dropped whole, and it keeps an id of its own so that it
+        // does not fuse with the word after it.
+        let mut word = prev.map(|p| p.word_id);
+        for (i, (ch, starts_word)) in run.iter().enumerate() {
+            if *starts_word {
+                let closed_by_next = upto.is_some() && !run[i + 1..].iter().any(|(_, s)| *s);
+                word = if closed_by_next {
+                    upto.map(|n| n.word_id)
+                } else {
+                    let id = next_synthetic_word;
+                    next_synthetic_word += 1;
+                    Some(id)
+                };
+            }
+            // split the available interval evenly across the run
+            let a = lo + (hi - lo) * (i as f64 / n);
+            let b = lo + (hi - lo) * ((i as f64 + 1.0) / n);
+            let frame = (a * frame_rate).round() as i64;
+            out.push(TokenAlignment {
+                index: out.len(),
+                token_id: usize::MAX,
+                piece: ch.to_string(),
+                word_id: word.unwrap_or(next_synthetic_word),
+                start: a,
+                end: b,
+                start_frame: frame,
+                end_frame: frame,
+                score: 0.0,
+                inferred: true,
+            });
+        }
+    };
+
+    for (at, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            after_space = true;
+            continue;
+        }
+        let starts_word = after_space;
+        after_space = false;
+        match placed.get(&at).copied() {
+            Some(ti) => {
+                while next < ti {
+                    out.push(tokens[next].clone());
+                    next += 1;
+                }
+                flush(&mut gap, prev, Some(&tokens[ti]), &mut out);
+                out.push(tokens[ti].clone());
+                prev = Some(&tokens[ti]);
+                next = ti + 1;
+            }
+            None => gap.push((ch, starts_word)),
+        }
+    }
+    while next < tokens.len() {
+        out.push(tokens[next].clone());
+        next += 1;
+    }
+    flush(&mut gap, prev, None, &mut out);
+    for (i, tok) in out.iter_mut().enumerate() {
+        tok.index = i;
+    }
+    out
 }
 
 fn r4(x: f64) -> f64 {
@@ -254,7 +476,7 @@ impl Aligner {
         // a real CTC target, so the DP places it and it consumes frames, which
         // is what the blank runs -- and therefore every word boundary -- are
         // measured against.
-        let (ids, pieces, word_ids) = self.vocab.tokenise_with_word_ids(&text);
+        let (ids, pieces, word_ids, src) = self.vocab.tokenise_with_word_ids(&text);
         if ids.is_empty() {
             anyhow::bail!("no in-vocabulary characters in the transcript");
         }
@@ -335,49 +557,19 @@ impl Aligner {
         }
 
         fix_timestamp(&mut res.tokens);
-        let words = build_words(&res.tokens);
-        let segments = build_segments(&res.tokens, &words);
-        let skipped = skipped_chars(&text, &pieces);
-        let chars: Vec<serde_json::Value> = res
-            .tokens
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "index": t.index,
-                    "token_id": t.token_id,
-                    "piece": t.piece,
-                    "start": r4(t.start),
-                    "end": r4(t.end),
-                    "mid": r4(t.mid()),
-                    "duration": r4(t.duration()),
-                    "start_frame": t.start_frame,
-                    "end_frame": t.end_frame,
-                    "score": r4(t.score),
-                })
-            })
-            .collect();
-
-        let spans = crate::views::build_spans(
-            &text,
+        res.tokens = fill_unaligned_characters(
             &res.tokens,
-            res.frames,
-            res.frame_rate,
-            &res.frame_scores,
-            crate::views::auto_split(&text),
+            &text,
+            &src,
+            self.frame_rate,
+            duration,
         );
-        let cues = crate::views::build_cues(&res.tokens);
-        let cue_rows: Vec<serde_json::Value> = cues
-            .cues
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "index": c.index,
-                    "start": c.start,
-                    "end": c.end,
-                    "text": c.text,
-                })
-            })
-            .collect();
+        // `segments` is a reading of `tokens`, cut at the transcript's own
+        // sentence-final punctuation, and a consumer whose idea of a sentence
+        // differs groups them again themselves. It carries no index into
+        // `tokens`: a row that has to be joined up to mean anything is not
+        // parallel to one that does not.
+        let segments = build_segments(&res.tokens, &build_words(&res.tokens));
 
         Ok(AlignOutput {
             audio: audio_path.display().to_string(),
@@ -387,50 +579,19 @@ impl Aligner {
             frame_rate: res.frame_rate,
             mean_frame_score: r4(res.mean_frame_score()),
             log_prob: r4(res.log_prob),
-            skipped,
-            chars,
-            words: words
-                .iter()
-                .map(|w| {
-                    serde_json::json!({
-                        "index": w.index,
-                        "text": w.text,
-                        "start": r4(w.start),
-                        "end": r4(w.end),
-                        "duration": r4(w.duration()),
-                        "char_start": w.char_start,
-                        "char_end": w.char_end,
-                    })
-                })
-                .collect(),
             segments: segments
                 .iter()
                 .map(|s| {
                     serde_json::json!({
-                        "index": s.index,
                         "text": s.text,
                         "start": r4(s.start),
                         "end": r4(s.end),
-                        "duration": r4(s.end - s.start),
-                        "words": s.words,
                     })
                 })
                 .collect(),
-            spans: spans
-                .iter()
-                .map(|s| {
-                serde_json::json!({
-                    "start": s.start,
-                    "end": s.end,
-                    "text": s.text,
-                    "score": s.score,
-                })
-            })
-            .collect(),
-            cues: cue_rows,
+            tokens: std::mem::take(&mut res.tokens),
             encode_s,
             align_s,
-            tokens: res.tokens,
             frame_scores: res.frame_scores,
             frame_path: res.frame_path.unwrap_or_default(),
         })
@@ -1328,6 +1489,149 @@ impl Emissions for LazyEmissions<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of putting a timestamp on text: the text must come out
+    /// the other side untouched.
+    ///
+    /// Every property below is one way this has actually broken. A character
+    /// the vocabulary had no target for went missing; a cue boundary handed one
+    /// character to two cues and printed it twice; and an interpolated run split
+    /// across a shared frame came out with a start later than the placed
+    /// character that follows it, so the sequence ran backwards.
+    #[test]
+    fn unaligned_characters_are_restored_without_reordering() {
+        // "拉蔻就" -- 蔻 is not in the vocabulary, and the neighbours share a
+        // frame, which is the case that produced an inverted start.
+        let text = "拉蔻就";
+        let mut toks: Vec<TokenAlignment> = Vec::new();
+        // 拉 spans 71.500..71.520 (padded forward past 就's onset),
+        // 就 spans 71.500..71.620. 蔻 has no target at all.
+        for (i, (piece, sf, ef)) in
+            [("拉", 3548u64, 3575u64), ("就", 3575u64, 3580u64)].iter().enumerate()
+        {
+            toks.push(TokenAlignment {
+                index: i,
+                token_id: 7 + i,
+                piece: piece.to_string(),
+                word_id: 0,
+                start: *sf as f64 * 0.02,
+                end: *ef as f64 * 0.02 + 0.02,
+                start_frame: *sf as i64,
+                end_frame: *ef as i64,
+                score: -0.1,
+                inferred: false,
+            });
+        }
+        // `src[i]` is the byte offset in `text` of the character that target
+        // `i` came from, and `usize::MAX` marks a `<star>`, which has no
+        // character. One entry per target, so the two lists are parallel.
+        // These are BYTE offsets: every character here is three bytes of UTF-8,
+        // so 拉 is at 0 and 就 at 6, not at 2.
+        let src: Vec<usize> = vec![0, 6];
+        let out = fill_unaligned_characters(&toks, text, &src, 50.0, 4.0);
+
+        let got: String = out.iter().map(|t| t.piece.as_str()).collect();
+        assert_eq!(got, "拉蔻就", "the transcript comes back character for character");
+        assert!(out[1].inferred && !out[0].inferred && !out[2].inferred);
+
+        for w in out.windows(2) {
+            assert!(
+                w[1].start >= w[0].start - 1e-9,
+                "start ran backwards: {} ({}) then {} ({})",
+                w[0].piece, w[0].start, w[1].piece, w[1].start
+            );
+        }
+        // and the interpolated span may not reach past the character it precedes
+        assert!(out[1].end <= out[2].start + 1e-9, "interpolated span overran");
+    }
+
+    /// A character with no target at the START of a source word the rest of
+    /// which was placed belongs to that word, not to a new one.
+    ///
+    /// `贅沢` is one word: `贅` is outside the vocabulary and `沢` is not. The
+    /// star that opens the word is emitted while the tokenizer is still
+    /// counting it, so it lands between the two, carrying the PREVIOUS word's
+    /// id. Giving `贅` an id of its own and letting that star vote for a
+    /// boundary both split the word, and `words` printed `贅 沢。` -- a space
+    /// the transcript does not contain.
+    #[test]
+    fn a_missing_leading_character_joins_the_word_it_was_written_in() {
+        let text = "。 贅沢。";
+        let at: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+        // at == [0, 3, 4, 7, 10] for 。, the space, 贅, 沢, 。
+        let tok = |i: usize, piece: &str, word_id: usize, end: f64| TokenAlignment {
+            index: i,
+            token_id: 7 + i,
+            piece: piece.to_string(),
+            word_id,
+            start: end - 0.2,
+            end,
+            start_frame: (end * 50.0) as i64,
+            end_frame: (end * 50.0) as i64 + 9,
+            score: -0.1,
+            inferred: false,
+        };
+        // what the DP returned: the stars, then the three characters it had a
+        // target for
+        let toks = vec![
+            tok(0, "<star>", usize::MAX, 0.0),
+            tok(1, "。", 1, 0.2),
+            tok(2, "<star>", 1, 0.2),
+            tok(3, "沢", 2, 0.6),
+            tok(4, "。", 2, 0.8),
+        ];
+        let src = vec![usize::MAX, at[0], usize::MAX, at[3], at[4]];
+        let out = fill_unaligned_characters(&toks, text, &src, 50.0, 1.0);
+        let got: String = out.iter().map(|t| t.piece.as_str()).collect();
+        assert_eq!(got, "<star>。<star>贅沢。", "every character comes back once");
+        let zei = out.iter().position(|t| t.piece == "贅").unwrap();
+        let sawa = out.iter().position(|t| t.piece == "沢").unwrap();
+        assert_eq!(
+            out[zei].word_id, out[sawa].word_id,
+            "贅 was put in a word of its own, so 贅沢 renders as 贅 沢"
+        );
+        // and the two really are one word to `build_words`: `贅沢。` is a run of
+        // characters, so it is reported a character at a time -- except that the
+        // full stop rides in the character it follows, since a mark occupies no
+        // frames and would otherwise be a row that is only a point in time.
+        // One gap, the one the transcript has before `贅`.
+        let words = crate::spans::build_words(&out);
+        let rendered: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(rendered, ["。", "贅", "沢。"]);
+        let mut text_back = String::new();
+        for (i, w) in words.iter().enumerate() {
+            if i > 0 && w.space_before {
+                text_back.push(' ');
+            }
+            text_back.push_str(&w.text);
+        }
+        assert_eq!(text_back, "。 贅沢。", "the transcript is not the one we were given");
+    }
+
+    /// A whole word the vocabulary dropped keeps its own word id, or it would
+    /// render glued to the word before it.
+    #[test]
+    fn a_wholly_unalignable_word_stays_separate() {
+        let text = "好 野";
+        let toks = vec![TokenAlignment {
+            index: 0,
+            token_id: 7,
+            piece: "好".to_string(),
+            word_id: 1,
+            start: 0.0,
+            end: 0.2,
+            start_frame: 0,
+            end_frame: 9,
+            score: -0.1,
+            inferred: false,
+        }];
+        // only 好 has a target, at text offset 0; 野 was dropped whole
+        let src = vec![0];
+        let out = fill_unaligned_characters(&toks, text, &src, 50.0, 2.0);
+        let got: String = out.iter().map(|t| t.piece.as_str()).collect();
+        assert_eq!(got, "好野");
+        assert_ne!(out[1].word_id, out[0].word_id, "the missing word joined its neighbour");
+    }
 
     /// The GPU tower's hidden form: the stored rows are pre-lm-head, and
     /// `RowGather::Head` re-runs the host-side head per window.  The whole

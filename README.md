@@ -18,7 +18,7 @@ The goal is simple: given audio **and** its transcript, produce the start and en
 * 📦 Offline local inference
 * ⏱️ Character- and word-level start / end timestamps
 * 🗣️ Multilingual — whatever the checkpoint's vocabulary covers
-* 📄 JSON / spans / SRT / Cues output
+* 📄 JSON / SRT / ASS karaoke output
 * 🧩 CLI + Rust library
 
 ### Install
@@ -71,13 +71,30 @@ align --audio speech.wav --text transcript.txt --format srt --output out.srt
 | `--device <spec>` | `auto` (default, CPU when no GPU), `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring |
 | `--window <sec>` | Memory and throughput; **does not move timestamps** (default `30`). Capped near 90 s by the single-forward VRAM limit |
 | `--context <sec>` | Encoder overlap on each side of a window (default `2`, floor near 1.3 — it must cover the positional conv) |
-| `--format <json\|srt>` | `json` is the full alignment (default); `srt` is subtitles |
+| `--format <json\|srt\|ass>` | `json` is the full alignment (default); `srt` is subtitles; `ass` is karaoke, one sweep per character |
+| `--ass-res <WxH>` | `ass` only: the **video's** resolution (default `1920x1080`) — the aligner sees a waveform and cannot know it |
+| `--ass-font <name>` | `ass` only: font family (default `Malgun Gothic`); the size is fixed |
 | `--output <path>` | Write here (default: print to stdout) |
 | `--list-devices` | List the wgpu adapters usable on this machine |
 
 `--window` and `--context` were measured: across their legal range they move no timestamp metric (30/2 against 60/4 on the same material differ inside the noise on start MAE), and 60/4 encodes 47% slower. They are memory knobs, not accuracy knobs.
 
-`json` carries `chars` (per character, with frame indices and confidence), `words`, `segments`, `spans` (silence folded onto neighbours so the timeline is gapless) and `cues` (exactly the line breaking `--format srt` renders). `--format srt` is those cues as text, so the two cannot disagree.
+`json` is three things, all at the top level and none inside another:
+
+| field | what it is |
+|---|---|
+| `text` | the transcript, exactly as given |
+| `tokens` | where each **timed unit** is said: `text`, `start`, `end`, `space_before`, `score`, `inferred` |
+| `segments` | the same read a sentence at a time: `text`, `start`, `end` |
+
+A unit is a word, and which kind is decided **per word** with no language table: a whole word where the script spaces its words, a single character where it does not. A Chinese "word" is a whole sentence and the test applies inside it, so a mixed transcript gets both kinds in the same file. Where a script is cut per character, a **mark rides in the character it follows** — `は、` is one unit, not two — because a mark is snapped onto the preceding token's end and occupies no frames of its own, so a row that was only a mark was a point in time rather than a timing. On the 73-minute Japanese transcript that was 2,490 rows of 26,355 saying nothing; 4 remain, the marks the transcript put after a space, which open a word of their own.
+
+Two of the six fields are there so the row cannot lie:
+
+- **`space_before`** is the transcript's own whitespace in front of this unit, and it is what makes the rows renderable back into `text`. The obvious alternative — join the rows with spaces — is what put a space between every character of a Japanese sentence. On that transcript it is set on 1,780 rows, which is exactly the number of spaces in the source.
+- **`inferred`** marks a unit containing a character the vocabulary had no target for, so part of its span is the midpoint of what its neighbours leave open rather than something measured. The character is still in `text` and still in the row. **`score` is the mean over the characters that were measured, and `null` when none of them was** — an interpolated character has no score, and a log-probability of 0 is a probability of 1, which would be the best possible confidence said about the one row that has no evidence at all.
+
+Nothing points at anything else. A consumer who wants timings reads `tokens` and stops; one who wants sentences reads `segments` and regroups if their idea of a sentence differs. The subtitle line breaking is this program's opinion and lives in `--format srt` and `--format ass`, not in the alignment — carrying it as data too made the file 39% larger and added copies of every character to keep in step. `<star>` is not in the output at all: it is a DP anchor rather than transcript text, it carries a constant score, and a `<star>` printed into a subtitle is a bug.
 
 ### Library
 
@@ -113,11 +130,11 @@ The model's convolutional frontend subsamples by 320, so **timestamps land on a 
 
 Whether the output is per character or per word is decided **per word**, with no language table: a word whose characters are mostly CJK is split into characters, every other word is one unit the line-breaker cannot cut inside. So Korean and Japanese come out per character, Chinese likewise (a Chinese "word" is a whole sentence, and the test applies inside it), and English, Spanish and French per word.
 
-Characters outside the checkpoint's vocabulary are dropped, and listed in the `skipped` field of `json`.
+Characters outside the checkpoint's vocabulary have no CTC target and so never reach the DP, but they are **not** dropped from the output: a forced alignment is a monotone path, so a character written between two placed ones must fall between them, and it is placed at the midpoint of that interval with `inferred: true` to say so. A transcript that mentions a rare han character four times used to ship a subtitle missing all four, and the only trace was a line in a `skipped` list that nobody read. There is no such list now — the character is in `tokens` with the flag set, which is the same information without the risk of it reading as "this was thrown away". (That list was 96% spaces anyway: a space is a tokenizer separator and was never a target to begin with.)
 
 ### Deliberate departures from the reference
 
-The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that implementation was written for its own MMS checkpoint. The following five were changed **on measurement, on this checkpoint**. They are not bugs:
+The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that implementation was written for its own MMS checkpoint. The following eight were changed **on measurement, on this checkpoint**. They are not bugs:
 
 1. **One `<star>` per word, not the reference's `edges` placement (one at each end of the file).**
    A star is a DP anchor, not a word marker. This checkpoint's DP is under-constrained wherever the acoustic evidence is weak: two stars let the whole path slide, one per word does not. Over a 180-clip multilingual set — 124 of which pass a FireRedVAD / short-time-energy cross-check, since VAD alone misses most of the speech in some FLEURS English clips and believing it inverts the result:
@@ -144,8 +161,18 @@ The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that impl
 4. **The breaking unit is decided per word, not per file.**
    The old code asked once per file whether the text was Chinese; one Han character made the whole transcript Chinese, and `alignment` came out as `alignm` and `ent`.
 
-5. **`--format cues` is now a field of `json`.**
-   It was the same `build_cues()` call as `--format srt` with the numbers serialised as JSON, verified identical cue for cue. Two formats could only ever disagree with each other.
+5. **`json` is three parallel fields, and none of them is a second copy of the line breaking.**
+   It used to carry the cues as data too, so a consumer could see the subtitle line breaking without asking for the format — verified identical cue for cue, which is the one thing that argued for it. The cost was larger than the benefit: the file grew 39%, and every character of the transcript was written five times over, so five things had to stay in step. `--format srt` and `--format ass` are one `build_cues()` call either way, so they cannot disagree with each other, and a consumer who wants the cues as data can group `tokens` however it likes.
+
+6. **A word is a whitespace-delimited run of the transcript, punctuation included, and only `word_id` draws its boundary.**
+   The reference splits on `text.split()`, so a mark is a character of the word it was written in. Holding marks in a side buffer "so they join the word before them" emptied that buffer on the next letter, and dropped every `、` that was not the last character of its word: **1,116 marks gone** from a 26,552 character Japanese transcript, while the cue view — which has no such buffer — kept every one. The aligner exists to put times on a transcript, not to edit one.
+   A `<star>` is skipped, never treated as a boundary: the star that opens a word carries the id of the word *before* it, so a word whose first character had no target has its star in the middle of the word and the ids around it run backwards. `贅沢` came out as `贅 沢` — a space the transcript does not contain. `json` reports `space_before` per word, so `words` can be rendered back into the text it came from.
+
+7. **Characters with no target are interpolated back in, not dropped.**
+   See [Timestamp granularity](#timestamp-granularity). The reference drops them and reports them in a `skipped` list; here they get the midpoint of the interval their neighbours leave open and an `inferred` flag on the `tokens` row, so the subtitle says what the speaker said and the row is still there.
+
+8. **`--format ass` exists.**
+   The karaoke sweep is the same cue list with a `\k` duration per character, so it cannot disagree with the SRT. A gap in the transcript becomes a `\h` on the character it stands in front of, and none at the start of a line — the line break is already there, exactly as in the SRT. `WrapStyle: 0` and the play resolution come from `--ass-res`: the line breaking is libass's, and inserting `\N` here would hard-code a guess about the player's font fallback and safe area.
 
 ### Long audio
 

@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use rayon::prelude::*;
-use ctc_forced_aligner_wgpu::align_inference::{Aligner, BLANK_ID, FRAME_RATE};
+use ctc_forced_aligner_wgpu::align_inference::Aligner;
 use ctc_forced_aligner_wgpu::audio::{load_audio, znorm};
 use ctc_forced_aligner_wgpu::viterbi::ctc_forced_align;
 use ctc_forced_aligner_wgpu::wav2vec2::StageSet;
@@ -183,12 +183,15 @@ fn golden_stages_and_tokens() {
     let (ids, pieces) = aligner.vocab.tokenise(text);
     let vocab = aligner.config().vocab_size;
     let t_frames = log_probs.len() / vocab;
+    // the blank and the frame rate come from the checkpoint's own config, not
+    // from constants here: `pad_token_id` and `conv_stride`'s product
+    let (blank_id, frame_rate) = (aligner.blank_id, aligner.frame_rate);
 
     // gathered lm-head epilogue: the values the DP actually consumes.  The
     // fused path must agree with a gather from the full log_probs above to
     // within the GEMM's destination-add rounding.
     {
-        let expanded = ctc_forced_aligner_wgpu::viterbi::build_expanded_labels(&ids, BLANK_ID);
+        let expanded = ctc_forced_aligner_wgpu::viterbi::build_expanded_labels(&ids, blank_id);
         let (g, _) = model
             .forward_gathered_with(
                 &input,
@@ -268,8 +271,8 @@ fn golden_stages_and_tokens() {
         t_frames,
         vocab,
         &ids,
-        BLANK_ID,
-        FRAME_RATE,
+        blank_id,
+        frame_rate,
         Some(&pieces),
         false,
     )
@@ -468,7 +471,7 @@ fn gpu_golden_tokens() {
         let mut diffs = Vec::new();
         let mut same = 0usize;
         let mut speech = 0usize;
-        for (rust, py) in out.chars.iter().zip(py_chars) {
+        for (rust, py) in out.tokens.iter().zip(py_chars) {
             let piece = py["piece"].as_str().unwrap_or("");
             // fix_timestamp rewrites only non-speech marks. Letter and digit
             // frames stay on the raw Viterbi path.
@@ -480,7 +483,7 @@ fn gpu_golden_tokens() {
                 py["start_frame"].as_i64().unwrap(),
                 py["end_frame"].as_i64().unwrap(),
             );
-            let rf = (rust["start_frame"].as_i64().unwrap(), rust["end_frame"].as_i64().unwrap());
+            let rf = (rust.start_frame, rust.end_frame);
             if pf == rf {
                 same += 1;
             } else {
@@ -514,18 +517,15 @@ fn gpu_golden_tokens() {
                 })
         };
         let mut checked = 0usize;
-        for rust in out.chars.iter() {
-            let piece = rust["piece"].as_str().unwrap_or("");
+        for rust in out.tokens.iter() {
+            let piece = rust.piece.as_str();
             if !piece.chars().any(|c| c.is_alphanumeric()) {
                 continue;
             }
             let Some((ps, pe)) = py_by_piece(piece) else {
                 continue;
             };
-            let (rs, re) = (
-                rust["start_frame"].as_i64().unwrap(),
-                rust["end_frame"].as_i64().unwrap(),
-            );
+            let (rs, re) = (rust.start_frame, rust.end_frame);
             assert!(
                 rs <= ps && re >= pe,
                 "{piece}: gpu span {rs}..{re} does not contain reference {ps}..{pe}"
@@ -539,15 +539,20 @@ fn gpu_golden_tokens() {
     )
     .unwrap();
     let py_words = py["words"].as_array().unwrap().len();
-    if out.words.len() != py_words {
+    // `words` is no longer a field of the output; the golden comparison is
+    // against the reference's own segmentation, so build the same view here.
+    let our_words = ctc_forced_aligner_wgpu::spans::build_words(&out.tokens);
+    if our_words.len() != py_words {
         println!(
             "word count {py_words} in the reference vs {} here: expected, the \
              reference predates the apostrophe fix",
-            out.words.len()
+            our_words.len()
         );
     }
+    let our_segments =
+        ctc_forced_aligner_wgpu::spans::build_segments(&out.tokens, &our_words);
     assert_eq!(
-        out.segments.len(),
+        our_segments.len(),
         py["segments"].as_array().unwrap().len(),
         "segment count"
     );
