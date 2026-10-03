@@ -1201,6 +1201,9 @@ struct LazyEmissions<'a> {
     /// A set, not a list: `score_path` asks once per frame per window, and a
     /// linear scan over a few hundred stars is ~10^7 comparisons on an hour.
     star_cols: std::collections::HashSet<usize>,
+    /// the same states, ascending: the per-slice stamping walks them row by
+    /// row, and a sorted sweep keeps the writes inside one cached row
+    star_sorted: Vec<usize>,
 }
 
 impl<'a> LazyEmissions<'a> {
@@ -1220,6 +1223,11 @@ impl<'a> LazyEmissions<'a> {
             window_logits: std::cell::RefCell::new(None),
             norm: std::cell::RefCell::new(vec![0.0; frames]),
             star_cols: star_state_idx
+                .iter()
+                .copied()
+                .filter(|&i| i < blocks.num_states)
+                .collect(),
+            star_sorted: star_state_idx
                 .iter()
                 .copied()
                 .filter(|&i| i < blocks.num_states)
@@ -1310,10 +1318,15 @@ impl<'a> LazyEmissions<'a> {
             &mut norm[t0..t0 + rows],
         );
         // the star columns are the reference's appended zero column, not a real
-        // log-prob; `forward_gathered` stamps them once and the lazy forms have
-        // to match or the DP walks a different path (see `star_cols`).
-        for &c in &self.star_cols {
-            for row in out.chunks_exact_mut(s) {
+        // log-prob; the gathered value there is the blank's own log-prob, so
+        // every slice row is re-stamped with `CTC_STAR_SCORE`.  Row-major: a
+        // slice row is `s * 4` bytes and stays in cache while its ~50 k star
+        // cells are written; the old column-major loop walked all `rows` of a
+        // slice per star — every write a fresh cache line, ~16 M of them per
+        // slice on an hour's transcript, and it owned 2/3 of the DP's wall
+        // time.  `star_sorted` is already ascending.
+        for row in out.chunks_exact_mut(s) {
+            for &c in &self.star_sorted {
                 row[c] = CTC_STAR_SCORE;
             }
         }
@@ -1348,22 +1361,22 @@ impl<'a> LazyEmissions<'a> {
 }
 
 impl Emissions for LazyEmissions<'_> {
-    fn fill_emit(&self, t: usize, emit: &mut [f32], _token_ids: &[usize]) {
-        let s = self.blocks.num_states;
-        let (block, lo, _) = self.slice_at(t);
-        let r = t % self.blocks.frames_per_chunk - lo;
-        let row = &block[r * s..][..s];
-        emit.copy_from_slice(row);
-    }
-
-    /// The band `[lo, hi]` only — on an hour's trellis the mid-file band is
-    /// the whole row, but the two ramps shrink the copy with it.
-    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, _token_ids: &[usize]) {
+    fn with_emit(
+        &self,
+        t: usize,
+        _lo: usize,
+        _hi: usize,
+        _token_ids: &[usize],
+        f: impl FnOnce(&[f32]),
+    ) {
+        // the gathered slice row, lent to the DP in place — the old path
+        // copied it into a staging buffer, a full extra pass over the row on
+        // every frame of the DP
         let s = self.blocks.num_states;
         let (block, slice_lo, _) = self.slice_at(t);
         let r = t % self.blocks.frames_per_chunk - slice_lo;
         let row = &block[r * s..][..s];
-        emit[lo..=hi].copy_from_slice(&row[lo..=hi]);
+        f(row);
     }
 
     /// One column of `t`'s row.  The slice holding `t` has to have been

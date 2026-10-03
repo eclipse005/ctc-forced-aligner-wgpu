@@ -406,15 +406,22 @@ pub(crate) fn build_expanded_labels(token_ids: &[usize], blank_id: usize) -> Vec
 /// keeps the lm-head logits per window instead of the trellis and gathers the
 /// columns on demand ([`ctc_forced_align_emissions`]).
 pub(crate) trait Emissions {
-    /// Fill `emit[0..num_states]` with frame `t`'s state scores.
-    fn fill_emit(&self, t: usize, emit: &mut [f32], token_ids: &[usize]);
-    /// Fill `emit[lo..=hi]` — the band the banded DP reads.  The default
-    /// fills the whole row (of which the band is a subset); sources that pay
-    /// per-column work override it to touch the band only.
-    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, token_ids: &[usize]) {
-        let _ = (lo, hi);
-        self.fill_emit(t, emit, token_ids)
-    }
+    /// Run `f` once on frame `t`'s emission row — the full `S`-wide row,
+    /// borrowed in place from wherever the source holds it.  No staging copy:
+    /// on a long file the DP reads a row per frame, and routing that read
+    /// through a staging buffer costs a third of the DP's wall time.
+    ///
+    /// The banded DP reads only `[lo..=hi]` of the row; a source whose rows
+    /// are expensive to materialise in full may fill just that range and
+    /// leave the rest of the row it lends unspecified.
+    fn with_emit(
+        &self,
+        t: usize,
+        lo: usize,
+        hi: usize,
+        token_ids: &[usize],
+        f: impl FnOnce(&[f32]),
+    );
     /// Score of expanded state `st` at frame `t` (frame_scores, collapse).
     fn score(&self, t: usize, st: usize) -> f32;
     /// The path's per-frame scores, `out[t] = score(t, states[t])`.
@@ -431,8 +438,15 @@ pub(crate) trait Emissions {
 }
 
 impl<T: Emissions + ?Sized> Emissions for &T {
-    fn fill_emit(&self, t: usize, emit: &mut [f32], token_ids: &[usize]) {
-        (**self).fill_emit(t, emit, token_ids)
+    fn with_emit(
+        &self,
+        t: usize,
+        lo: usize,
+        hi: usize,
+        token_ids: &[usize],
+        f: impl FnOnce(&[f32]),
+    ) {
+        (**self).with_emit(t, lo, hi, token_ids, f)
     }
     fn score(&self, t: usize, st: usize) -> f32 {
         (**self).score(t, st)
@@ -449,27 +463,21 @@ struct FullRows<'a> {
 
 #[cfg(test)]
 impl Emissions for FullRows<'_> {
-    fn fill_emit(&self, t: usize, emit: &mut [f32], token_ids: &[usize]) {
+    fn with_emit(
+        &self,
+        t: usize,
+        _lo: usize,
+        _hi: usize,
+        token_ids: &[usize],
+        f: impl FnOnce(&[f32]),
+    ) {
+        // a mock: materialise the row, hand it over, drop it
         let row = &self.log_probs[t * self.vocab..(t + 1) * self.vocab];
-        emit.fill(row[self.blank_id]);
+        let mut buf = vec![row[self.blank_id]; self.labels.len()];
         for (i, &tok) in token_ids.iter().enumerate() {
-            emit[2 * i + 1] = row[tok];
+            buf[2 * i + 1] = row[tok];
         }
-    }
-    /// Banded: blank over the band, then the token states that fall inside
-    /// it — the same values the full row holds on `[lo, hi]`.
-    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, token_ids: &[usize]) {
-        let row = &self.log_probs[t * self.vocab..(t + 1) * self.vocab];
-        emit[lo..=hi].fill(row[self.blank_id]);
-        for (i, &tok) in token_ids.iter().enumerate() {
-            let st = 2 * i + 1;
-            if st > hi {
-                break;
-            }
-            if st >= lo {
-                emit[st] = row[tok];
-            }
-        }
+        f(&buf);
     }
     fn score(&self, t: usize, st: usize) -> f32 {
         self.log_probs[t * self.vocab + self.labels[st]]
@@ -484,14 +492,16 @@ struct GatheredRows<'a> {
 
 #[cfg(test)]
 impl Emissions for GatheredRows<'_> {
-    fn fill_emit(&self, t: usize, emit: &mut [f32], _token_ids: &[usize]) {
+    fn with_emit(
+        &self,
+        t: usize,
+        _lo: usize,
+        _hi: usize,
+        _token_ids: &[usize],
+        f: impl FnOnce(&[f32]),
+    ) {
         let row = &self.gathered[t * self.num_states..(t + 1) * self.num_states];
-        emit.copy_from_slice(row);
-    }
-    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, _token_ids: &[usize]) {
-        let s = self.num_states;
-        let row = &self.gathered[t * s..(t + 1) * s];
-        emit[lo..=hi].copy_from_slice(&row[lo..=hi]);
+        f(row);
     }
     fn score(&self, t: usize, st: usize) -> f32 {
         self.gathered[t * self.num_states + st]
@@ -550,15 +560,17 @@ impl GatheredChunks {
 }
 
 impl Emissions for GatheredChunks {
-    fn fill_emit(&self, t: usize, emit: &mut [f32], _token_ids: &[usize]) {
+    fn with_emit(
+        &self,
+        t: usize,
+        _lo: usize,
+        _hi: usize,
+        _token_ids: &[usize],
+        f: impl FnOnce(&[f32]),
+    ) {
         let s = self.num_states;
         let row = &self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s..(t % self.frames_per_chunk + 1) * s];
-        emit.copy_from_slice(row);
-    }
-    fn fill_emit_band(&self, t: usize, emit: &mut [f32], lo: usize, hi: usize, _token_ids: &[usize]) {
-        let s = self.num_states;
-        let row = &self.chunks[t / self.frames_per_chunk][t % self.frames_per_chunk * s..(t % self.frames_per_chunk + 1) * s];
-        emit[lo..=hi].copy_from_slice(&row[lo..=hi]);
+        f(row);
     }
     fn score(&self, t: usize, st: usize) -> f32 {
         let s = self.num_states;
@@ -666,7 +678,6 @@ struct Dp<'a, E: Emissions + ?Sized> {
     band: bool,
     /// all-ones lane => the skip arc is illegal (forced to -inf)
     skip_dead: Vec<u64>,
-    emit: Vec<f32>,
     prev: Vec<f64>,
     next: Vec<f64>,
 
@@ -710,7 +721,6 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
             t_len,
             band,
             skip_dead,
-            emit: vec![0.0f32; s],
             prev,
             next: vec![0.0f64; s],
 
@@ -749,48 +759,40 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
         let use_avx2 = false;
         for t in t0..t1 {
             let (lo, hi) = if self.band { self.band(t) } else { (0, self.s - 1) };
-            if self.band {
-                self.em
-                    .fill_emit_band(t, &mut self.emit, lo, hi, self.token_ids);
-            } else {
-                self.em.fill_emit(t, &mut self.emit, self.token_ids);
-            }
-            let row = match back.as_deref_mut() {
-                Some(buf) => {
-                    let at = (t - t0) * rb;
-                    Some(&mut buf[at..at + rb])
+            let mut row = back.as_deref_mut().map(|buf| &mut buf[(t - t0) * rb..]);
+            // the row is borrowed straight from the source -- the kernel runs
+            // inside the callback, so no per-frame staging copy happens
+            self.em.with_emit(t, lo, hi, self.token_ids, &mut |emit: &[f32]| {
+                if self.band {
+                    dp_row_range(
+                        &self.prev,
+                        emit,
+                        &self.skip_dead,
+                        &mut self.next,
+                        row.as_deref_mut(),
+                        lo,
+                        hi,
+                        use_avx2,
+                    );
+                    // frame t+1's kernel reads up to hi+2 (the states the band
+                    // grows into); what it sees there must be -inf, not the alpha
+                    // this buffer held two frames ago.  Below the band nothing
+                    // needs clearing: the lowest read at t+1 is exactly lo.
+                    let hi_next = (hi + 2).min(self.s - 1);
+                    for st in hi + 1..=hi_next {
+                        self.next[st] = f64::NEG_INFINITY;
+                    }
+                } else {
+                    dp_row_par(
+                        &self.prev,
+                        emit,
+                        &self.skip_dead,
+                        &mut self.next,
+                        row.as_deref_mut(),
+                        use_avx2,
+                    );
                 }
-                None => None,
-            };
-            if self.band {
-                dp_row_range(
-                    &self.prev,
-                    &self.emit,
-                    &self.skip_dead,
-                    &mut self.next,
-                    row,
-                    lo,
-                    hi,
-                    use_avx2,
-                );
-                // frame t+1's kernel reads up to hi+2 (the states the band
-                // grows into); what it sees there must be -inf, not the alpha
-                // this buffer held two frames ago.  Below the band nothing
-                // needs clearing: the lowest read at t+1 is exactly lo.
-                let hi_next = (hi + 2).min(self.s - 1);
-                for st in hi + 1..=hi_next {
-                    self.next[st] = f64::NEG_INFINITY;
-                }
-            } else {
-                dp_row_par(
-                    &self.prev,
-                    &self.emit,
-                    &self.skip_dead,
-                    &mut self.next,
-                    row,
-                    use_avx2,
-                );
-            }
+            });
             std::mem::swap(&mut self.prev, &mut self.next);
         }
     }
@@ -1375,14 +1377,14 @@ mod tests {
         );
     }
 
-    fn sample_row() -> (Vec<f64>, Vec<f64>, Vec<u64>) {
+    fn sample_row() -> (Vec<f64>, Vec<f32>, Vec<u64>) {
         let s = 17;
         let mut prev = vec![0.0; s];
-        let mut emit = vec![0.0; s];
+        let mut emit = vec![0.0f32; s];
         let mut skip_dead = vec![0u64; s];
         for i in 0..s {
             prev[i] = (i as f64) * 0.37 - 2.5;
-            emit[i] = -0.05 * (i as f64);
+            emit[i] = -0.05 * (i as f32);
         }
         // Ties and dead skips, including -inf lanes.
         prev[4] = prev[3];
