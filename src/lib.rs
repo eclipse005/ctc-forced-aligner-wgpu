@@ -23,10 +23,13 @@ pub mod alloc_stats;
 pub mod audio;
 pub mod config;
 pub mod gpu;
+pub mod render;
 pub mod resample_sinc;
 pub mod shaders;
 pub mod simd;
 pub mod spans;
+#[cfg(test)]
+mod testutil;
 pub mod timeline;
 pub mod viterbi;
 pub mod views;

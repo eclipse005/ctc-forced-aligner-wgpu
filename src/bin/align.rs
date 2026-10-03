@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ctc_forced_aligner_wgpu::align_inference::{AlignOutput, Aligner};
+use ctc_forced_aligner_wgpu::render::{ass, srt};
 use ctc_forced_aligner_wgpu::views;
 use ctc_forced_aligner_wgpu::DeviceSelector;
 
@@ -115,13 +116,13 @@ fn main() -> Result<()> {
 
     // The karaoke style carries only what a user might genuinely need to
     // change; everything else has a default that reads on normal footage.
-    let mut karaoke = views::KaraokeStyle {
+    let mut karaoke = ass::KaraokeStyle {
         title: output
             .as_ref()
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Karaoke".to_string()),
-        ..views::KaraokeStyle::default()
+        ..ass::KaraokeStyle::default()
     };
     if let Some(f) = karaoke_font {
         karaoke.font = f;
@@ -164,16 +165,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn render(out: &AlignOutput, format: &str, karaoke: &views::KaraokeStyle) -> Result<String> {
+fn render(out: &AlignOutput, format: &str, karaoke: &ass::KaraokeStyle) -> Result<String> {
     match format {
         // Compact, not pretty. This is a machine-read format and a 73-minute
         // Japanese transcript spent 6.1 MB of its 16.4 on indentation alone --
         // 37% of the file, saying nothing. An editor can re-indent it.
         "json" => Ok(serde_json::to_string(out)?),
-        "srt" => Ok(views::cues_to_srt(&views::build_cues(&out.tokens))),
+        "srt" => Ok(srt::cues_to_srt(&views::build_cues(&out.tokens))),
         "ass" => {
             let doc = views::build_cues(&out.tokens);
-            Ok(views::cues_to_karaoke(&doc, &out.tokens, karaoke))
+            Ok(ass::cues_to_karaoke(&doc, &out.tokens, karaoke))
         }
         other => anyhow::bail!("unknown --format {other:?}; expected json, srt, or ass"),
     }
