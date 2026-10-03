@@ -516,7 +516,8 @@ impl GpuModel {
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
-        self.forward_impl(input, None, false, None, &[])
+        let p = self.forward_begin(input, None, false, None, &[], None)?;
+        self.collect(p)
     }
 
     /// Same forward, but instead of the whole (T, V) log-prob matrix only
@@ -534,7 +535,43 @@ impl GpuModel {
         keep: Option<(usize, usize)>,
         stars: &[u32],
     ) -> Result<Vec<f32>> {
-        self.forward_impl(input, Some(expanded), false, keep, stars)
+        let p = self.forward_begin(input, Some(expanded), false, keep, stars, None)?;
+        self.collect(p)
+    }
+
+    /// Pipelined [`forward_gathered`]: submit the compute and return
+    /// immediately; the caller collects the previous chunk's result while
+    /// this one computes. `prev` is that previous pending — its staging
+    /// copies are enqueued here, ahead of this chunk's compute, because this
+    /// chunk's dispatches are what overwrite the result buffers.
+    pub fn forward_gathered_begin(
+        &self,
+        input: &[f32],
+        expanded: &[u32],
+        keep: Option<(usize, usize)>,
+        stars: &[u32],
+        prev: Option<&mut GpuPending>,
+    ) -> Result<GpuPending> {
+        self.forward_begin(input, Some(expanded), false, keep, stars, prev)
+    }
+
+    /// Pipelined [`forward_hidden`] — see [`GpuModel::forward_gathered_begin`].
+    pub fn forward_hidden_begin(
+        &self,
+        input: &[f32],
+        prev: Option<&mut GpuPending>,
+    ) -> Result<GpuPending> {
+        self.forward_begin(input, None, true, None, &[], prev)
+    }
+
+    /// Pipelined full-logits [`forward`] — see
+    /// [`GpuModel::forward_gathered_begin`].
+    pub fn forward_logits_begin(
+        &self,
+        input: &[f32],
+        prev: Option<&mut GpuPending>,
+    ) -> Result<GpuPending> {
+        self.forward_begin(input, None, false, None, &[], prev)
     }
 
     /// Same forward, but the lm head and log-softmax never run: the host gets
@@ -543,7 +580,8 @@ impl GpuModel {
     /// ([`crate::wav2vec2::LmHeadCpu`]) when the DP needs trellis columns,
     /// which is what keeps a long transcript's emissions out of RAM.
     pub fn forward_hidden(&self, input: &[f32]) -> Result<Vec<f32>> {
-        self.forward_impl(input, None, true, None, &[])
+        let p = self.forward_begin(input, None, true, None, &[], None)?;
+        self.collect(p)
     }
 
     /// Columns per row of [`GpuModel::forward`]'s log-prob block.  The aligner
@@ -558,14 +596,16 @@ impl GpuModel {
         self.cfg.hidden_size
     }
 
-    fn forward_impl(
+    #[allow(clippy::too_many_arguments)]
+    fn forward_begin(
         &self,
         input: &[f32],
         gather: Option<&[u32]>,
         read_hidden: bool,
         keep: Option<(usize, usize)>,
         stars: &[u32],
-    ) -> Result<Vec<f32>> {
+        mut prev: Option<&mut GpuPending>,
+    ) -> Result<GpuPending> {
         let gpu = &self.gpu;
         // the GEMM pipelines were compiled with this tile; every grid below
         // must tile with the same numbers or part of the output is never
@@ -593,7 +633,7 @@ impl GpuModel {
                 "sequence of {t} frames is too long for one GPU forward; use --window 30"
             );
         }
-        let (x_in, convs, staging, cached, mut act, ubuf, gather_buf) = {
+        let (x_in, convs, cached, mut act, ubuf, gather_buf) = {
             let mut guard = self.scratch.lock().unwrap();
             let gathered = gather.is_some();
             let reuse = guard
@@ -636,20 +676,6 @@ impl GpuModel {
                     // every window, and the dispatch can then join the
                     // recorded graph instead of being re-recorded per call
                     gather_out: gather.map(|e| st("gather-out", t * e.len())),
-                    // the gathered readback never touches the MAP_READ staging;
-                    // a 34 s chunk's full staging is 70 MB of dead VRAM there
-                    staging: gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("logits-staging"),
-                        size: if gathered {
-                            16
-                        } else if read_hidden {
-                            f32s(t * hidden)
-                        } else {
-                            f32s(t * vocab)
-                        },
-                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }),
                     ubuf: gpu.uniform("dims", 4096 * UNIFORM_ALIGN),
                     jobs: Vec::new(),
                     uni: Vec::new(),
@@ -664,7 +690,6 @@ impl GpuModel {
             (
                 s.x_in.clone(),
                 s.convs.clone(),
-                s.staging.clone(),
                 cached,
                 ActSet {
                     x: s.x.clone(),
@@ -1105,6 +1130,15 @@ impl GpuModel {
         // Input and every uniform slot go out before the first command buffer.
         // The three layer-groups are queued back to back; each buffer stays
         // under the Windows TDR window, and one wait keeps the GPU busy.
+        // The window pipeline's hinge: the previous chunk's result buffers are
+        // scratch-resident and THIS chunk's dispatches are what overwrite them,
+        // so its device->host copies must be enqueued here, ahead of our
+        // compute. Arming the maps now means the map callbacks fire when those
+        // copies execute -- not when this chunk's compute does -- so the
+        // caller's collect() below overlaps our 500+ ms of compute.
+        if let Some(p) = prev.as_deref_mut() {
+            p.arm(&self.gpu)?;
+        }
         gpu.upload(&x_in, bytemuck::cast_slice(input));
         if let Some(expanded) = gather {
             gpu.upload(&self.labels, bytemuck::cast_slice(expanded));
@@ -1182,8 +1216,11 @@ impl GpuModel {
                 gpu.queue.submit([enc.finish()]);
             }
         }
+        // One non-blocking pump: submit-time validation is processed here, so
+        // the error scope's future resolves without waiting for the GPU. (The
+        // split path above already waited — its query readback blocks.)
         gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Poll)
             .map_err(|e| anyhow::anyhow!("poll: {e}"))?;
         if let Some(e) = pollster::block_on(guard.pop()) {
             anyhow::bail!("gpu validation: {e}");
@@ -1231,15 +1268,16 @@ impl GpuModel {
         }
         if prof {
             eprintln!(
-                "[fwd] T={t} replay {:.1} ms ({} batches, {} uniforms)",
+                "[fwd] T={t} submit {:.1} ms ({} batches, {} uniforms) — collecting in background",
                 t_replay.elapsed().as_secs_f64() * 1000.0,
                 batches.len(),
                 uni.len() / UNIFORM_ALIGN as usize
             );
         }
-        // One copy and one map. Chunked 8 MB maps were a driver workaround
-        // that cost a full poll per piece (~70 MB of logits).
-        if let Some(expanded) = gather {
+        // The result buffer, the rows the caller keeps, and the staging that
+        // the NEXT begin fills: from here the GPU computes while the host
+        // collects the previous chunk.
+        let (buffer, offset, floats) = if let Some(expanded) = gather {
             let states = expanded.len();
             // clamp to the rows this forward actually produced (the caller's
             // range is written for a full window; the last one may be short)
@@ -1249,18 +1287,17 @@ impl GpuModel {
                     (lo, hi.min(t).max(lo))
                 })
                 .unwrap_or((0, t));
-            return gpu.readback_f32(
-                gather_buf.as_ref().context("missing gather buffer")?,
+            (
+                gather_buf.as_ref().context("missing gather buffer")?.clone(),
                 (lo * states * 4) as u64,
-                ((hi - lo) * states) as u64,
-            );
-        }
-        // the hidden readback needs the buffer the recorded final LN wrote —
-        // `out_x` is saved when the graph is recorded (the local `act.x` it
-        // bound stops being valid the moment the call's swap sequence is
-        // skipped on a replay), so fetch the latest saved handle here rather
-        // than the call-start snapshot
-        let (rb_src, nbytes, out_len) = if read_hidden {
+                (hi - lo) * states,
+            )
+        } else if read_hidden {
+            // the hidden readback needs the buffer the recorded final LN
+            // wrote — `out_x` is saved when the graph is recorded (the local
+            // `act.x` it bound stops being valid the moment the call's swap
+            // sequence is skipped on a replay), so fetch the latest saved
+            // handle here rather than the call-start snapshot
             let out_x = self
                 .scratch
                 .lock()
@@ -1269,40 +1306,146 @@ impl GpuModel {
                 .context("scratch dropped before hidden readback")?
                 .out_x
                 .clone();
-            (out_x, f32s(t * hidden), t * hidden)
+            (out_x, 0, t * hidden)
         } else {
-            (act.logits.clone(), f32s(t * vocab), t * vocab)
+            (act.logits.clone(), 0, t * vocab)
         };
-        let t_rb = std::time::Instant::now();
-        {
-            let mut enc2 = gpu.device.create_command_encoder(&Default::default());
-            enc2.copy_buffer_to_buffer(&rb_src, 0, &staging, 0, nbytes);
-            gpu.queue.submit([enc2.finish()]);
+        Ok(GpuPending::new(&self.gpu, buffer, offset, floats))
+    }
+
+    /// Map a pending chunk's result back to the host.
+    ///
+    /// A pending whose staging copies were armed by the *next* chunk's begin
+    /// collects while the GPU still computes: the pump below waits only for
+    /// the copies' maps, which execute ahead of that compute. The last chunk
+    /// of a run arms itself here and waits for its own copy.
+    pub fn collect(&self, mut p: GpuPending) -> Result<Vec<f32>> {
+        let gpu = &self.gpu;
+        if p.armed.is_none() {
+            p.arm(gpu)?;
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| anyhow::anyhow!("poll for readback: {e}"))?;
         }
-        let t_copy = t_rb.elapsed();
-        let slice = staging.slice(..nbytes);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| anyhow::anyhow!("poll for readback: {e}"))?;
-        let t_poll = t_rb.elapsed();
-        rx.recv().context("map callback dropped")??;
-        let mapped = slice.get_mapped_range()?;
-        let mut out = vec![0.0f32; out_len];
-        out.copy_from_slice(bytemuck::cast_slice(&mapped));
-        drop(mapped);
-        staging.unmap();
-        if prof {
-            eprintln!("[fwd] T={t} readback: copy_submit {:?} poll {:?} map+memcpy {:?}", t_copy, t_poll, t_rb.elapsed());
+        let rxs = p.armed.take().context("pending maps already consumed")?;
+        // pump until every piece's map has landed; each poll also retires
+        // whatever compute is in flight
+        let mut got: Vec<Option<()>> = vec![None; rxs.len()];
+        loop {
+            let mut done = true;
+            for (i, rx) in rxs.iter().enumerate() {
+                if got[i].is_some() {
+                    continue;
+                }
+                match rx.try_recv() {
+                    Ok(Ok(())) => got[i] = Some(()),
+                    Ok(Err(e)) => {
+                        eprintln!("[map debug] inner error = {e:?}");
+                        return Err(anyhow::Error::from(e).context("map buffer"));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => done = false,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        anyhow::bail!("map callback dropped")
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+            gpu.device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|e| anyhow::anyhow!("poll for maps: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        let mut out: Vec<f32> = Vec::with_capacity(p.floats);
+        for (piece, &(_, take)) in p.staging.iter().zip(&p.pieces) {
+            let slice = piece.slice(..);
+            let mapped = slice.get_mapped_range()?;
+            out.extend_from_slice(bytemuck::cast_slice(&mapped[..take as usize]));
+            drop(mapped);
+            piece.unmap();
         }
         Ok(out)
     }
 }
 
 const UNIFORM_ALIGN: u64 = 256;
+
+const READBACK_CHUNK: u64 = 16 << 20;
+
+/// One submitted chunk whose result is still on the device.
+///
+/// The staging pieces are allocated at submit time. The NEXT chunk's begin
+/// enqueues the device->host copies into them — ahead of its own compute,
+/// which is what overwrites the result buffers — and arms the maps, so
+/// `collect` pumps until the copies land while the GPU keeps computing. A
+/// pending that no begin follows (the last chunk of a run) arms itself in
+/// `collect` and waits for its own copy.
+pub(crate) struct GpuPending {
+    /// the device buffer holding this chunk's result: the gather-out buffer
+    /// (gathered form), the recorded final LN's output (hidden form), or the
+    /// logits buffer (full form)
+    buffer: wgpu::Buffer,
+    /// source byte offset and byte length of each staging piece
+    pieces: Vec<(u64, u64)>,
+    staging: Vec<wgpu::Buffer>,
+    floats: usize,
+    /// map receivers, once armed
+    armed: Option<Vec<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>>,
+}
+
+impl GpuPending {
+    fn new(gpu: &Gpu, buffer: wgpu::Buffer, offset: u64, floats: usize) -> Self {
+        let bytes = (floats * 4) as u64;
+        let mut pieces = Vec::new();
+        let mut staging = Vec::new();
+        let mut off = offset;
+        while off < offset + bytes {
+            let take = READBACK_CHUNK.min(offset + bytes - off);
+            let size = (take + 3) & !3;
+            staging.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            pieces.push((off, take));
+            off += take;
+        }
+        Self {
+            buffer,
+            pieces,
+            staging,
+            floats,
+            armed: None,
+        }
+    }
+
+    /// Enqueue this pending's staging copies and arm the maps. Called from the
+    /// next chunk's begin, before its compute submits: the queue executes the
+    /// copies first, so they read the result before the compute overwrites it,
+    /// and the map callbacks fire when the copies do.
+    fn arm(&mut self, gpu: &Gpu) -> Result<()> {
+        {
+            let mut enc = gpu.device.create_command_encoder(&Default::default());
+            for (piece, &(src_off, take)) in self.staging.iter().zip(&self.pieces) {
+                enc.copy_buffer_to_buffer(&self.buffer, src_off, piece, 0, take);
+            }
+            gpu.queue.submit([enc.finish()]);
+        }
+        let mut rxs = Vec::with_capacity(self.staging.len());
+        for piece in &self.staging {
+            let slice = piece.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            rxs.push(rx);
+        }
+        self.armed = Some(rxs);
+        Ok(())
+    }
+}
 
 struct Scratch {
     n_in: usize,
@@ -1330,7 +1473,6 @@ struct Scratch {
     attn_o: wgpu::Buffer,
     logits: wgpu::Buffer,
     gather_out: Option<wgpu::Buffer>,
-    staging: wgpu::Buffer,
     ubuf: wgpu::Buffer,
     jobs: Vec<Vec<Job>>,
     uni: Vec<u8>,

@@ -368,18 +368,6 @@ impl Gpu {
         Ok(out)
     }
 
-    /// Same readback, typed as f32 without the intermediate byte `Vec`: the
-    /// gathered trellis download is (T, S) floats — ~36 MB on a 2.7 k-token
-    /// transcript — and every skipped copy of it is host time between chunks.
-    /// `offset` must be 4-byte aligned (a row range of the source block).
-    pub fn readback_f32(&self, buf: &wgpu::Buffer, offset: u64, floats: u64) -> Result<Vec<f32>> {
-        let mut out: Vec<f32> = Vec::with_capacity(floats as usize);
-        self.readback_map(buf, offset, floats * 4, &mut |piece| {
-            out.extend_from_slice(bytemuck::cast_slice(piece));
-        })?;
-        Ok(out)
-    }
-
     /// Copy `bytes` of `buf` at `offset` out in 16 MiB staging pieces, handing
     /// each mapped piece to `sink` in order.
     ///

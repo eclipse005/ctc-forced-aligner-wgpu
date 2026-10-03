@@ -704,6 +704,16 @@ impl Aligner {
         let mut blocks: Vec<Vec<f32>> = Vec::new();
         let mut scratch = crate::wav2vec2::Scratch::default();
         // one scratch for the whole file: no per-chunk buffer churn
+        //
+        // GPU window pipeline: window N's begin arms window N-1's pending —
+        // its staging copies are enqueued ahead of window N's compute, which
+        // is what overwrites the result buffers — so collecting window N-1
+        // below overlaps window N's compute instead of idling the GPU behind
+        // a readback. The last window flushes after the loop.
+        let mut pending: Option<crate::wav2vec2_gpu::GpuPending> = None;
+        // the gather path takes u32s; built once, not per window
+        let exp32: Vec<u32> = expanded.iter().map(|&x| x as u32).collect();
+        let star32: Vec<u32> = star_state_idx.iter().map(|&x| x as u32).collect();
         let mut start = 0usize; // chunk start inside `padded`
         while start + win + 2 * ctx <= padded_len {
             // chunk = [ctx zeros | win real samples | ctx zeros], gathered from
@@ -724,40 +734,101 @@ impl Aligner {
                 // keep the whole block: no per-chunk copy, and the DP gathers
                 // this window's columns a slice at a time when it gets there
                 let w = kind.width();
-                let g = self.forward_lazy(&chunk, kind, &mut scratch)?;
-                let rows = g.len() / w;
-                blocks.push(g);
-                if crate::alloc_stats::enabled() {
-                    let (live, peak) = crate::alloc_stats::stats();
-                    eprintln!(
-                        "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  {kind:?} {} MB, {} kept rows",
-                        blocks.len() - 1,
-                        blocks[blocks.len() - 1].capacity() * 4 >> 20,
-                        kept_of(rows),
-                    );
+                match &self.tower {
+                    Tower::Gpu(gpu) => {
+                        let new = match kind {
+                            BlockKind::Hidden { .. } => {
+                                gpu.forward_hidden_begin(&chunk, pending.as_mut())?
+                            }
+                            BlockKind::Logits { .. } => {
+                                gpu.forward_logits_begin(&chunk, pending.as_mut())?
+                            }
+                        };
+                        if let Some(p) = pending.replace(new) {
+                            let g = gpu.collect(p)?;
+                            let rows = g.len() / w;
+                            blocks.push(g);
+                            if crate::alloc_stats::enabled() {
+                                let (live, peak) = crate::alloc_stats::stats();
+                                eprintln!(
+                                    "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  {kind:?} {} MB, {} kept rows",
+                                    blocks.len() - 1,
+                                    blocks[blocks.len() - 1].capacity() * 4 >> 20,
+                                    kept_of(rows),
+                                );
+                            }
+                        }
+                    }
+                    Tower::Cpu(_) => {
+                        let g = self.forward_lazy(&chunk, kind, &mut scratch)?;
+                        let rows = g.len() / w;
+                        blocks.push(g);
+                        if crate::alloc_stats::enabled() {
+                            let (live, peak) = crate::alloc_stats::stats();
+                            eprintln!(
+                                "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  {kind:?} {} MB, {} kept rows",
+                                blocks.len() - 1,
+                                blocks[blocks.len() - 1].capacity() * 4 >> 20,
+                                kept_of(rows),
+                            );
+                        }
+                    }
                 }
             } else {
-                // the kept rows only: `forward_gathered` slices to the kept
-                // range before it returns, so what comes back is the block
-                let g = self.forward_gathered(
-                    &chunk,
-                    expanded,
-                    star_state_idx,
-                    &mut scratch,
-                    Some((ctx_frames, ctx_frames + win_frames)),
-                )?;
-                blocks.push(g);
-                if crate::alloc_stats::enabled() {
-                    let (live, peak) = crate::alloc_stats::stats();
-                    let c = blocks.len() - 1;
-                    eprintln!(
-                        "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  block {} MB",
-                        c,
-                        blocks[c].capacity() * 4 >> 20
-                    );
+                // the kept rows only: the gather slices to the kept range
+                // before it lands in `blocks`
+                match &self.tower {
+                    Tower::Gpu(gpu) => {
+                        let new = gpu.forward_gathered_begin(
+                            &chunk,
+                            &exp32,
+                            Some((ctx_frames, ctx_frames + win_frames)),
+                            &star32,
+                            pending.as_mut(),
+                        )?;
+                        if let Some(p) = pending.replace(new) {
+                            blocks.push(gpu.collect(p)?);
+                            if crate::alloc_stats::enabled() {
+                                let (live, peak) = crate::alloc_stats::stats();
+                                let c = blocks.len() - 1;
+                                eprintln!(
+                                    "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  block {} MB",
+                                    c,
+                                    blocks[c].capacity() * 4 >> 20
+                                );
+                            }
+                        }
+                    }
+                    Tower::Cpu(_) => {
+                        let g = self.forward_gathered(
+                            &chunk,
+                            expanded,
+                            star_state_idx,
+                            &mut scratch,
+                            Some((ctx_frames, ctx_frames + win_frames)),
+                        )?;
+                        blocks.push(g);
+                        if crate::alloc_stats::enabled() {
+                            let (live, peak) = crate::alloc_stats::stats();
+                            let c = blocks.len() - 1;
+                            eprintln!(
+                                "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  block {} MB",
+                                c,
+                                blocks[c].capacity() * 4 >> 20
+                            );
+                        }
+                    }
                 }
             }
             start += win;
+        }
+        // flush the last window: no next begin to arm it, so its collect
+        // waits for its own copy
+        if let Some(p) = pending.take() {
+            match &self.tower {
+                Tower::Gpu(gpu) => blocks.push(gpu.collect(p)?),
+                Tower::Cpu(_) => anyhow::bail!("pending result without the GPU tower"),
+            }
         }
 
         // the tail zero-padding contributed ext_frames of frames: drop them
