@@ -798,66 +798,20 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
     }
 }
 
-/// The single-pass decision budget when `CTC_VITERBI_BUDGET_MB` is unset:
-/// half the currently available RAM, floored at 512 MB.
+/// The traceback's memory budget: a fixed 512 MB unless
+/// `CTC_VITERBI_BUDGET_MB` says otherwise.
 ///
-/// Keeping every backpointer instead of checkpointing is worth ~half the DP's
-/// wall time, and it is the only budget decision with a speed consequence:
-/// within linear mode the segment length trades memory for nothing (the
-/// recompute replays every frame once whatever the segment), so the sizing
-/// stays at the fixed conservative budget and only THIS decision is allowed
-/// to grow. Half of *available* leaves the other half for the trellis blocks,
-/// the emissions and everything else the run holds at that point (the probe
-/// runs after the encode, so those are already subtracted). The 512 MB floor
-/// keeps the conservative behaviour wherever RAM cannot be queried. An
-/// explicit `CTC_VITERBI_BUDGET_MB` always wins.
-fn default_budget() -> usize {
-    available_ram()
-        .map(|avail| ((avail / 2) as usize).max(512 << 20))
-        .unwrap_or(512 << 20)
-}
-
-/// RAM the OS could hand out right now, when it can be asked cheaply and
-/// without a dependency. `None` falls back to the conservative budget.
-#[cfg(windows)]
-fn available_ram() -> Option<u64> {
-    #[repr(C)]
-    #[derive(Default)]
-    #[allow(non_snake_case)]
-    struct MemStatus {
-        dwLength: u32,
-        dwMemoryLoad: u32,
-        ullTotalPhys: u64,
-        ullAvailPhys: u64,
-        ullTotalPageFile: u64,
-        ullAvailPageFile: u64,
-        ullTotalVirtual: u64,
-        ullAvailVirtual: u64,
-        ullAvailExtendedVirtual: u64,
-    }
-    #[allow(non_snake_case)]
-    extern "system" {
-        fn GlobalMemoryStatusEx(lpBuffer: *mut MemStatus) -> i32;
-    }
-    let mut ms = MemStatus {
-        dwLength: std::mem::size_of::<MemStatus>() as u32,
-        ..MemStatus::default()
-    };
-    // SAFETY: kernel32 takes exactly this struct, with dwLength telling it so.
-    (unsafe { GlobalMemoryStatusEx(&mut ms) } != 0).then_some(ms.ullAvailPhys)
-}
-
-#[cfg(not(windows))]
-fn available_ram() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
+/// Memory is what bounds the duration a machine can process, so the default
+/// must not grow with it: peak DP state stays O(1) in the audio length —
+/// checkpoints plus segment backpointers, each capped by this budget, with
+/// the AM-GM vertex as the floor when even the vertex would not fit. A
+/// budget that scales with installed RAM (half of available was tried, and
+/// measured 2.39 -> 7.15 GB peak on the 1 h fixture) buys the single pass —
+/// about half the DP's wall time — but only up to the next longer file, and
+/// it breaks the property that any duration runs in bounded memory. Raising
+/// it is a caller's decision: an explicit `CTC_VITERBI_BUDGET_MB` turns the
+/// single pass on for whatever the caller is willing to hold.
+const DEFAULT_BUDGET: usize = 512 << 20;
 
 /// Frames per linear-space segment: the largest length whose checkpoints plus
 /// segment backpointers still fit the budget, the whole file when the
@@ -867,15 +821,14 @@ fn available_ram() -> Option<u64> {
 /// The trade is `(t_len/seg)·S·8 + seg·S/4` bytes — U-shaped, so halving from
 /// the whole file walks down the long side to the largest segment that fits.
 /// Recomputing a segment replays the DP over every frame once whatever the
-/// segment length, so a large one only saves the per-segment overhead — which
-/// is why the unforced sizing uses the fixed conservative budget and the
-/// adaptive single-pass decision lives in [`align_with`], not here.
+/// segment length, so a larger segment saves nothing but the per-segment
+/// overhead.
 fn segment_len(t_len: usize, s: usize, rb: usize) -> usize {
     segment_len_with(
         match std::env::var("CTC_VITERBI_BUDGET_MB").ok().as_deref().map(str::parse::<usize>)
         {
             Some(Ok(mb)) => mb << 20,
-            _ => 512 << 20,
+            _ => DEFAULT_BUDGET,
         },
         t_len,
         s,
@@ -1047,17 +1000,14 @@ fn align_with(
     // path unchanged.
     //
     // The single pass is the one allocation with a speed consequence — it
-    // skips the recompute, ~half the DP. The conservative sizing
-    // ([`segment_len`], fixed 512 MB unless the env var says otherwise) is
-    // deliberately NOT allowed to grow for it, because inside linear mode a
-    // longer segment buys no time: the recompute replays every frame once
-    // whatever the segment. So the decision is made here, first: take the
-    // single pass when the budget covers the backpointers, where the budget
-    // is the env var or — unset — half the currently available RAM (see
-    // `default_budget`), and fall back to the conservative linear sizing
-    // otherwise or when the reserve fails. A forced `seg` (the tests' dial)
-    // bypasses the budget entirely and keeps the old loud failure on a failed
-    // reserve.
+    // skips the recompute, ~half the DP — and the one allocation that grows
+    // with the audio, so it is gated on the same budget as the sizing: only
+    // when the whole backpointer store fits does the run keep it, and
+    // otherwise it falls back to the linear path (also used when the reserve
+    // itself fails — the machine is tighter than the budget assumed). Peak
+    // DP state is therefore bounded by the budget at every duration. A
+    // forced `seg` (the tests' dial) bypasses the budget entirely and keeps
+    // the old loud failure on a failed reserve.
     let mut checkpoints: Vec<f64> = Vec::new();
     let mut back: Vec<u8> = Vec::new();
     let nback = (t_len - 1).checked_mul(rb).context("backpointer size")?;
@@ -1083,7 +1033,7 @@ fn align_with(
                 .map(str::parse::<usize>)
             {
                 Some(Ok(mb)) => mb << 20,
-                _ => default_budget(),
+                _ => DEFAULT_BUDGET,
             };
             if nback.saturating_add(s * 8) <= budget && back.try_reserve_exact(nback).is_ok() {
                 // SAFETY: as above — the traceback writes every row whole
