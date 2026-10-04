@@ -3,6 +3,8 @@
 //! `backend.log_probs_chunked`, producing the same JSON schema.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -13,8 +15,8 @@ use crate::gpu::DeviceSelector;
 use crate::spans::{build_segments, build_words};
 use crate::viterbi::{
     build_expanded_labels, ctc_forced_align_emissions_with_word_ids,
-    ctc_forced_align_gathered_with_word_ids,
-    Emissions, GatheredChunks, TokenAlignment,
+    ctc_forced_align_gathered_with_word_ids, AlignmentResult, Emissions, GatheredChunks,
+    TokenAlignment,
 };
 use crate::vocab::Vocab;
 use crate::wav2vec2::{LmHeadCpu, Model};
@@ -359,48 +361,84 @@ impl Aligner {
         let expanded = build_expanded_labels(&gather_ids, self.blank_id);
         let star_state_idx: Vec<usize> =
             (0..ids.len()).filter(|&i| ids[i] == star).map(|i| 2 * i + 1).collect();
-        let t_enc = std::time::Instant::now();
-        let trellis = self.log_probs_trellis(
-            &waveform, window_sec, context_sec, &expanded, &star_state_idx,
-        )?;
-        // The DP never reads the waveform — everything it consumes is in the
-        // trellis — so free it before the traceback allocates its checkpoints
-        // and backpointers: 237 MB on an hour, 691 MB on three.
-        drop(waveform);
-        let encode_s = t_enc.elapsed().as_secs_f64();
-        crate::wav2vec2::prof::dump(&format!(
-            "{} [{}]",
-            audio_path.display(),
-            self.backend_name()
-        ));
-        let t_al = std::time::Instant::now();
-        let mut res = match trellis {
-            Trellis::Gathered(gathered) => {
-                ctc_forced_align_gathered_with_word_ids(
-                    &gathered, &ids, self.frame_rate, Some(&pieces), &word_ids, keep_path)?
+        // The streaming plan: the GPU tower's windowed lazy path runs the
+        // Viterbi against the encode, block by block. Everything else — the
+        // CPU tower, an unchunked forward, the gathered trellis (whose files
+        // are short enough that the DP is a rounding error) — collects first
+        // and aligns after, as before.
+        let stream = match (&self.tower, window_sec) {
+            (Tower::Gpu(_), Some(wsec)) => {
+                let win = (wsec * TARGET_SR as f64) as usize;
+                let frames = (waveform.len() / self.subsampling).max(1);
+                match self.choose_form(frames, expanded.len(), window_sec) {
+                    Form::Lazy(kind)
+                        if waveform.len() >= win && waveform.len().div_ceil(win) >= 2 =>
+                    {
+                        Some((win, kind))
+                    }
+                    _ => None,
+                }
             }
-            Trellis::Lazy(blocks) => {
-                let gather = match &self.tower {
-                    Tower::Cpu(m) => RowGather::Cpu(m),
-                    Tower::Gpu(_) => match blocks.kind {
-                        // the GPU tower's logits blocks are already
-                        // log-softmaxed on the device (plain column copy);
-                        // its hidden blocks need the host-side head re-run
-                        BlockKind::Hidden { .. } => RowGather::Head(self
-                            .gpu_lm_head
-                            .as_ref()
-                            .context("GPU tower is missing the host-side lm head")?),
-                        BlockKind::Logits { .. } => RowGather::Gpu,
-                    },
+            _ => None,
+        };
+        let t_enc = std::time::Instant::now();
+        let (mut res, encode_s, align_s) = match stream {
+            Some((win, kind)) => self.align_streaming(
+                waveform, win, context_sec, kind, &expanded, &star_state_idx, &ids, &pieces,
+                &word_ids,
+            )?,
+            None => {
+                let trellis = self.log_probs_trellis(
+                    &waveform, window_sec, context_sec, &expanded, &star_state_idx,
+                )?;
+                // The DP never reads the waveform — everything it consumes is
+                // in the trellis — so free it before the traceback allocates
+                // its checkpoints and backpointers: 237 MB on an hour, 691 MB
+                // on three.
+                drop(waveform);
+                let encode_s = t_enc.elapsed().as_secs_f64();
+                crate::wav2vec2::prof::dump(&format!(
+                    "{} [{}]",
+                    audio_path.display(),
+                    self.backend_name()
+                ));
+                let t_al = std::time::Instant::now();
+                let res = match trellis {
+                    Trellis::Gathered(gathered) => {
+                        ctc_forced_align_gathered_with_word_ids(
+                            &gathered, &ids, self.frame_rate, Some(&pieces), &word_ids, keep_path)?
+                    }
+                    Trellis::Lazy(blocks) => {
+                        let gather = match &self.tower {
+                            Tower::Cpu(m) => RowGather::Cpu(m),
+                            Tower::Gpu(_) => match blocks.kind {
+                                // the GPU tower's logits blocks are already
+                                // log-softmaxed on the device (plain column copy);
+                                // its hidden blocks need the host-side head re-run
+                                BlockKind::Hidden { .. } => RowGather::Head(self
+                                    .gpu_lm_head
+                                    .as_ref()
+                                    .context("GPU tower is missing the host-side lm head")?),
+                                BlockKind::Logits { .. } => RowGather::Gpu,
+                            },
+                        };
+                        let em = LazyEmissions::new(&blocks, gather, &expanded, &star_state_idx);
+                        let frames = em.total_frames();
+                        em.validate()?;
+                        ctc_forced_align_emissions_with_word_ids(
+                            &em, frames, &ids, self.frame_rate, Some(&pieces), &word_ids)?
+                    }
                 };
-                let em = LazyEmissions::new(&blocks, gather, &expanded, &star_state_idx);
-                let frames = em.total_frames();
-                em.validate()?;
-                ctc_forced_align_emissions_with_word_ids(
-                    &em, frames, &ids, self.frame_rate, Some(&pieces), &word_ids)?
+                (res, encode_s, t_al.elapsed().as_secs_f64())
             }
         };
-        let align_s = t_al.elapsed().as_secs_f64();
+        if stream.is_some() {
+            crate::wav2vec2::prof::dump(&format!(
+                "{} [{}]",
+                audio_path.display(),
+                self.backend_name()
+            ));
+        }
         if crate::alloc_stats::enabled() {
             // the per-chunk prints stop at the end of the encode; the DP's
             // backpointers are allocated after that, so the run's real high
@@ -472,28 +510,10 @@ impl Aligner {
         // is re-run on demand.  Whichever of the three is the narrowest one
         // that fits, so RAM is bounded no matter how long the audio is.
         // `CTC_TRELLIS=auto|gathered|logits|hidden` forces any of them.
-        let vocab = self.vocab_size();
-        let hidden = self.hidden_size();
         let states = expanded.len();
         let frames = (waveform.len() / self.subsampling).max(1);
+        let form = self.choose_form(frames, states, window_sec);
         let win = window_sec.map(|w| (w * TARGET_SR as f64) as usize);
-        let form = match std::env::var("CTC_TRELLIS").ok().as_deref() {
-            Some("gathered") => Form::Gathered,
-            Some("logits") => Form::Lazy(BlockKind::Logits { vocab }),
-            Some("hidden") => Form::Lazy(BlockKind::Hidden { hidden }),
-            _ if fits(frames, states) => Form::Gathered,
-            // past the gathered trellis, the encoder stream (4 KB/frame) beats
-            // parking the lm head's logits (41 KB/frame) for a windowed run:
-            // the per-window head re-run costs ~25 ms against a 34 s window,
-            // while the logits form's extra 37 KB/frame sits resident for the
-            // whole DP.  Measured on 15 m: hidden 2.24 GB / RTFx 17.8 vs
-            // logits 4.19 GB / 17.1, outputs byte-identical.  An unchunked
-            // forward has no windows to re-run over — the head would
-            // materialise the whole (T, V) matrix anyway — so it keeps the
-            // logits form.
-            _ if win.is_some() => Form::Lazy(BlockKind::Hidden { hidden }),
-            _ => Form::Lazy(BlockKind::Logits { vocab }),
-        };
         match win {
             None => {
                 let mut input = waveform.to_vec();
@@ -513,14 +533,14 @@ impl Aligner {
                     Form::Lazy(kind) => {
                         let g = self.forward_lazy(&input, kind, &mut scratch)?;
                         let rows = g.len() / kind.width();
-                        Trellis::Lazy(LazyBlocks {
-                            blocks: vec![g],
+                        Trellis::Lazy(LazyBlocks::owned(
+                            vec![g],
                             kind,
-                            num_states: states,
-                            row_offset: 0,
-                            frames_per_chunk: rows.max(1),
-                            spans: vec![(0usize, 0usize, rows)],
-                        })
+                            states,
+                            rows.max(1),
+                            0,
+                            vec![(0usize, 0usize, rows)],
+                        ))
                     }
                 })
             }
@@ -534,6 +554,30 @@ impl Aligner {
         match &self.tower {
             Tower::Cpu(m) => m.vocab_size(),
             Tower::Gpu(g) => g.vocab_size(),
+        }
+    }
+
+    /// Which of the three equivalent trellis storage forms a run takes.
+    ///
+    /// Past the gathered trellis, the encoder stream (4 KB/frame) beats
+    /// parking the lm head's logits (41 KB/frame) for a windowed run: the
+    /// per-window head re-run costs ~25 ms against a 34 s window, while the
+    /// logits form's extra 37 KB/frame sits resident for the whole DP.
+    /// Measured on 15 m: hidden 2.24 GB / RTFx 17.8 vs logits 4.19 GB / 17.1,
+    /// outputs byte-identical.  An unchunked forward has no windows to re-run
+    /// over — the head would materialise the whole (T, V) matrix anyway — so
+    /// it keeps the logits form.
+    fn choose_form(&self, frames: usize, states: usize, window_sec: Option<f64>) -> Form {
+        let vocab = self.vocab_size();
+        let hidden = self.hidden_size();
+        let windowed = window_sec.is_some();
+        match std::env::var("CTC_TRELLIS").ok().as_deref() {
+            Some("gathered") => Form::Gathered,
+            Some("logits") => Form::Lazy(BlockKind::Logits { vocab }),
+            Some("hidden") => Form::Lazy(BlockKind::Hidden { hidden }),
+            _ if fits(frames, states) => Form::Gathered,
+            _ if windowed => Form::Lazy(BlockKind::Hidden { hidden }),
+            _ => Form::Lazy(BlockKind::Logits { vocab }),
         }
     }
 
@@ -666,14 +710,14 @@ impl Aligner {
                 Form::Lazy(kind) => {
                     let g = self.forward_lazy(&input, kind, &mut scratch)?;
                     let rows = g.len() / kind.width();
-                    Trellis::Lazy(LazyBlocks {
-                        blocks: vec![g],
+                    Trellis::Lazy(LazyBlocks::owned(
+                        vec![g],
                         kind,
-                        num_states: states,
-                        row_offset: 0,
-                        frames_per_chunk: rows.max(1),
-                        spans: vec![(0usize, 0usize, rows)],
-                    })
+                        states,
+                        rows.max(1),
+                        0,
+                        vec![(0usize, 0usize, rows)],
+                    ))
                 }
                 Form::Gathered => {
                     let g = self.forward_gathered(
@@ -708,64 +752,26 @@ impl Aligner {
         let mut blocks: Vec<Vec<f32>> = Vec::new();
         let mut scratch = crate::wav2vec2::Scratch::default();
         // one scratch for the whole file: no per-chunk buffer churn
-        //
-        // GPU window pipeline: window N's begin arms window N-1's pending —
-        // its staging copies are enqueued ahead of window N's compute, which
-        // is what overwrites the result buffers — so collecting window N-1
-        // below overlaps window N's compute instead of idling the GPU behind
-        // a readback. The last window flushes after the loop.
-        let mut pending: Option<crate::wav2vec2_gpu::GpuPending> = None;
-        // the gather path takes u32s; built once, not per window
-        let exp32: Vec<u32> = expanded.iter().map(|&x| x as u32).collect();
-        let star32: Vec<u32> = star_state_idx.iter().map(|&x| x as u32).collect();
-        let mut start = 0usize; // chunk start inside `padded`
-        while start + win + 2 * ctx <= padded_len {
-            // chunk = [ctx zeros | win real samples | ctx zeros], gathered from
-            // the waveform with zero fill at the file edges
-            let w_lo = start as i64 - ctx as i64; // waveform index of chunk sample 0
-            let len = win + 2 * ctx;
-            let mut chunk = vec![0.0f32; len];
-            // one memcpy of the waveform overlap instead of a bounds-checked
-            // copy per sample; the zero padding at the file edges stays put
-            let (i_lo, i_hi) = (0i64.max(-w_lo), (len as i64).min(n as i64 - w_lo));
-            if i_lo < i_hi {
-                chunk[i_lo as usize..i_hi as usize]
-                    .copy_from_slice(&waveform[(w_lo + i_lo) as usize..(w_lo + i_hi) as usize]);
-            }
-            znorm(&mut chunk);
-
-            if let Form::Lazy(kind) = form {
-                // keep the whole block: no per-chunk copy, and the DP gathers
-                // this window's columns a slice at a time when it gets there
-                let w = kind.width();
-                match &self.tower {
-                    Tower::Gpu(gpu) => {
-                        let new = match kind {
-                            BlockKind::Hidden { .. } => {
-                                gpu.forward_hidden_begin(&chunk, pending.as_mut())?
-                            }
-                            BlockKind::Logits { .. } => {
-                                gpu.forward_logits_begin(&chunk, pending.as_mut())?
-                            }
-                        };
-                        if let Some(p) = pending.replace(new) {
-                            let g = gpu.collect(p)?;
-                            let rows = g.len() / w;
-                            blocks.push(g);
-                            if crate::alloc_stats::enabled() {
-                                let (live, peak) = crate::alloc_stats::stats();
-                                eprintln!(
-                                    "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  {kind:?} {} MB, {} kept rows",
-                                    blocks.len() - 1,
-                                    blocks[blocks.len() - 1].capacity() * 4 >> 20,
-                                    kept_of(rows),
-                                );
-                            }
-                        }
-                    }
-                    Tower::Cpu(_) => {
+        if let Form::Lazy(kind) = form {
+            match &self.tower {
+                Tower::Gpu(_) => {
+                    // GPU window pipeline: window N's begin arms window N-1's
+                    // pending — its staging copies are enqueued ahead of
+                    // window N's compute, which is what overwrites the result
+                    // buffers — so collecting window N-1 below overlaps
+                    // window N's compute instead of idling the GPU behind a
+                    // readback. The last window flushes inside the helper.
+                    self.encode_lazy_gpu_windows(waveform, win, ctx, kind, |_i, g| {
+                        blocks.push(g);
+                        Ok(())
+                    })?;
+                }
+                Tower::Cpu(_) => {
+                    let mut start = 0usize; // chunk start inside `padded`
+                    while start + win + 2 * ctx <= padded_len {
+                        let chunk = window_chunk(waveform, start, win, ctx);
                         let g = self.forward_lazy(&chunk, kind, &mut scratch)?;
-                        let rows = g.len() / w;
+                        let rows = g.len() / kind.width();
                         blocks.push(g);
                         if crate::alloc_stats::enabled() {
                             let (live, peak) = crate::alloc_stats::stats();
@@ -776,11 +782,20 @@ impl Aligner {
                                 kept_of(rows),
                             );
                         }
+                        start += win;
                     }
                 }
-            } else {
-                // the kept rows only: the gather slices to the kept range
-                // before it lands in `blocks`
+            }
+        } else {
+            // the kept rows only: the gather slices to the kept range
+            // before it lands in `blocks`
+            // the gather path takes u32s; built once, not per window
+            let exp32: Vec<u32> = expanded.iter().map(|&x| x as u32).collect();
+            let star32: Vec<u32> = star_state_idx.iter().map(|&x| x as u32).collect();
+            let mut pending: Option<crate::wav2vec2_gpu::GpuPending> = None;
+            let mut start = 0usize; // chunk start inside `padded`
+            while start + win + 2 * ctx <= padded_len {
+                let chunk = window_chunk(waveform, start, win, ctx);
                 match &self.tower {
                     Tower::Gpu(gpu) => {
                         let new = gpu.forward_gathered_begin(
@@ -823,15 +838,15 @@ impl Aligner {
                         }
                     }
                 }
+                start += win;
             }
-            start += win;
-        }
-        // flush the last window: no next begin to arm it, so its collect
-        // waits for its own copy
-        if let Some(p) = pending.take() {
-            match &self.tower {
-                Tower::Gpu(gpu) => blocks.push(gpu.collect(p)?),
-                Tower::Cpu(_) => anyhow::bail!("pending result without the GPU tower"),
+            // flush the last window: no next begin to arm it, so its collect
+            // waits for its own copy
+            if let Some(p) = pending.take() {
+                match &self.tower {
+                    Tower::Gpu(gpu) => blocks.push(gpu.collect(p)?),
+                    Tower::Cpu(_) => anyhow::bail!("pending result without the GPU tower"),
+                }
             }
         }
 
@@ -859,14 +874,14 @@ impl Aligner {
             if let Some(last) = spans.last_mut() {
                 last.2 = last.2.saturating_sub(ext_frames);
             }
-            Ok(Trellis::Lazy(LazyBlocks {
-                frames_per_chunk: spans.first().map_or(1, |s| s.2.max(1)),
-                row_offset: spans.first().map_or(0, |s| s.1),
+            Ok(Trellis::Lazy(LazyBlocks::owned(
                 blocks,
                 kind,
-                num_states: states,
+                states,
+                spans.first().map_or(1, |s| s.2.max(1)),
+                spans.first().map_or(0, |s| s.1),
                 spans,
-            }))
+            )))
         } else {
             Ok(Trellis::Gathered(GatheredChunks {
                 chunks: blocks,
@@ -874,6 +889,249 @@ impl Aligner {
                 num_states: states,
             }))
         }
+    }
+
+    /// The windowed GPU encode of a lazy trellis: one `(rows × width)` block
+    /// per window, handed to `sink` in order. Shared by the synchronous path
+    /// (which pushes into `blocks`) and the streaming one (which hands each
+    /// block to the DP already running on its own thread).
+    ///
+    /// Every chunk is full by construction: `padded_len = n_chunks·win + 2·ctx`
+    /// keeps `start + win + 2·ctx ≤ padded_len` true for all `n_chunks`
+    /// windows, the tail padding existing exactly to fill the last one — so
+    /// every block holds `(win + 2·ctx) / subsampling` rows, which is what the
+    /// streaming spans are predicted from.
+    fn encode_lazy_gpu_windows(
+        &self,
+        waveform: &[f32],
+        win: usize,
+        ctx: usize,
+        kind: BlockKind,
+        mut sink: impl FnMut(usize, Vec<f32>) -> Result<()>,
+    ) -> Result<()> {
+        let n = waveform.len();
+        let n_chunks = n.div_ceil(win);
+        let extension = n_chunks * win - n;
+        let padded_len = n + 2 * ctx + extension;
+        let gpu = match &self.tower {
+            Tower::Gpu(g) => g,
+            Tower::Cpu(_) => anyhow::bail!("lazy GPU windows need the GPU tower"),
+        };
+        // window N's begin arms window N-1's pending — its staging copies are
+        // enqueued ahead of window N's compute, which is what overwrites the
+        // result buffers — so collecting window N-1 overlaps window N's
+        // compute. The last window flushes after the loop: no next begin to
+        // arm it, so its collect waits for its own copy.
+        let mut pending: Option<crate::wav2vec2_gpu::GpuPending> = None;
+        let mut collected = 0usize;
+        let mut start = 0usize; // chunk start inside `padded`
+        while start + win + 2 * ctx <= padded_len {
+            let chunk = window_chunk(waveform, start, win, ctx);
+            let new = match kind {
+                BlockKind::Hidden { .. } => gpu.forward_hidden_begin(&chunk, pending.as_mut())?,
+                BlockKind::Logits { .. } => gpu.forward_logits_begin(&chunk, pending.as_mut())?,
+            };
+            if let Some(p) = pending.replace(new) {
+                let g = gpu.collect(p)?;
+                if crate::alloc_stats::enabled() {
+                    let (live, peak) = crate::alloc_stats::stats();
+                    eprintln!(
+                        "[alloc] chunk {:>2}: live {live:>12} peak {peak:>12}  {kind:?} {} MB, {} rows",
+                        collected,
+                        g.capacity() * 4 >> 20,
+                        g.len() / kind.width(),
+                    );
+                }
+                sink(collected, g)?;
+                collected += 1;
+            }
+            start += win;
+        }
+        if let Some(p) = pending.take() {
+            let g = gpu.collect(p)?;
+            sink(collected, g)?;
+            collected += 1;
+        }
+        debug_assert_eq!(collected, n_chunks, "the loop's window arithmetic drifted");
+        Ok(())
+    }
+
+    /// The streaming run: the GPU encode feeds blocks to a Viterbi already
+    /// running on its own thread. The DP reads frames strictly in order, so it
+    /// waits at most for the window it is inside, and the encoder never waits
+    /// at all — the DP's forward pass hides inside the encode instead of
+    /// running after it.
+    ///
+    /// The spans the DP is started with are PREDICTED from the window
+    /// arithmetic (`n_chunks` full chunks of `win_frames` kept rows each, the
+    /// last short by the tail padding's `ext_frames`); every block the encoder
+    /// puts is cross-checked against that prediction, so a drift in the
+    /// chunk→frames mapping fails loudly instead of shifting every timestamp.
+    /// `waveform` is consumed and dropped once the last chunk is built — the
+    /// traceback, which allocates the run's largest structures, never runs
+    /// while the raw audio is still resident.
+    #[allow(clippy::too_many_arguments)]
+    fn align_streaming(
+        &self,
+        waveform: Vec<f32>,
+        win: usize,
+        ctx_sec: f64,
+        kind: BlockKind,
+        expanded: &[usize],
+        star_state_idx: &[usize],
+        ids: &[usize],
+        pieces: &[String],
+        word_ids: &[usize],
+    ) -> Result<(AlignmentResult, f64, f64)> {
+        let ctx = (ctx_sec * TARGET_SR as f64) as usize;
+        let states = expanded.len();
+        let n = waveform.len();
+        let ctx_frames = ctx / self.subsampling;
+        let win_frames = win / self.subsampling;
+        let n_chunks = n.div_ceil(win);
+        let extension = n_chunks * win - n;
+        let ext_frames = ((extension as f64 / TARGET_SR as f64 * self.frame_rate).ceil()) as usize;
+        let kept_of =
+            |rows: usize| (ctx_frames + win_frames).min(rows) - ctx_frames.min(rows);
+        // per-block kept rows, predicted for the unclamped case (a full chunk
+        // yields at least `ctx_frames + win_frames` rows, which the encoder
+        // cross-check below verifies against the actual rows it produced)
+        let kept_last = win_frames.saturating_sub(ext_frames);
+        let frames = (n_chunks - 1) * win_frames + kept_last;
+        let spans: Vec<(usize, usize, usize)> = (0..n_chunks)
+            .map(|i| (i, ctx_frames, if i + 1 == n_chunks { kept_last } else { win_frames }))
+            .collect();
+        let w = kind.width();
+        let shared = Arc::new(SharedBlocks::new(n_chunks));
+        let gather = match kind {
+            BlockKind::Hidden { .. } => {
+                RowGather::Head(self.gpu_lm_head.as_ref().context(
+                    "GPU tower is missing the host-side lm head",
+                )?)
+            }
+            BlockKind::Logits { .. } => RowGather::Gpu,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let t_all = std::time::Instant::now();
+        let mut enc_err: Option<anyhow::Error> = None;
+        let mut loop_end: Option<std::time::Instant> = None;
+        {
+            let shared_dp = shared.clone();
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    // with_emit has no error channel, so an encode failure
+                    // surfaces here as the wait's panic; either way the result
+                    // goes back through the channel and the encoder's own
+                    // error, if any, wins below.
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let blocks = LazyBlocks {
+                            store: BlockStore::Shared(shared_dp),
+                            kind,
+                            num_states: states,
+                            frames_per_chunk: win_frames,
+                            row_offset: ctx_frames,
+                            spans,
+                        };
+                        blocks.validate()?;
+                        let em = LazyEmissions::new(&blocks, gather, expanded, star_state_idx);
+                        em.validate()?;
+                        ctc_forced_align_emissions_with_word_ids(
+                            &em, frames, ids, self.frame_rate, Some(pieces), word_ids,
+                        )
+                    }));
+                    let res = match out {
+                        Ok(r) => r,
+                        Err(p) => Err(anyhow::anyhow!(
+                            "viterbi worker died: {}",
+                            panic_message(p)
+                        )),
+                    };
+                    let _ = tx.send(res);
+                });
+                // ---- the encode, on the calling thread ----
+                let enc = (|| -> Result<()> {
+                    let mut tail = 0usize;
+                    self.encode_lazy_gpu_windows(waveform.as_slice(), win, ctx, kind, |i, g| {
+                        // cross-check the block against the span the DP was
+                        // predicted. The chunk→frames mapping is the model's
+                        // own conv arithmetic — NOT `len / subsampling` (this
+                        // checkpoint's stack yields one frame fewer) — so the
+                        // spans are predicted from `kept_of`, the same clamp
+                        // the synchronous path applies to the actual rows.
+                        // Every chunk is full by construction (the tail
+                        // padding exists exactly to fill the last one), so
+                        // every block including the last must keep
+                        // `win_frames`; the tail padding's `ext_frames` are
+                        // trimmed from the last block's SPAN, not from the
+                        // block. `kept_of(rows) == win_frames` also pins
+                        // `rows ≥ row_offset + kept`, so the DP's read of the
+                        // kept range cannot run off the block, and a drift in
+                        // the conv arithmetic fails loudly instead of shifting
+                        // every later timestamp.
+                        let rows = g.len() / w;
+                        anyhow::ensure!(
+                            kept_of(rows) == win_frames,
+                            "window {i} produced {rows} rows, keeping {}, predicted {win_frames}",
+                            kept_of(rows)
+                        );
+                        tail = i + 1;
+                        shared.put(i, g);
+                        Ok(())
+                    })?;
+                    debug_assert_eq!(tail, n_chunks, "the loop's window arithmetic drifted");
+                    Ok(())
+                })();
+                if let Err(e) = enc {
+                    shared.fail();
+                    enc_err = Some(e);
+                }
+                loop_end = Some(std::time::Instant::now());
+                // the last chunk is built; the traceback, which allocates the
+                // run's largest structures, need not wait under the raw audio
+                drop(waveform);
+            });
+        }
+        let encode_s = loop_end.map_or(0.0, |t| t.duration_since(t_all).as_secs_f64());
+        let res = rx.recv().context("viterbi worker died without a result")?;
+        let wall_s = t_all.elapsed().as_secs_f64();
+        match enc_err {
+            Some(e) => Err(e),
+            // the wall clock is the span from encode start to DP end; report
+            // it as encode + the un-overlapped tail so the CLI's RTFx keeps
+            // meaning duration / wall
+            None => Ok((res?, encode_s, (wall_s - encode_s).max(0.0))),
+        }
+    }
+}
+
+/// `[ctx zeros | win real samples | ctx zeros]`, gathered from the waveform
+/// with zero fill at the file edges — one memcpy of the overlap instead of a
+/// bounds-checked copy per sample — and z-normalised in place, exactly as the
+/// reference's chunked path does. The normalisation is per chunk, so the
+/// znorm belongs to the chunk, not to any one caller.
+fn window_chunk(waveform: &[f32], start: usize, win: usize, ctx: usize) -> Vec<f32> {
+    let n = waveform.len();
+    let len = win + 2 * ctx;
+    let mut chunk = vec![0.0f32; len];
+    let w_lo = start as i64 - ctx as i64; // waveform index of chunk sample 0
+    let (i_lo, i_hi) = (0i64.max(-w_lo), (len as i64).min(n as i64 - w_lo));
+    if i_lo < i_hi {
+        chunk[i_lo as usize..i_hi as usize]
+            .copy_from_slice(&waveform[(w_lo + i_lo) as usize..(w_lo + i_hi) as usize]);
+    }
+    znorm(&mut chunk);
+    chunk
+}
+
+/// A panic payload's text, for reporting a dead worker.
+fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -909,7 +1167,7 @@ impl std::fmt::Debug for Trellis {
             Trellis::Lazy(b) => f
                 .debug_struct("Lazy")
                 .field("kind", &b.kind)
-                .field("blocks", &b.blocks.len())
+                .field("blocks", &b.block_count())
                 .finish(),
         }
     }
@@ -919,7 +1177,7 @@ impl std::fmt::Debug for LazyBlocks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyBlocks")
             .field("kind", &self.kind)
-            .field("blocks", &self.blocks.len())
+            .field("blocks", &self.block_count())
             .field("frames", &self.total_frames())
             .finish()
     }
@@ -937,10 +1195,83 @@ pub(crate) enum Trellis {
     Lazy(LazyBlocks),
 }
 
+/// Blocks a windowed GPU encode hands over while the Viterbi consumes them.
+///
+/// The DP runs on its own thread and reads frames strictly in order, so a
+/// block is only ever waited on once, and the encoder never waits on the DP —
+/// when the DP is the faster of the two, its forward pass tracks the encode
+/// with a block or two of lag; when it is slower, the slots fill up, which is
+/// the same memory the collected blocks would have held anyway. `fail` wakes
+/// a waiter when the encode dies: the waiter panics, because
+/// [`Emissions::with_emit`] has no error channel, and the spawn site catches
+/// the panic and returns the encode's own error instead.
+struct SharedBlocks {
+    slots: Mutex<Vec<Option<Vec<f32>>>>,
+    cv: Condvar,
+    failed: AtomicBool,
+}
+
+impl SharedBlocks {
+    fn new(n: usize) -> Self {
+        Self {
+            slots: Mutex::new((0..n).map(|_| None).collect()),
+            cv: Condvar::new(),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn put(&self, i: usize, block: Vec<f32>) {
+        let mut g = self.lock();
+        debug_assert!(g[i].is_none(), "block {i} put twice");
+        g[i] = Some(block);
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Wake every waiter: the encode died and no more blocks are coming.
+    fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    /// The slots, with block `i` filled. Panics when the encode failed —
+    /// caught where the DP thread was spawned.
+    fn wait(&self, i: usize) -> MutexGuard<'_, Vec<Option<Vec<f32>>>> {
+        let mut g = self.lock();
+        loop {
+            if g[i].is_some() {
+                return g;
+            }
+            assert!(
+                !self.failed.load(Ordering::Acquire),
+                "encoder failed while the Viterbi waited on block {i}"
+            );
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Poison-immune lock: the only thread that could poison the mutex is the
+    /// DP's, and it dies holding nothing the encoder needs.
+    fn lock(&self) -> MutexGuard<'_, Vec<Option<Vec<f32>>>> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// What a lazily gathered trellis parks between the forward pass and the
+/// traceback. All three widths produce the same f32s; they only differ in how
+/// much memory has to stay resident and whether the DP can start before the
+/// last block lands.
+enum BlockStore {
+    /// every block already collected (CPU tower, tests, unchunked runs)
+    Owned(Vec<Vec<f32>>),
+    /// blocks arrive from the encode while the DP runs (streaming GPU path)
+    Shared(Arc<SharedBlocks>),
+}
+
 /// Per-window blocks plus the row window the DP is allowed to read: the same
 /// kept frames the gathered path keeps, addressed inside the wider block.
 pub(crate) struct LazyBlocks {
-    blocks: Vec<Vec<f32>>,
+    store: BlockStore,
     /// what a row of a block is, and how wide it is
     kind: BlockKind,
     /// columns the DP reads (S = 2·tokens+1)
@@ -955,8 +1286,52 @@ pub(crate) struct LazyBlocks {
 }
 
 impl LazyBlocks {
+    /// The synchronous shape: blocks collected before the DP starts.
+    fn owned(
+        blocks: Vec<Vec<f32>>,
+        kind: BlockKind,
+        num_states: usize,
+        frames_per_chunk: usize,
+        row_offset: usize,
+        spans: Vec<(usize, usize, usize)>,
+    ) -> Self {
+        Self { store: BlockStore::Owned(blocks), kind, num_states, frames_per_chunk, row_offset, spans }
+    }
+
+    /// Lend block `b`'s rows to `f`, waiting for the encoder when the store is
+    /// still filling. The borrow lives only for the call; everything the DP
+    /// keeps (gathered slices, window logits, normalisers) is copied out
+    /// first, so the row kernel never runs under the lock.
+    fn with_block<R>(&self, b: usize, f: impl FnOnce(&[f32]) -> R) -> R {
+        match &self.store {
+            BlockStore::Owned(v) => f(&v[b]),
+            BlockStore::Shared(sh) => {
+                let guard = sh.wait(b);
+                let block = guard[b].as_deref().expect("wait returned a filled slot");
+                f(block)
+            }
+        }
+    }
+
     fn total_frames(&self) -> usize {
         self.spans.iter().map(|s| s.2).sum()
+    }
+
+    /// The synchronous store's blocks, for the tests' reference constructions.
+    #[cfg(test)]
+    fn owned_blocks(&self) -> &[Vec<f32>] {
+        match &self.store {
+            BlockStore::Owned(v) => v,
+            BlockStore::Shared(_) => unreachable!("tests never build a shared store"),
+        }
+    }
+
+    /// How many blocks the store holds or expects.
+    fn block_count(&self) -> usize {
+        match &self.store {
+            BlockStore::Owned(v) => v.len(),
+            BlockStore::Shared(sh) => sh.lock().len(),
+        }
     }
 
     /// First frame of window `b` in the DP's frame numbering.
@@ -974,26 +1349,54 @@ impl LazyBlocks {
     /// Every window but the last must contribute exactly `frames_per_chunk`
     /// frames from the same row offset, or the DP's arithmetic addressing
     /// would read the wrong row instead of failing.
+    ///
+    /// With a [`BlockStore::Shared`] store the blocks are still arriving, so
+    /// the per-block row checks cannot run here — the encoder cross-checks
+    /// each block against the predicted spans as it puts it, and this side
+    /// checks only the spans' own arithmetic.
     fn validate(&self) -> Result<()> {
         let w = self.kind.width();
         anyhow::ensure!(w > 0 && self.num_states > 0, "empty trellis");
         anyhow::ensure!(self.frames_per_chunk > 0, "frames_per_chunk must be positive");
         let last = self.spans.len().saturating_sub(1);
-        for (i, &(b, row, kept)) in self.spans.iter().enumerate() {
-            anyhow::ensure!(b == i, "block span {i} out of order");
-            let rows = self.blocks.get(i).map_or(0, |x| x.len() / w);
-            anyhow::ensure!(
-                self.blocks[i].len() % w == 0,
-                "block {i} is not a whole number of {w}-column rows"
-            );
-            anyhow::ensure!(row + kept <= rows, "block {i} keeps {kept} of {rows} rows");
-            if i != last {
-                anyhow::ensure!(
-                    kept == self.frames_per_chunk && row == self.row_offset,
-                    "block {i} keeps {kept}@{row}, expected {}@{} (only the last may be short)",
-                    self.frames_per_chunk,
-                    self.row_offset
-                );
+        match &self.store {
+            BlockStore::Owned(blocks) => {
+                for (i, &(b, row, kept)) in self.spans.iter().enumerate() {
+                    anyhow::ensure!(b == i, "block span {i} out of order");
+                    let rows = blocks.get(i).map_or(0, |x| x.len() / w);
+                    anyhow::ensure!(
+                        blocks[i].len() % w == 0,
+                        "block {i} is not a whole number of {w}-column rows"
+                    );
+                    anyhow::ensure!(row + kept <= rows, "block {i} keeps {kept} of {rows} rows");
+                    if i != last {
+                        anyhow::ensure!(
+                            kept == self.frames_per_chunk && row == self.row_offset,
+                            "block {i} keeps {kept}@{row}, expected {}@{} (only the last may be short)",
+                            self.frames_per_chunk,
+                            self.row_offset
+                        );
+                    }
+                }
+            }
+            BlockStore::Shared(_) => {
+                for (i, &(b, row, kept)) in self.spans.iter().enumerate() {
+                    anyhow::ensure!(b == i, "block span {i} out of order");
+                    if i != last {
+                        anyhow::ensure!(
+                            kept == self.frames_per_chunk && row == self.row_offset,
+                            "block span {i} keeps {kept}@{row}, expected {}@{}",
+                            self.frames_per_chunk,
+                            self.row_offset
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            row == self.row_offset,
+                            "last block span keeps rows from {row}, expected {}",
+                            self.row_offset
+                        );
+                    }
+                }
             }
         }
         Ok(())
@@ -1277,20 +1680,22 @@ impl<'a> LazyEmissions<'a> {
         let (_, row0, kept) = blocks.spans[b];
         let mut wl = self.window_logits.borrow_mut();
         if wl.as_ref().map(|(wb, _)| *wb != b).unwrap_or(true) {
-            let src = &blocks.blocks[b][row0 * w..][..kept * w];
-            match &mut *wl {
-                // the buffer is reused between windows, but the index has to
-                // follow it or every frame re-runs the head
-                Some((wb, buf)) => {
-                    self.gather.window_logits(src, kept, buf);
-                    *wb = b;
+            blocks.with_block(b, |src| {
+                let src = &src[row0 * w..][..kept * w];
+                match &mut *wl {
+                    // the buffer is reused between windows, but the index has
+                    // to follow it or every frame re-runs the head
+                    Some((wb, buf)) => {
+                        self.gather.window_logits(src, kept, buf);
+                        *wb = b;
+                    }
+                    None => {
+                        let mut buf = Vec::new();
+                        self.gather.window_logits(src, kept, &mut buf);
+                        *wl = Some((b, buf));
+                    }
                 }
-                None => {
-                    let mut buf = Vec::new();
-                    self.gather.window_logits(src, kept, &mut buf);
-                    *wl = Some((b, buf));
-                }
-            }
+            });
         }
         RefMut::map(wl, |c: &mut Option<(usize, Vec<f32>)>| {
             c.as_mut().expect("just filled").1.as_mut_slice()
@@ -1340,17 +1745,19 @@ impl<'a> LazyEmissions<'a> {
         }
         let out = &mut cache.as_mut().expect("just filled").3;
         let mut norm = self.norm.borrow_mut();
-        self.gather.slice(
-            self.kind,
-            &b.blocks[block],
-            row0 + lo,
-            lo,
-            rows,
-            window_logits,
-            &self.cols,
-            out,
-            &mut norm[t0..t0 + rows],
-        );
+        self.blocks.with_block(block, |src| {
+            self.gather.slice(
+                self.kind,
+                src,
+                row0 + lo,
+                lo,
+                rows,
+                window_logits,
+                &self.cols,
+                out,
+                &mut norm[t0..t0 + rows],
+            );
+        });
         // the star columns are the reference's appended zero column, not a real
         // log-prob; the gathered value there is the blank's own log-prob, so
         // every slice row is re-stamped with `CTC_STAR_SCORE`.  Row-major: a
@@ -1443,8 +1850,10 @@ impl Emissions for LazyEmissions<'_> {
         let w = b.kind.width();
         let r = t - b.frame_base(block);
         debug_assert!(r < kept);
-        let src = &b.blocks[block][(row + r) * w..][..w];
-        self.gather.value(self.kind, src, col, self.norm.borrow()[t])
+        b.with_block(block, |src| {
+            let src = &src[(row + r) * w..][..w];
+            self.gather.value(self.kind, src, col, self.norm.borrow()[t])
+        })
     }
 
     /// The path's per-frame scores, window by window, without re-gathering a
@@ -1476,17 +1885,19 @@ impl Emissions for LazyEmissions<'_> {
                 }
             } else {
                 let w = b.kind.width();
-                let src = &b.blocks[bi][row * w..][..kept * w];
-                for r in 0..kept {
-                    let t = base + r;
-                    let st = states[t] as usize;
-                    out[t] = if self.star_cols.contains(&st) {
-                        CTC_STAR_SCORE as f64
-                    } else {
-                        let col = self.cols[st] as usize;
-                        self.gather.value(self.kind, &src[r * w..][..w], col, norm[t]) as f64
-                    };
-                }
+                b.with_block(bi, |src| {
+                    let src = &src[row * w..][..kept * w];
+                    for r in 0..kept {
+                        let t = base + r;
+                        let st = states[t] as usize;
+                        out[t] = if self.star_cols.contains(&st) {
+                            CTC_STAR_SCORE as f64
+                        } else {
+                            let col = self.cols[st] as usize;
+                            self.gather.value(self.kind, &src[r * w..][..w], col, norm[t]) as f64
+                        };
+                    }
+                });
             }
         }
     }
@@ -1681,20 +2092,20 @@ mod tests {
             );
             spans.push((i, row_offset, kept));
         }
-        let lb = LazyBlocks {
+        let lb = LazyBlocks::owned(
             blocks,
-            kind: BlockKind::Hidden { hidden: hidden_dim },
-            num_states: s,
-            frames_per_chunk: per,
+            BlockKind::Hidden { hidden: hidden_dim },
+            s,
+            per,
             row_offset,
             spans,
-        };
+        );
 
         // reference: head over each block's kept rows, gathered straight —
         // no windows, no slices, no caches
         let mut flat = Vec::new();
         for (bi, &(_, row, kept)) in lb.spans.iter().enumerate() {
-            let src = &lb.blocks[bi][row * hidden_dim..(row + kept) * hidden_dim];
+            let src = &lb.owned_blocks()[bi][row * hidden_dim..(row + kept) * hidden_dim];
             let mut logits = vec![0f32; kept * vocab];
             head.into_logits(src, kept, &mut logits);
             for r in 0..kept {
@@ -1785,19 +2196,19 @@ mod tests {
             );
             spans.push((i, row_offset, kept));
         }
-        let lb = LazyBlocks {
+        let lb = LazyBlocks::owned(
             blocks,
-            kind: BlockKind::Hidden { hidden: hidden_dim },
-            num_states: s,
-            frames_per_chunk: per,
+            BlockKind::Hidden { hidden: hidden_dim },
+            s,
+            per,
             row_offset,
             spans,
-        };
+        );
 
         // reference: the gathered form, stamped exactly as forward_gathered does
         let mut flat = Vec::new();
         for (bi, &(_, row, kept)) in lb.spans.iter().enumerate() {
-            let src = &lb.blocks[bi][row * hidden_dim..(row + kept) * hidden_dim];
+            let src = &lb.owned_blocks()[bi][row * hidden_dim..(row + kept) * hidden_dim];
             let mut logits = vec![0f32; kept * vocab];
             head.into_logits(src, kept, &mut logits);
             for r in 0..kept {
@@ -1914,20 +2325,20 @@ mod tests {
             );
             spans.push((i, row_offset, kept));
         }
-        let lb = LazyBlocks {
+        let lb = LazyBlocks::owned(
             blocks,
-            kind: BlockKind::Logits { vocab },
-            num_states: s,
-            frames_per_chunk: per,
+            BlockKind::Logits { vocab },
+            s,
+            per,
             row_offset,
             spans,
-        };
+        );
 
         // the same values, gathered: what the block-per-window path holds
         let mut flat = Vec::with_capacity(total_kept * s);
         for (b, &(_, row, kept)) in lb.spans.iter().enumerate() {
             for r in 0..kept {
-                let src = &lb.blocks[b][(row + r) * vocab..][..vocab];
+                let src = &lb.owned_blocks()[b][(row + r) * vocab..][..vocab];
                 for &c in &expanded {
                     flat.push(src[c]);
                 }
@@ -2003,14 +2414,14 @@ mod tests {
             );
             spans.push((i, row_offset, kept));
         }
-        let lb = LazyBlocks {
+        let lb = LazyBlocks::owned(
             blocks,
-            kind: BlockKind::Logits { vocab },
-            num_states: s,
-            frames_per_chunk: per,
+            BlockKind::Logits { vocab },
+            s,
+            per,
             row_offset,
             spans,
-        };
+        );
 
         let em = LazyEmissions::new(&lb, RowGather::Gpu, &expanded, &star_state_idx);
         em.validate().unwrap();
@@ -2018,7 +2429,7 @@ mod tests {
 
         // the stored blank really is the tempting value, so the assertions
         // below cannot pass by accident
-        let raw_blank = em.blocks.blocks[0][(row_offset as usize) * vocab + blank];
+        let raw_blank = em.blocks.owned_blocks()[0][(row_offset as usize) * vocab + blank];
         assert!(raw_blank > -0.01, "blank column should look attractive, got {raw_blank}");
 
         for t in 0..total_kept {
@@ -2036,7 +2447,7 @@ mod tests {
         let mut flat = Vec::with_capacity(total_kept * s);
         for (b, &(_, row, kept)) in lb.spans.iter().enumerate() {
             for r in 0..kept {
-                let src = &lb.blocks[b][(row + r) * vocab..][..vocab];
+                let src = &lb.owned_blocks()[b][(row + r) * vocab..][..vocab];
                 for (j, &c) in expanded.iter().enumerate() {
                     flat.push(if star_state_idx.contains(&j) {
                         CTC_STAR_SCORE
