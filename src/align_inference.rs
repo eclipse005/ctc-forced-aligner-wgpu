@@ -1231,8 +1231,16 @@ impl SharedBlocks {
     }
 
     /// Wake every waiter: the encode died and no more blocks are coming.
+    ///
+    /// The flag store takes the same mutex the waiter's predicate loop holds,
+    /// so a waiter cannot observe `failed == false`, release the lock into
+    /// `cv.wait`, and miss this notification — the notify-before-sleep lost
+    /// wakeup a lock-free flag allows. (`put` needs no such dance: it writes
+    /// the slot under the lock, which is the predicate itself.)
     fn fail(&self) {
+        let _g = self.lock();
         self.failed.store(true, Ordering::Release);
+        drop(_g);
         self.cv.notify_all();
     }
 

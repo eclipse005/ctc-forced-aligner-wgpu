@@ -860,7 +860,7 @@ impl RowTeam {
         let mut workers = match std::env::var("CTC_DP_THREADS").ok().as_deref().map(str::parse::<usize>)
         {
             Some(Ok(n)) if n >= 1 => n,
-            _ => cores.saturating_sub(1).min(12).max(2),
+            _ => cores.saturating_sub(1).clamp(2, 12),
         };
         // every partition needs at least one 4-state group
         workers = workers.min(s / 4).max(1);
@@ -898,7 +898,15 @@ impl RowTeam {
             }
         }
         if handles.len() < 2 {
-            // a team of one cannot barrier against itself — fall back
+            // a team of one cannot barrier against itself — and a partial
+            // spawn must not leak: dropping the half-built team publishes the
+            // shutdown flag and joins whoever did start
+            drop(Self {
+                shared,
+                workers: handles.len(),
+                frame: 0,
+                handles,
+            });
             return None;
         }
         let workers = handles.len();
