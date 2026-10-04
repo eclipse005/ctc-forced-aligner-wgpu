@@ -426,7 +426,8 @@ impl Aligner {
                         let frames = em.total_frames();
                         em.validate()?;
                         ctc_forced_align_emissions_with_word_ids(
-                            &em, frames, &ids, self.frame_rate, Some(&pieces), &word_ids)?
+                            &em, frames, &ids, self.vocab.star_id, self.frame_rate,
+                            Some(&pieces), &word_ids)?
                     }
                 };
                 (res, encode_s, t_al.elapsed().as_secs_f64())
@@ -1037,7 +1038,8 @@ impl Aligner {
                         let em = LazyEmissions::new(&blocks, gather, expanded, star_state_idx);
                         em.validate()?;
                         ctc_forced_align_emissions_with_word_ids(
-                            &em, frames, ids, self.frame_rate, Some(pieces), word_ids,
+                            &em, frames, ids, self.vocab.star_id, self.frame_rate, Some(pieces),
+                            word_ids,
                         )
                     }));
                     let res = match out {
@@ -1619,9 +1621,6 @@ struct LazyEmissions<'a> {
     /// A set, not a list: `score_path` asks once per frame per window, and a
     /// linear scan over a few hundred stars is ~10^7 comparisons on an hour.
     star_cols: std::collections::HashSet<usize>,
-    /// the same states, ascending: the per-slice stamping walks them row by
-    /// row, and a sorted sweep keeps the writes inside one cached row
-    star_sorted: Vec<usize>,
     /// frames per gathered slice, from [`slice_frames`] for this trellis's
     /// state count
     slice_frames: usize,
@@ -1644,11 +1643,6 @@ impl<'a> LazyEmissions<'a> {
             window_logits: std::cell::RefCell::new(None),
             norm: std::cell::RefCell::new(vec![0.0; frames]),
             star_cols: star_state_idx
-                .iter()
-                .copied()
-                .filter(|&i| i < blocks.num_states)
-                .collect(),
-            star_sorted: star_state_idx
                 .iter()
                 .copied()
                 .filter(|&i| i < blocks.num_states)
@@ -1758,19 +1752,10 @@ impl<'a> LazyEmissions<'a> {
                 &mut norm[t0..t0 + rows],
             );
         });
-        // the star columns are the reference's appended zero column, not a real
-        // log-prob; the gathered value there is the blank's own log-prob, so
-        // every slice row is re-stamped with `CTC_STAR_SCORE`.  Row-major: a
-        // slice row is `s * 4` bytes and stays in cache while its ~50 k star
-        // cells are written; the old column-major loop walked all `rows` of a
-        // slice per star — every write a fresh cache line, ~16 M of them per
-        // slice on an hour's transcript, and it owned 2/3 of the DP's wall
-        // time.  `star_sorted` is already ascending.
-        for row in out.chunks_exact_mut(s) {
-            for &c in &self.star_sorted {
-                row[c] = CTC_STAR_SCORE;
-            }
-        }
+        // the star states' cells hold the blank's log-prob here — the star's
+        // own id sits past the vocabulary — and the DP's row kernel substitutes
+        // the reference's constant through its own bitmap when it reads them,
+        // so no per-slice stamping pass is needed
     }
 
     /// The gathered trellis slice holding frame `t`, as (buffer, first row of
@@ -1828,21 +1813,20 @@ impl Emissions for LazyEmissions<'_> {
     /// rows — no second gather of the whole file.
     fn score(&self, t: usize, st: usize) -> f32 {
         let b = self.blocks;
+        // The star's score is the reference's appended constant, not whatever
+        // the source holds in the cell (a star target gathers the blank's
+        // column, since the star's own id sits past the vocabulary).  This
+        // read happens before the DP's first `fill_emit` (the DP seeds
+        // `prev[0]`/`prev[1]` from frame 0 through here) — the DP's row kernel
+        // applies the same constant through its own star bitmap.
+        if self.star_cols.contains(&st) {
+            return CTC_STAR_SCORE;
+        }
         if matches!(self.kind, BlockKind::Hidden { .. }) {
             // pre-lm-head rows: the column only exists in the gathered slice
             let (block, lo, _) = self.slice_at(t);
             let s = b.num_states;
             return block[(t % b.frames_per_chunk - lo) * s + st];
-        }
-        // The star's column was gathered from BLANK_ID, so the stored row's
-        // own value is the blank log-prob, not the reference's constant.  This
-        // read happens before the DP's first `fill_emit` (the DP seeds
-        // `prev[0]`/`prev[1]` from frame 0 through here), so without the
-        // check the first frames score the star on the blank and the path
-        // parks on it from frame 0 instead of waiting for the model to make
-        // it likely.
-        if self.star_cols.contains(&st) {
-            return CTC_STAR_SCORE;
         }
         let col = self.cols[st] as usize;
         let (block, row, kept) = b.span_of(t);
@@ -2131,7 +2115,7 @@ mod tests {
         let want = ctc_forced_align_gathered_with_word_ids(
             &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
         let got =
-            ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids).unwrap();
+            ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, usize::MAX, 50.0, Some(&pieces), &word_ids).unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());
         for (g, w) in got.tokens.iter().zip(&want.tokens) {
@@ -2146,15 +2130,17 @@ mod tests {
 
     /// The `<star>` sentinel is a real target, and its column is the
     /// reference's *appended* zero column rather than a real log-prob.  The
-    /// gathered form stamps it once up front; a lazy block re-derives every
-    /// slice from stored rows, so it has to stamp it again or the DP reads the
-    /// blank log-prob the column was gathered from (~-0.005) where the
-    /// constant is -1.0 — the star then parks for a different number of frames
-    /// and every later boundary moves with it.
+    /// gathered form stamps it once up front; a lazy block's slice holds the
+    /// blank log-prob the star's column was gathered from (~-0.005) where the
+    /// constant is -1.0, and the constant is applied by the DP's row kernel
+    /// (through its star bitmap) and by `score`/`score_path` (through
+    /// `star_cols`) — without those, the star parks for a different number of
+    /// frames and every later boundary moves with it.
     ///
-    /// Both read paths matter: `fill_slice` feeds the DP forward, `score_path`
-    /// rescores the chosen path afterwards.  A fix in only one of them leaves
-    /// a token whose timestamp and whose score disagree.
+    /// All three read paths matter: the row kernel feeds the DP, `score` seeds
+    /// frame 0, and `score_path` rescores the chosen path afterwards.  A fix
+    /// in only one of them leaves a token whose timestamp and whose score
+    /// disagree.
     #[test]
     fn lazy_star_columns_score_the_reference_constant() {
         let (hidden_dim, vocab, l) = (8usize, 23usize, 5usize);
@@ -2231,22 +2217,28 @@ mod tests {
         em.validate().unwrap();
         let total_kept = 2 * per + kept_last;
 
-        // every gathered slice carries the constant, never the blank score
+        // the slice's star cells hold the blank's own log-prob — the stamping
+        // pass is gone, and the DP's row kernel substitutes the constant
+        // through its bitmap — so the slice must read back as the UNGATHERED
+        // value, while `score()` (the read path the DP's seed and `score_path`
+        // use) must still answer the constant
         for t in 0..total_kept {
             let (buf, lo, _rows) = em.slice_at(t);
             let r = t % em.blocks.frames_per_chunk - lo;
             let frame = &buf[r * s..][..s];
             for &si in &star_state_idx {
-                assert_eq!(
+                // the gathered blank value, NOT the -1.0 constant: a
+                // regression to slice-side stamping cannot pass
+                assert_ne!(
                     frame[si], CTC_STAR_SCORE,
-                    "frame {t} star column {si} is not the reference constant"
+                    "frame {t}: the slice must hold the gathered value, not a stamp"
                 );
-                // -1.0, not the ~-0.005 blank log-prob the column was
-                // gathered from: below the guard, so a regression to the
-                // ungathered value cannot pass as equal
-                assert!(
-                    frame[si] < -0.5,
-                    "frame {t}: the constant must not read back as a blank log-prob"
+            }
+            for &si in &star_state_idx {
+                assert_eq!(
+                    em.score(t, si),
+                    CTC_STAR_SCORE,
+                    "score({t}, star state {si}) is not the reference constant"
                 );
             }
         }
@@ -2270,7 +2262,7 @@ mod tests {
         let want = ctc_forced_align_gathered_with_word_ids(
             &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
         let got = ctc_forced_align_emissions_with_word_ids(
-            &em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids).unwrap();
+            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids).unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());
         for (g, w) in got.tokens.iter().zip(&want.tokens) {
@@ -2360,7 +2352,7 @@ mod tests {
         let word_ids: Vec<usize> = (0..token_ids.len()).collect();
         let want = ctc_forced_align_gathered_with_word_ids(
             &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
-        let got = ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids)
+        let got = ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, usize::MAX, 50.0, Some(&pieces), &word_ids)
             .unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());
@@ -2468,7 +2460,7 @@ mod tests {
         let want = ctc_forced_align_gathered_with_word_ids(
             &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
         let got = ctc_forced_align_emissions_with_word_ids(
-            &em, total_kept, &token_ids, 50.0, Some(&pieces), &word_ids).unwrap();
+            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids).unwrap();
 
         for (g, w) in got.tokens.iter().zip(&want.tokens) {
             assert_eq!(

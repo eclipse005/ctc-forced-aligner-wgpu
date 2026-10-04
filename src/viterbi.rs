@@ -11,6 +11,8 @@
 
 use anyhow::Context;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// One aligned token and its time span.
 #[derive(Debug, Clone)]
@@ -74,6 +76,22 @@ impl AlignmentResult {
         self.log_prob / self.frames.max(1) as f64
     }
 }
+
+/// The score the reference gives `<star>`: the column it appends to its
+/// emissions is `torch.cat([emissions, zeros(..., 1)], dim=1)` AFTER the
+/// log_softmax, so every star frame scores exactly 0.0 — measured on a real
+/// utterance, where the appended column is all zeros while the real column
+/// beside it averages −2.457.
+///
+/// Scoring it 0.0 exactly, as the reference does, lets the path PARK on the
+/// star: with a 0 to tie or beat the blank, the unbanded DP held it for eleven
+/// consecutive frames where the reference held it for one, which moved every
+/// later boundary with it. A small negative value keeps the star reachable —
+/// it still has to be placed, the CTC path cannot skip a target — while making
+/// the blank strictly preferable on any frame where the model is not sure the
+/// frame is the star, which is the situation the reference's own banding
+/// produces.
+pub(crate) const CTC_STAR_SCORE: f32 = -1.0;
 
 /// One trellis row. `skip_dead[st] == u64::MAX` forbids the skip arc.
 /// Tie-break matches numpy `argmax` over `[stay, advance, skip]`: the first
@@ -147,12 +165,13 @@ fn dp_row_par(
     prev: &[f64],
     emit: &[f32],
     skip_dead: &[u64],
+    star4: &[u8],
     next: &mut [f64],
     back: Option<&mut [u8]>,
     use_avx2: bool,
 ) {
     let s = prev.len();
-    dp_row_range(prev, emit, skip_dead, next, back, 0, s - 1, use_avx2)
+    dp_row_range(prev, emit, skip_dead, star4, next, back, 0, s - 1, use_avx2)
 }
 
 /// States `[lo, hi]` of one row — the *band* the DP computes for frame `t`.
@@ -168,6 +187,7 @@ fn dp_row_range(
     prev: &[f64],
     emit: &[f32],
     skip_dead: &[u64],
+    star4: &[u8],
     next: &mut [f64],
     mut back: Option<&mut [u8]>,
     lo: usize,
@@ -184,7 +204,7 @@ fn dp_row_range(
     let first = (lo >> 2) << 2;
     if first >= 4 {
         // the band opens past the row head: no scalar prologue needed
-        return dp_row_body(prev, emit, skip_dead, next, back, first, end, use_avx2);
+        return dp_row_body(prev, emit, skip_dead, star4, next, back, first, end, use_avx2);
     }
     // the band includes states 0..4: they run first and serially — the
     // vector kernel reads st-2, and 4 is also the first offset that owns a
@@ -193,7 +213,7 @@ fn dp_row_range(
     if head > 0 {
         let mut byte = 0u8;
         for k in 0..head {
-            byte |= dp_one(k, prev, emit, skip_dead, &mut next[k..]) << (k * 2);
+            byte |= dp_one(k, prev, emit, skip_dead, star4, &mut next[k..]) << (k * 2);
         }
         if let Some(back) = back.as_deref_mut() {
             put_back_byte(back, 0, byte);
@@ -202,7 +222,7 @@ fn dp_row_range(
     if head >= end {
         return;
     }
-    dp_row_body(prev, emit, skip_dead, next, back, 4, end, use_avx2);
+    dp_row_body(prev, emit, skip_dead, star4, next, back, 4, end, use_avx2);
 }
 
 /// States `[st0, end)` of one row, split across threads when wide enough.
@@ -210,6 +230,7 @@ fn dp_row_body(
     prev: &[f64],
     emit: &[f32],
     skip_dead: &[u64],
+    star4: &[u8],
     next: &mut [f64],
     back: Option<&mut [u8]>,
     st0: usize,
@@ -219,7 +240,7 @@ fn dp_row_body(
     if end - st0 < PAR_ROW_MIN_STATES {
         // too small to be worth splitting: one serial range
         let bytes = back.map(|b| &mut b[st0 >> 2..]);
-        return dp_range(prev, emit, skip_dead, &mut next[st0..end], bytes, st0, use_avx2);
+        return dp_range(prev, emit, skip_dead, star4, &mut next[st0..end], bytes, st0, use_avx2);
     }
     let per = {
         // whole 4-groups, and enough of them to fill the pool
@@ -235,11 +256,20 @@ fn dp_row_body(
             .zip(bytes.par_chunks_mut(per / 4))
             .enumerate()
             .for_each(|(ci, (chunk, row))| {
-                dp_range(prev, emit, skip_dead, chunk, Some(row), st0 + ci * per, use_avx2)
+                dp_range(
+                    prev,
+                    emit,
+                    skip_dead,
+                    star4,
+                    chunk,
+                    Some(row),
+                    st0 + ci * per,
+                    use_avx2,
+                )
             }),
         None => next[st0..end].par_chunks_mut(per).enumerate().for_each(
             |(ci, chunk)| {
-                dp_range(prev, emit, skip_dead, chunk, None, st0 + ci * per, use_avx2)
+                dp_range(prev, emit, skip_dead, star4, chunk, None, st0 + ci * per, use_avx2)
             },
         ),
     }
@@ -250,6 +280,7 @@ fn dp_range(
     prev: &[f64],
     emit: &[f32],
     skip_dead: &[u64],
+    star4: &[u8],
     next: &mut [f64],
     back: Option<&mut [u8]>,
     st0: usize,
@@ -258,16 +289,17 @@ fn dp_range(
     #[cfg(target_arch = "x86_64")]
     if use_avx2 {
         // SAFETY: use_avx2 is the runtime AVX2 check.
-        unsafe { dp_range_avx2(prev, emit, skip_dead, next, back, st0) };
+        unsafe { dp_range_avx2(prev, emit, skip_dead, star4, next, back, st0) };
         return;
     }
-    dp_range_scalar(prev, emit, skip_dead, next, back, st0);
+    dp_range_scalar(prev, emit, skip_dead, star4, next, back, st0);
 }
 
 fn dp_range_scalar(
     prev: &[f64],
     emit: &[f32],
     skip_dead: &[u64],
+    star4: &[u8],
     next: &mut [f64],
     mut back: Option<&mut [u8]>,
     st0: usize,
@@ -280,7 +312,14 @@ fn dp_range_scalar(
             if st + k >= end {
                 break;
             }
-            byte |= dp_one(st + k, prev, emit, skip_dead, &mut next[st + k - st0..]) << (k * 2);
+            byte |= dp_one(
+                st + k,
+                prev,
+                emit,
+                skip_dead,
+                star4,
+                &mut next[st + k - st0..],
+            ) << (k * 2);
         }
         if let Some(row) = back.as_deref_mut() {
             put_back_byte(row, (st - st0) >> 2, byte);
@@ -295,6 +334,7 @@ unsafe fn dp_range_avx2(
     prev: &[f64],
     emit: &[f32],
     skip_dead: &[u64],
+    star4: &[u8],
     next: &mut [f64],
     mut back: Option<&mut [u8]>,
     st0: usize,
@@ -302,12 +342,16 @@ unsafe fn dp_range_avx2(
     use std::arch::x86_64::{
         _mm256_add_pd, _mm256_and_pd, _mm256_blendv_pd, _mm256_castsi256_pd, _mm256_cmp_pd,
         _mm256_cvtps_pd, _mm256_loadu_pd, _mm256_loadu_si256, _mm256_movemask_pd,
-        _mm256_set1_pd, _mm256_storeu_pd, _mm_loadu_ps, _CMP_GE_OQ,
+        _mm256_set1_pd, _mm256_storeu_pd, _mm_blendv_ps, _mm_loadu_ps, _mm_setr_ps,
+        _CMP_GE_OQ,
     };
     let end = st0 + next.len();
     debug_assert!(st0 >= 2, "the vector loop reads prev[st-2]; the driver starts at 4");
     debug_assert!(st0 % 4 == 0, "chunks are 4-aligned so they own whole back bytes");
     let neginf = _mm256_set1_pd(f64::NEG_INFINITY);
+    // the star states' emission is the reference's appended constant; the
+    // gathered cell under a star state holds the blank's log-prob and is
+    // never read. Most 4-state groups carry no star, so the blend is gated.
     let mut st = st0;
     while st + 4 <= end {
         let stay = _mm256_loadu_pd(prev.as_ptr().add(st));
@@ -323,7 +367,26 @@ unsafe fn dp_range_avx2(
         let best = _mm256_blendv_pd(adv_or_skip, stay, stay_wins);
         // the f32 emission converts exactly to f64 — the same value the f64
         // staging row used to hold, loaded straight from the narrower row
-        let out = _mm256_add_pd(best, _mm256_cvtps_pd(_mm_loadu_ps(emit.as_ptr().add(st))));
+        let mut ev = _mm_loadu_ps(emit.as_ptr().add(st));
+        let sb = *star4.get(st >> 2).unwrap_or(&0);
+        if sb != 0 {
+            // blendv picks a lane by its mask's sign bit; the star lanes take
+            // the constant, exactly the value the slice stamp used to write
+            let starv = _mm_setr_ps(
+                if sb & 1 != 0 { CTC_STAR_SCORE } else { 0.0 },
+                if sb & 2 != 0 { CTC_STAR_SCORE } else { 0.0 },
+                if sb & 4 != 0 { CTC_STAR_SCORE } else { 0.0 },
+                if sb & 8 != 0 { CTC_STAR_SCORE } else { 0.0 },
+            );
+            let m = _mm_setr_ps(
+                if sb & 1 != 0 { -0.0 } else { 0.0 },
+                if sb & 2 != 0 { -0.0 } else { 0.0 },
+                if sb & 4 != 0 { -0.0 } else { 0.0 },
+                if sb & 8 != 0 { -0.0 } else { 0.0 },
+            );
+            ev = _mm_blendv_ps(ev, starv, m);
+        }
+        let out = _mm256_add_pd(best, _mm256_cvtps_pd(ev));
         _mm256_storeu_pd(next.as_mut_ptr().add(st - st0), out);
         if let Some(row) = back.as_deref_mut() {
             // 2 bits per state, four states to a byte: stay = 0b00, advance =
@@ -346,7 +409,8 @@ unsafe fn dp_range_avx2(
         // so it can be written whole without reading first
         let mut byte = 0u8;
         while st < end {
-            byte |= dp_one(st, prev, emit, skip_dead, &mut next[st - st0..]) << ((st & 3) * 2);
+            byte |= dp_one(st, prev, emit, skip_dead, star4, &mut next[st - st0..])
+                << ((st & 3) * 2);
             st += 1;
         }
         if let Some(row) = back.as_deref_mut() {
@@ -358,7 +422,19 @@ unsafe fn dp_range_avx2(
 /// One state of the row: returns its packed choice and writes the new score
 /// to `next[0]` — callers pass the sub-slice for state `st`, which is what lets
 /// a parallel chunk own a contiguous piece of the row.
-fn dp_one(st: usize, prev: &[f64], emit: &[f32], skip_dead: &[u64], next: &mut [f64]) -> u8 {
+///
+/// `star4` marks the `<star>` states, one bit per state in a byte per 4: a
+/// star's emission is the reference's appended constant, not whatever the
+/// source gathered into its cell (a star target gathers the blank's column,
+/// since the star's own id sits past the vocabulary).
+fn dp_one(
+    st: usize,
+    prev: &[f64],
+    emit: &[f32],
+    skip_dead: &[u64],
+    star4: &[u8],
+    next: &mut [f64],
+) -> u8 {
     let stay = prev[st];
     let adv = if st >= 1 { prev[st - 1] } else { f64::NEG_INFINITY };
     let skip = if st >= 2 && skip_dead[st] == 0 {
@@ -373,7 +449,12 @@ fn dp_one(st: usize, prev: &[f64], emit: &[f32], skip_dead: &[u64], next: &mut [
     } else {
         (2, skip)
     };
-    next[0] = best + emit[st] as f64;
+    let e = if star4[st >> 2] >> (st & 3) & 1 != 0 {
+        CTC_STAR_SCORE
+    } else {
+        emit[st]
+    };
+    next[0] = best + e as f64;
     choice
 }
 
@@ -593,7 +674,7 @@ pub(crate) fn ctc_forced_align(
 ) -> anyhow::Result<AlignmentResult> {
     let labels = build_expanded_labels(token_ids, blank_id);
     let em = FullRows { log_probs, vocab, labels: &labels, blank_id };
-    align(&em, num_frames, &labels, blank_id, token_ids, frame_rate, pieces, return_path)
+    align(&em, num_frames, &labels, blank_id, usize::MAX, token_ids, frame_rate, pieces, return_path)
 }
 
 /// Force-align against a pre-gathered (T, S) score matrix with
@@ -627,7 +708,7 @@ pub(crate) fn ctc_forced_align_gathered(
         .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
         .collect();
     let em = GatheredRows { gathered, num_states };
-    align(&em, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
+    align(&em, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate, pieces, false)
 }
 
 /// Same DP over [`GatheredChunks`]: the per-window blocks the aligner
@@ -651,7 +732,7 @@ pub(crate) fn ctc_forced_align_gathered_chunks(
     let labels: Vec<usize> = (0..num_states)
         .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
         .collect();
-    align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate, pieces, false)
+    align(&chunks, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate, pieces, false)
 }
 
 
@@ -678,17 +759,271 @@ struct Dp<'a, E: Emissions + ?Sized> {
     band: bool,
     /// all-ones lane => the skip arc is illegal (forced to -inf)
     skip_dead: Vec<u64>,
+    /// the `<star>` states' emission bitmap: bit `st & 3` of `star4[st >> 2]`
+    /// marks state `st`, whose score is [`CTC_STAR_SCORE`] regardless of what
+    /// the emissions source holds in its cell
+    star4: Vec<u8>,
     prev: Vec<f64>,
     next: Vec<f64>,
 
+    /// the fixed row team on wide DPs; `None` keeps the serial/rayon row path
+    team: Option<RowTeam>,
 
     #[cfg(target_arch = "x86_64")]
     avx2: bool,
 }
 
+/// The DP's per-frame row split, run by a fixed team of workers.
+///
+/// The row is memory-bound and has no cross-state dependency, so any
+/// partition of the states gives bit-identical results — but the partitioning
+/// decides the memory traffic. rayon's per-frame `par_chunks_mut` has no core
+/// affinity, so the two alpha rows (1 MB each at the 1 h fixture's 124 k
+/// states) migrate between cores' L2s every frame and every state streams
+/// ~20 B from DRAM; a worker pinned to its own state range keeps its slice of
+/// the alpha rows L2-resident, and the per-frame traffic collapses to the
+/// emission row and the backpointer bytes. The per-frame rayon fork/join
+/// (~10-30 µs against rows the box measured at +6 % for splitting) goes with
+/// it.
+///
+/// Protocol per frame: the coordinator publishes the row's parameters into
+/// [`TeamShared::params`], bumps `ready`, and waits until `done` reaches
+/// `frame · workers`; each worker waits for `ready > its generation`, reads
+/// the parameters, computes its range, and bumps `done`. Both counters are
+/// monotone and Acquire/Release — the generation numbers are the barrier, no
+/// sense reversal needed. Workers spin briefly and then yield, so the idle
+/// time between frames (slice gathers, the head's GEMM — both rayon work)
+/// does not starve the pool that runs it.
+struct RowTeam {
+    shared: Arc<TeamShared>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    workers: usize,
+    /// frames published so far
+    frame: usize,
+}
+
+/// One frame's row, published by the coordinator and consumed by every
+/// worker. Pointers are valid for exactly one frame: the coordinator holds
+/// the borrows across its own wait, and the workers' use ends before their
+/// `done` bump, which is what the coordinator waits on.
+struct FrameParams {
+    prev: *const f64,
+    next: *mut f64,
+    emit: *const f32,
+    skip_dead: *const u64,
+    /// the `<star>` states' bitmap, one bit per state in a byte per 4
+    star4: *const u8,
+    /// null on the alpha-only pass, which keeps no choices
+    back: *mut u8,
+    s: usize,
+    /// the body's 4-aligned start — the band head below it ran serially
+    first: usize,
+    /// the band's hi + 1
+    end: usize,
+    use_avx2: bool,
+    shutdown: bool,
+}
+
+struct TeamShared {
+    ready: AtomicUsize,
+    done: AtomicUsize,
+    params: std::cell::UnsafeCell<FrameParams>,
+}
+
+// SAFETY: `params` is written by the coordinator alone, between the frame's
+// `done` completing and its `ready` bump, and read by workers between their
+// `ready` observation and their `done` bump — the two Acquire/Release
+// counters are the synchronisation, and the pointers inside are valid for
+// exactly that window. Send holds for the same reason: the struct's raw
+// pointers are per-frame published and never dereferenced outside the
+// protocol, and the pointee memory outlives the team (the coordinator owns
+// it across every frame).
+unsafe impl Sync for TeamShared {}
+unsafe impl Send for TeamShared {}
+
+/// Below this many cells the row is too narrow to be worth a team; the
+/// serial/rayon row path handles small files.
+const TEAM_MIN_CELLS: u128 = 512_000_000;
+
+/// Spin iterations before a waiter falls back to yielding.
+const SPIN_BEFORE_YIELD: usize = 1 << 13;
+
+impl RowTeam {
+    /// Spawn a team for an `s`-state, `t_len`-frame DP — `None` below the
+    /// cell threshold unless `force` (the tests' dial). `CTC_DP_THREADS`
+    /// overrides the worker count.
+    fn maybe_spawn(s: usize, t_len: usize, force: bool) -> Option<Self> {
+        if (t_len as u128) * (s as u128) < TEAM_MIN_CELLS && !force {
+            return None;
+        }
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let mut workers = match std::env::var("CTC_DP_THREADS").ok().as_deref().map(str::parse::<usize>)
+        {
+            Some(Ok(n)) if n >= 1 => n,
+            _ => cores.saturating_sub(1).min(12).max(2),
+        };
+        // every partition needs at least one 4-state group
+        workers = workers.min(s / 4).max(1);
+        if workers < 2 {
+            return None;
+        }
+        let shared = Arc::new(TeamShared {
+            ready: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            params: std::cell::UnsafeCell::new(FrameParams {
+                prev: std::ptr::null(),
+                next: std::ptr::null_mut(),
+                emit: std::ptr::null(),
+                skip_dead: std::ptr::null(),
+                star4: std::ptr::null(),
+                back: std::ptr::null_mut(),
+                s: 0,
+                first: 0,
+                end: 0,
+                use_avx2: false,
+                shutdown: true,
+            }),
+        });
+        let mut handles = Vec::with_capacity(workers);
+        for i in 0..workers {
+            // 4-aligned partitions; the last one takes the row's tail states
+            let p_lo = (s * i / workers / 4) * 4;
+            let p_hi = if i + 1 == workers { s } else { (s * (i + 1) / workers / 4) * 4 };
+            let sh = shared.clone();
+            match std::thread::Builder::new().name("ctc-dp-row".into()).spawn(move || {
+                team_worker(sh, p_lo, p_hi)
+            }) {
+                Ok(h) => handles.push(h),
+                Err(_) => break,
+            }
+        }
+        if handles.len() < 2 {
+            // a team of one cannot barrier against itself — fall back
+            return None;
+        }
+        let workers = handles.len();
+        Some(Self { shared, handles, workers, frame: 0 })
+    }
+
+    /// One row: publish, wait for every worker's range, return. Blocks until
+    /// the row is fully computed — the caller's borrows outlive exactly that.
+    #[allow(clippy::too_many_arguments)]
+    fn run_row(
+        &mut self,
+        prev: &[f64],
+        emit: &[f32],
+        skip_dead: &[u64],
+        star4: &[u8],
+        next: &mut [f64],
+        back: Option<&mut [u8]>,
+        first: usize,
+        end: usize,
+        use_avx2: bool,
+    ) {
+        let s = prev.len();
+        {
+            let p = self.shared.params.get();
+            // SAFETY: no worker is inside the window — the previous frame's
+            // `done` completed before this call, and `ready` has not moved.
+            unsafe {
+                *p = FrameParams {
+                    prev: prev.as_ptr(),
+                    next: next.as_mut_ptr(),
+                    emit: emit.as_ptr(),
+                    skip_dead: skip_dead.as_ptr(),
+                    star4: star4.as_ptr(),
+                    back: match back {
+                        Some(b) => b.as_mut_ptr(),
+                        None => std::ptr::null_mut(),
+                    },
+                    s,
+                    first,
+                    end,
+                    use_avx2,
+                    shutdown: false,
+                };
+            }
+        }
+        self.frame += 1;
+        self.shared.ready.store(self.frame, Ordering::Release);
+        let target = self.frame * self.workers;
+        let mut spins = 0usize;
+        while self.shared.done.load(Ordering::Acquire) < target {
+            spins += 1;
+            if spins < SPIN_BEFORE_YIELD {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+impl Drop for RowTeam {
+    fn drop(&mut self) {
+        // SAFETY: no worker is in the window (the last frame's `done`
+        // completed before this struct can drop).
+        unsafe {
+            (*self.shared.params.get()).shutdown = true;
+        }
+        self.shared.ready.store(self.frame + 1, Ordering::Release);
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// One worker: own the state range `[p_lo, p_hi)` for the team's lifetime.
+fn team_worker(shared: Arc<TeamShared>, p_lo: usize, p_hi: usize) {
+    let mut gen = 0usize;
+    let mut spins = 0usize;
+    loop {
+        while shared.ready.load(Ordering::Acquire) <= gen {
+            spins += 1;
+            if spins < SPIN_BEFORE_YIELD {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        gen += 1;
+        spins = 0;
+        let p = unsafe { &*shared.params.get() };
+        if p.shutdown {
+            return;
+        }
+        let my_lo = p_lo.max(p.first);
+        let my_hi = p_hi.min(p.end);
+        if my_lo < my_hi {
+            unsafe {
+                let prev = std::slice::from_raw_parts(p.prev, p.s);
+                let emit = std::slice::from_raw_parts(p.emit, p.s);
+                let skip_dead = std::slice::from_raw_parts(p.skip_dead, p.s);
+                let star4 = std::slice::from_raw_parts(p.star4, p.s.div_ceil(4));
+                let next = std::slice::from_raw_parts_mut(p.next.add(my_lo), my_hi - my_lo);
+                // the slice runs to the row's end, as `dp_row_body`'s does: a
+                // band edge mid-byte writes that byte whole, and its fields
+                // past the band are never read by the traceback
+                let back = if p.back.is_null() {
+                    None
+                } else {
+                    let rb = p.s.div_ceil(4);
+                    Some(std::slice::from_raw_parts_mut(
+                        p.back.add(my_lo >> 2),
+                        rb - (my_lo >> 2),
+                    ))
+                };
+                dp_range(prev, emit, skip_dead, star4, next, back, my_lo, p.use_avx2);
+            }
+        }
+        shared.done.fetch_add(1, Ordering::Release);
+    }
+}
+
 impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
     /// `prev` starts as the alpha at frame 0: state 0 is the first blank and
     /// state 1 the first token of the expanded label sequence.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn new(
         em: &'a E,
@@ -696,6 +1031,7 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
         rb: usize,
         labels: &[usize],
         blank_id: usize,
+        star_id: usize,
         token_ids: &'a [usize],
         t_len: usize,
         band: bool,
@@ -706,6 +1042,19 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
                 skip_dead[st] = u64::MAX;
             }
         }
+        // the star targets' odd states, as the DP's own bitmap: their score is
+        // the reference's appended constant no matter what the emissions
+        // source holds in the cell (a star target gathers the blank's column,
+        // since the star's id sits past the vocabulary)
+        let mut star4 = vec![0u8; s.div_ceil(4)];
+        if star_id != usize::MAX {
+            for (i, &tok) in token_ids.iter().enumerate() {
+                if tok == star_id {
+                    let st = 2 * i + 1;
+                    star4[st >> 2] |= 1 << (st & 3);
+                }
+            }
+        }
         let mut prev = vec![f64::NEG_INFINITY; s];
         prev[0] = em.score(0, 0) as f64;
         if s > 1 {
@@ -713,6 +1062,7 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
         }
         #[cfg(target_arch = "x86_64")]
         let avx2 = std::is_x86_feature_detected!("avx2");
+        let team = RowTeam::maybe_spawn(s, t_len, false);
         Dp {
             em,
             token_ids,
@@ -721,8 +1071,10 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
             t_len,
             band,
             skip_dead,
+            star4,
             prev,
             next: vec![0.0f64; s],
+            team,
 
             #[cfg(target_arch = "x86_64")]
             avx2,
@@ -750,7 +1102,7 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
     /// Frames `[t0, t1)`, writing row `t`'s backpointers at
     /// `back[(t - t0) * rb..]`.  `None` runs the pass for its alpha only: the
     /// linear-space forward keeps checkpoints, not choices, and the row the
-    /// kernel would write is then dropped.
+    /// kernel would write is dropped.
     fn run(&mut self, t0: usize, t1: usize, mut back: Option<&mut [u8]>) {
         let rb = self.rb;
         #[cfg(target_arch = "x86_64")]
@@ -763,34 +1115,87 @@ impl<'a, E: Emissions + ?Sized> Dp<'a, E> {
             // the row is borrowed straight from the source -- the kernel runs
             // inside the callback, so no per-frame staging copy happens
             self.em.with_emit(t, lo, hi, self.token_ids, &mut |emit: &[f32]| {
-                if self.band {
-                    dp_row_range(
-                        &self.prev,
-                        emit,
-                        &self.skip_dead,
-                        &mut self.next,
-                        row.as_deref_mut(),
-                        lo,
-                        hi,
-                        use_avx2,
-                    );
-                    // frame t+1's kernel reads up to hi+2 (the states the band
-                    // grows into); what it sees there must be -inf, not the alpha
-                    // this buffer held two frames ago.  Below the band nothing
-                    // needs clearing: the lowest read at t+1 is exactly lo.
-                    let hi_next = (hi + 2).min(self.s - 1);
-                    for st in hi + 1..=hi_next {
-                        self.next[st] = f64::NEG_INFINITY;
+                match self.team.as_mut() {
+                    Some(team) => {
+                        // the head (a band opening inside the first 4-state
+                        // group) runs serially — the vector kernel reads
+                        // prev[st-2] and the backpointer byte 0 owns states
+                        // 0..4 — then the team takes the 4-aligned body
+                        let first = (lo >> 2) << 2;
+                        let end = (hi + 1).min(self.s);
+                        if first < 4 {
+                            let head = end.min(4);
+                            let mut byte = 0u8;
+                            for k in 0..head {
+                                byte |= dp_one(
+                                    k,
+                                    &self.prev,
+                                    emit,
+                                    &self.skip_dead,
+                                    &self.star4,
+                                    &mut self.next[k..],
+                                ) << (k * 2);
+                            }
+                            if let Some(r) = row.as_deref_mut() {
+                                put_back_byte(r, 0, byte);
+                            }
+                        }
+                        team.run_row(
+                            &self.prev,
+                            emit,
+                            &self.skip_dead,
+                            &self.star4,
+                            &mut self.next,
+                            row.as_deref_mut(),
+                            first.max(4),
+                            end,
+                            use_avx2,
+                        );
+                        // frame t+1's kernel reads up to hi+2 (the states the
+                        // band grows into); what it sees there must be -inf,
+                        // not the alpha this buffer held two frames ago.
+                        // Below the band nothing needs clearing: the lowest
+                        // read at t+1 is exactly lo.
+                        if self.band {
+                            let hi_next = (hi + 2).min(self.s - 1);
+                            for st in hi + 1..=hi_next {
+                                self.next[st] = f64::NEG_INFINITY;
+                            }
+                        }
                     }
-                } else {
-                    dp_row_par(
-                        &self.prev,
-                        emit,
-                        &self.skip_dead,
-                        &mut self.next,
-                        row.as_deref_mut(),
-                        use_avx2,
-                    );
+                    None => {
+                        if self.band {
+                            dp_row_range(
+                                &self.prev,
+                                emit,
+                                &self.skip_dead,
+                                &self.star4,
+                                &mut self.next,
+                                row.as_deref_mut(),
+                                lo,
+                                hi,
+                                use_avx2,
+                            );
+                            // frame t+1's kernel reads up to hi+2 (the states the band
+                            // grows into); what it sees there must be -inf, not the alpha
+                            // this buffer held two frames ago.  Below the band nothing
+                            // needs clearing: the lowest read at t+1 is exactly lo.
+                            let hi_next = (hi + 2).min(self.s - 1);
+                            for st in hi + 1..=hi_next {
+                                self.next[st] = f64::NEG_INFINITY;
+                            }
+                        } else {
+                            dp_row_par(
+                                &self.prev,
+                                emit,
+                                &self.skip_dead,
+                                &self.star4,
+                                &mut self.next,
+                                row.as_deref_mut(),
+                                use_avx2,
+                            );
+                        }
+                    }
                 }
             });
             std::mem::swap(&mut self.prev, &mut self.next);
@@ -874,12 +1279,16 @@ fn align(
     t_len: usize,
     labels: &[usize],
     blank_id: usize,
+    star_id: usize,
     token_ids: &[usize],
     frame_rate: f64,
     pieces: Option<&[String]>,
     return_path: bool,
 ) -> anyhow::Result<AlignmentResult> {
-    align_with(em, t_len, labels, blank_id, token_ids, frame_rate, pieces, return_path, None, None)
+    align_with(
+        em, t_len, labels, blank_id, star_id, token_ids, frame_rate, pieces, return_path, None,
+        None,
+    )
 }
 
 /// [ctc_forced_align_gathered_chunks], additionally told which source word
@@ -903,7 +1312,10 @@ pub(crate) fn ctc_forced_align_gathered_with_word_ids(
         .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
         .collect();
     with_word_ids(word_ids, || {
-        align(&chunks, num_frames, &labels, usize::MAX, token_ids, frame_rate,
+        // the gathered trellis arrives with the star columns already stamped
+        // to the constant (on device, or row-major on the CPU tower), so the
+        // DP needs no star bitmap of its own
+        align(&chunks, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate,
               pieces, keep_path)
     })
 }
@@ -914,13 +1326,14 @@ pub(crate) fn ctc_forced_align_emissions_with_word_ids(
     em: &impl Emissions,
     t_len: usize,
     token_ids: &[usize],
+    star_id: usize,
     frame_rate: f64,
     pieces: Option<&[String]>,
     word_ids: &[usize],
 ) -> anyhow::Result<AlignmentResult> {
     let expanded = build_expanded_labels(token_ids, 0);
     with_word_ids(word_ids, || {
-        align(em, t_len, &expanded, 0, token_ids, frame_rate, pieces, false)
+        align(em, t_len, &expanded, 0, star_id, token_ids, frame_rate, pieces, false)
     })
 }
 
@@ -956,6 +1369,7 @@ fn align_with(
     t_len: usize,
     labels: &[usize],
     blank_id: usize,
+    star_id: usize,
     token_ids: &[usize],
     frame_rate: f64,
     pieces: Option<&[String]>,
@@ -989,7 +1403,7 @@ fn align_with(
     let band = force_band.unwrap_or_else(|| {
         std::env::var("CTC_NO_BAND").ok().as_deref() != Some("1")
     });
-    let mut dp = Dp::new(em, s, rb, labels, blank_id, token_ids, t_len, band);
+    let mut dp = Dp::new(em, s, rb, labels, blank_id, star_id, token_ids, t_len, band);
 
     // Linear space: keep the alpha every `seg` frames and no backpointers at
     // all, then walk the file backwards one segment at a time, recomputing
@@ -1483,6 +1897,7 @@ mod tests {
             t,
             &labels,
             blank,
+            usize::MAX,
             &token_ids,
             50.0,
             Some(&pieces),
@@ -1497,6 +1912,7 @@ mod tests {
                 t,
                 &labels,
                 blank,
+                usize::MAX,
                 &token_ids,
                 50.0,
                 Some(&pieces),
@@ -1560,12 +1976,12 @@ mod tests {
             for seg in [t_len, 7] {
                 let em = GatheredRows { gathered: &gathered, num_states: s };
                 let full = align_with(
-                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
                     Some(seg), Some(false),
                 )
                 .unwrap();
                 let banded = align_with(
-                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
                     Some(seg), Some(true),
                 )
                 .unwrap();
@@ -1593,12 +2009,12 @@ mod tests {
                     blank_id: blank,
                 };
                 let full = align_with(
-                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
                     Some(t_len), Some(false),
                 )
                 .unwrap();
                 let banded = align_with(
-                    &em, t_len, &labels, blank, &token_ids, 50.0, Some(&pieces), true,
+                    &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
                     Some(t_len), Some(true),
                 )
                 .unwrap();
@@ -1608,33 +2024,69 @@ mod tests {
         }
     }
 
+    /// The team must be a pure re-partitioning: same kernel, same per-state
+    /// order, bit-identical alphas and backpointers.
+    #[test]
+    fn team_rows_match_serial_rows() {
+        let (t_len, v, l) = (2000usize, 64usize, 200usize);
+        let blank = 0usize;
+        let token_ids: Vec<usize> = (1..=l).map(|i| (i * 7) % v).collect();
+        let log_probs: Vec<f32> = (0..t_len * v)
+            .map(|i| -((i % 89) as f32) * 0.11 - ((i / v) as f32 % 7.0) * 0.05)
+            .collect();
+        let labels = build_expanded_labels(&token_ids, blank);
+        let s = labels.len();
+        let rb = row_bytes(s);
+
+        let run = |force_team: bool| {
+            let em = FullRows { log_probs: &log_probs, vocab: v, labels: &labels, blank_id: blank };
+            let mut dp = Dp::new(&em, s, rb, &labels, blank, usize::MAX, &token_ids, t_len, true);
+            if force_team {
+                dp.team = RowTeam::maybe_spawn(s, t_len, true);
+                assert!(dp.team.is_some(), "the test expects a team to spawn");
+            }
+            let nback = (t_len - 1) * rb;
+            let mut back = vec![0u8; nback];
+            dp.run(1, t_len, Some(&mut back));
+            (dp.prev, back)
+        };
+        let (want_prev, want_back) = run(false);
+        let (got_prev, got_back) = run(true);
+        assert_eq!(got_prev.len(), want_prev.len());
+        for (i, (a, b)) in got_prev.iter().zip(&want_prev).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "alpha {i}");
+        }
+        assert_eq!(got_back, want_back, "backpointers");
+    }
+
     #[test]
     fn scalar_tie_break_is_stay_then_advance() {
         let emit = [0.0, 0.0, 0.0];
         let skip_dead = [u64::MAX, u64::MAX, 0];
+        let star4 = [0u8; 1]; // no star states: the emission reads as gathered
         let mut next = [0.0f64; 3];
         let mut back = [0xffu8; 1]; // one packed byte covers 3 states
         let choice = |b: &[u8]| get_back(b, 2);
         // st=2: stay=prev[2], advance=prev[1], skip=prev[0]
         // stay == advance > skip -> stay
         let prev = [0.0, 1.0, 1.0];
-        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
+        dp_range_scalar(&prev, &emit, &skip_dead, &star4, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 0, "equal stay and advance keeps stay");
 
         // stay < advance == skip -> advance
         let prev = [5.0, 5.0, 0.0];
-        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
+        dp_range_scalar(&prev, &emit, &skip_dead, &star4, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 1, "equal advance and skip keeps advance");
 
         // stay < advance < skip -> skip
         let prev = [9.0, 4.0, 0.0];
-        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
+        dp_range_scalar(&prev, &emit, &skip_dead, &star4, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 2);
 
         // dead skip cannot win even if prev[st-2] is larger
         let prev = [9.0, 1.0, 0.0];
         let skip_dead = [u64::MAX, u64::MAX, u64::MAX];
-        dp_range_scalar(&prev, &emit, &skip_dead, &mut next, Some(&mut back), 0);
+        dp_range_scalar(&prev, &emit, &skip_dead, &star4, &mut next, Some(&mut back), 0);
         assert_eq!(choice(&back), 1);
     }
 
@@ -1646,14 +2098,15 @@ mod tests {
         }
         let (prev, emit, skip_dead) = sample_row();
         let s = prev.len();
+        let star4 = vec![0u8; s.div_ceil(4)];
         let mut n1 = vec![0.0f64; s];
         let mut b1 = vec![9u8; row_bytes(s)];
         let mut n2 = vec![0.0f64; s];
         let mut b2 = vec![9u8; row_bytes(s)];
         // through the real driver, so the parallel split is covered too: 17
         // states over 20 threads means four chunks
-        dp_row_par(&prev, &emit, &skip_dead, &mut n1, Some(&mut b1), false);
-        dp_row_par(&prev, &emit, &skip_dead, &mut n2, Some(&mut b2), true);
+        dp_row_par(&prev, &emit, &skip_dead, &star4, &mut n1, Some(&mut b1), false);
+        dp_row_par(&prev, &emit, &skip_dead, &star4, &mut n2, Some(&mut b2), true);
         // the vector loop writes whole bytes, so compare the decoded choices
         for i in 0..s {
             assert_eq!(
