@@ -363,6 +363,10 @@ impl Aligner {
         let trellis = self.log_probs_trellis(
             &waveform, window_sec, context_sec, &expanded, &star_state_idx,
         )?;
+        // The DP never reads the waveform — everything it consumes is in the
+        // trellis — so free it before the traceback allocates its checkpoints
+        // and backpointers: 237 MB on an hour, 691 MB on three.
+        drop(waveform);
         let encode_s = t_enc.elapsed().as_secs_f64();
         crate::wav2vec2::prof::dump(&format!(
             "{} [{}]",
@@ -996,10 +1000,21 @@ impl LazyBlocks {
     }
 }
 
-/// Frames per gathered slice.  The DP walks frames in order, so exactly one
-/// slice of trellis columns is resident whatever the file length — 256 rows of
-/// S columns is 127 MB at an hour-long file's 124 k states.
-const SLICE_FRAMES: usize = 256;
+/// Frames per gathered slice at the cap; long-transcript DPs shrink the slice
+/// so the resident cost stays bounded (see [`slice_frames`]).
+const SLICE_FRAMES_CAP: usize = 256;
+
+/// Frames per gathered slice for a trellis of `states` columns. The slice is
+/// the DP's one resident gather — `frames × states × 4` bytes, 127 MB at the
+/// cap on an hour's transcript and 380 MB on a dense 3 h one. Budgeting it at
+/// ~64 MB costs more fills but the same total gather work: the walk touches
+/// each slice once either way, and the gathered values do not depend on where
+/// the slice boundaries fall. Never fewer than 16 frames — below that the
+/// per-fill overhead stops amortising.
+fn slice_frames(states: usize) -> usize {
+    const SLICE_BUDGET_BYTES: usize = 64 << 20;
+    (SLICE_BUDGET_BYTES / (states * 4).max(1)).clamp(16, SLICE_FRAMES_CAP)
+}
 
 /// What a stored per-window block holds, and how its rows become trellis
 /// columns.  All three widths produce the same f32s; they only differ in how
@@ -1204,6 +1219,9 @@ struct LazyEmissions<'a> {
     /// the same states, ascending: the per-slice stamping walks them row by
     /// row, and a sorted sweep keeps the writes inside one cached row
     star_sorted: Vec<usize>,
+    /// frames per gathered slice, from [`slice_frames`] for this trellis's
+    /// state count
+    slice_frames: usize,
 }
 
 impl<'a> LazyEmissions<'a> {
@@ -1231,7 +1249,9 @@ impl<'a> LazyEmissions<'a> {
                 .iter()
                 .copied()
                 .filter(|&i| i < blocks.num_states)
-                .collect(),        }
+                .collect(),
+            slice_frames: slice_frames(blocks.num_states),
+        }
     }
 
     fn total_frames(&self) -> usize {
@@ -1292,12 +1312,26 @@ impl<'a> LazyEmissions<'a> {
                 if *cb == block && *cl == row0 + lo && *cr == rows && buf.len() == need {
                     false
                 } else {
-                    cache.replace((block, row0 + lo, rows, vec![0.0f32; need]));
+                    // Reuse the buffer across slices. The gather below writes
+                    // every cell before anything reads it, so the old
+                    // `vec![0.0; need]` was pure waste — a fresh zeroed 127 MB
+                    // allocation per slice on an hour's transcript, once per
+                    // DP pass: ~180 GB of allocation and zeroing on a 1 h run
+                    // and ~1.6 TB on a dense 3 h one, all on the DP's critical
+                    // path. `resize` is a no-op at the common size and
+                    // re-zeroes only a growth after the file's one short tail
+                    // slice.
+                    buf.resize(need, 0.0);
+                    *cb = block;
+                    *cl = row0 + lo;
+                    *cr = rows;
                     true
                 }
             }
             None => {
-                cache.replace((block, row0 + lo, rows, vec![0.0f32; need]));
+                let mut buf = Vec::with_capacity(self.slice_frames * s);
+                buf.resize(need, 0.0);
+                *cache = Some((block, row0 + lo, rows, buf));
                 true
             }
         };
@@ -1341,8 +1375,8 @@ impl<'a> LazyEmissions<'a> {
         let b = self.blocks;
         let (block, row0, kept) = b.span_of(t);
         let r = t - b.frame_base(block);
-        let lo = (r / SLICE_FRAMES) * SLICE_FRAMES;
-        let rows = (kept - lo).min(SLICE_FRAMES);
+        let lo = (r / self.slice_frames) * self.slice_frames;
+        let rows = (kept - lo).min(self.slice_frames);
         if matches!(self.kind, BlockKind::Hidden { .. }) {
             let wl = self.window_logits_for(block);
             self.fill_slice(block, row0, lo, rows, wl.as_ref());
