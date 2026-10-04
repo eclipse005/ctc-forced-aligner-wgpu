@@ -43,11 +43,11 @@
 //! - **model** — [`wav2vec2`] and [`wav2vec2_gpu`], the encoder tower and its
 //!   CPU twin. Audio in, per-frame label scores out.
 //! - **align** — [`viterbi`] reads the path into frame numbers, and
-//!   [`timeline`] is the ONE place a timestamp is decided afterwards: a boundary
-//!   sits in the middle of the pause beside it, a mark has no sound and becomes
-//!   a point, a character with no target lies between its placed neighbours.
-//!   The order those three run in is the order of the functions there.
-//! - **text** — [`spans`] groups tokens into the transcript's own words and
+//!   [`timeline`] is the ONE place a timestamp is decided afterwards: a
+//!   boundary sits in the middle of a pause that is short enough to be
+//!   prosody and on the word's own evidence once the run is long enough to
+//!   be silence, a mark has no sound and becomes a point on the sound it
+//!   touches, a character with no target lies between its placed neighbours.
 //!   sentences, [`views`] breaks them into subtitle lines.
 //!
 //! [`align_inference`] is the facade over all of it, and [`render`] only writes

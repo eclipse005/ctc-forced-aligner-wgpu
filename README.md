@@ -124,7 +124,7 @@ Four layers, each depending only on the ones above it:
 | align | `viterbi` `timeline` | the path, and **the one place a timestamp is decided** |
 | text | `spans` `views` | the transcript's own words and sentences, and where a subtitle line breaks |
 
-`timeline` is the part worth knowing: after the Viterbi picks frames, three rules turn that into the spans a subtitle shows — a boundary sits in the middle of the pause beside it, a mark has no sound so it becomes a point at the end of the one before, and a character the vocabulary had no target for lies between its placed neighbours. They used to live in three files with the order between them held up by comments; they are now one list, in order, each with the measurement that chose it. Nothing downstream of the Viterbi may write a `start` or an `end`, which is what keeps `--format srt`, `--format ass` and the JSON from ever disagreeing.
+`timeline` is the part worth knowing: after the Viterbi picks frames, three rules turn that into the spans a subtitle shows — a boundary sits in the middle of a pause short enough to be prosody and on the word's own evidence once the run is long enough to be silence, a mark has no sound so it becomes a point on the sound it touches — the one before it, or, at a stream opening, the one after — and a character the vocabulary had no target for lies between its placed neighbours. They used to live in three files with the order between them held up by comments; they are now one list, in order, each with the measurement that chose it. Nothing downstream of the Viterbi may write a `start` or an `end`, which is what keeps `--format srt`, `--format ass` and the JSON from ever disagreeing.
 
 ### Audio input
 
@@ -148,7 +148,7 @@ Characters outside the checkpoint's vocabulary have no CTC target and so never r
 
 ### Deliberate departures from the reference
 
-The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that implementation was written for its own MMS checkpoint. The following eight were changed **on measurement, on this checkpoint**. They are not bugs:
+The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that implementation was written for its own MMS checkpoint. The following ten were changed **on measurement, on this checkpoint**. They are not bugs:
 
 1. **One `<star>` per word, not the reference's `edges` placement (one at each end of the file).**
    A star is a DP anchor, not a word marker. This checkpoint's DP is under-constrained wherever the acoustic evidence is weak: two stars let the whole path slide, one per word does not. Over a 180-clip multilingual set — 124 of which pass a FireRedVAD / short-time-energy cross-check, since VAD alone misses most of the speech in some FLEURS English clips and believing it inverts the result:
@@ -189,6 +189,12 @@ The algorithm is ported from `MahmoudAshraf97/ctc-forced-aligner`, but that impl
 
 8. **`--format ass` exists.**
    The karaoke sweep is the same cue list with a `\k` duration per character, so it cannot disagree with the SRT. A gap in the transcript becomes a `\h` on the character it stands in front of, and none at the start of a line — the line break is already there, exactly as in the SRT. `WrapStyle: 0` and the play resolution come from `--ass-res`: the line breaking is libass's, and inserting `\N` here would hard-code a guess about the player's font fallback and safe area.
+
+9. **A blank run longer than 0.5 s is silence, not a pause: the word starts on its own evidence.**
+   The midpoint rule's error is half the run it is applied over — fine for the prosodic gaps of continuous speech, where a human annotator really does split the pause, unbounded where the run is silence that belongs to nobody. Measured on 10 clean Mandarin sentences (FLEURS cmn test) with leading silences of 0.9–3.7 s: the unsplit midpoint placed the first character 235 ms before the acoustic onset at the median and 740 ms at the worst. Buckeye — where the midpoint rule was measured against hand marks — has no word-fronting run past 500 ms, so English behaviour is bit-identical: every start boundary the old rule ever exercised is unchanged. With this, both sides of a boundary have a stated limit (the end side's is departure 2).
+
+10. **A mark with no timed token before it is a point on the sound that follows.**
+    The forward anchor rule cannot reach a mark that opens the stream — a star holds no time, so an opening `“` kept whatever frames the path left near it, and on material that opens into silence that span is pure fiction: measured on a Mandarin FLEURS clip, an opening `“` held 1.1 s over a blank run it had no sound in, dragging its host word's cue a second early with it. It is now a point at the first timed token's start — the mirror of the rule that anchors every other mark to the sound before it.
 
 ### Long audio
 

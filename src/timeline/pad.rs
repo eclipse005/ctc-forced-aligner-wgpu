@@ -1,4 +1,6 @@
-//! Rule 1: a boundary sits in the middle of the pause beside it.
+//! Rule 1: a boundary sits in the middle of the pause beside it — unless the
+//! pause is long enough to be silence, in which case the word starts where
+//! its own evidence starts.
 //!
 //! Operates on FRAME indices, not seconds. `collapse` reads the path into
 //! frame numbers, this decides which frame each boundary lands on, and
@@ -30,6 +32,41 @@
 /// clip, dense speech with no gap over 1.85 s, it is inert and produces
 /// output identical to no cap at all.
 pub(crate) const MAX_PADDING_SEC: f64 = 1.0;
+
+/// The longest blank run that still counts as a pause BESIDE a word rather
+/// than silence BETWEEN words.
+///
+/// Below the bound the front boundary sits at the run's midpoint — the pause
+/// is prosody, it belongs to the words on both sides, and a human annotator
+/// splits it down the middle (the measurement that chose the midpoint rule is
+/// in [`pad_into_silence`]). Above it the run is silence, and silence belongs
+/// to no word: a word begins where its own evidence begins.
+///
+/// Where the two regimes must meet: the midpoint puts a start `run/2` frames
+/// early, so its error grows with the pause, while the evidence edge costs
+/// one frame of coarticulation regardless. Past half a second a read-speech
+/// gap is inter-sentence silence, not coarticulation, and the midpoint's
+/// error has already passed 250 ms — ten times the evidence edge's.
+///
+/// Measured on 10 clean Mandarin sentences (FLEURS cmn test, leading
+/// silences 0.9–3.7 s): the unsplit midpoint put the first character 235 ms
+/// before the acoustic onset at the median and 740 ms at the worst — clip07
+/// dumps it exactly: the path sits on 它 at frame 179, the blank run before
+/// it is frames 114–178, and the midpoint moved the boundary to frame 146,
+/// 33 frames of invented early start. Qwen3-ForcedAligner, which claims no
+/// silence at all, held 85 ms at the median on the same clips — and most of
+/// THAT is the energy-onset detector lagging on aspirated onsets, not
+/// placement error. With the split, every long-run case lands on the
+/// evidence frame.
+///
+/// The bound is deliberately generous towards the midpoint: Buckeye — where
+/// the midpoint rule was measured against hand marks — is dense
+/// conversational speech whose word-fronting runs sit far below it, so
+/// English behaviour is unchanged wherever the original rule was actually
+/// doing its job. The one-sidedness of [`MAX_PADDING_SEC`] (ends may claim,
+/// starts may not) is therefore no longer unbounded: both sides of a
+/// boundary now have a stated limit.
+pub(crate) const MAX_PAUSE_SEC: f64 = 0.5;
 
 /// Move every boundary into the silence beside it, then bound how much of
 /// that silence one token may keep.
@@ -99,11 +136,25 @@ pub(crate) fn pad_into_silence(
         if starts[i] < 0 {
             continue;
         }
-        // front: midpoint of the blank run before token i
+        // front: the blank run before token i.
+        //
+        // A SHORT run is a prosodic pause: it belongs to the word, and the
+        // boundary sits at its midpoint — the annotator habit, measured
+        // against Buckeye's hand marks in the essay above. A LONG run is
+        // silence, and silence is nobody's: the word starts where its own
+        // evidence starts, one frame of grace for coarticulation. One rule
+        // cannot serve both — the midpoint's error is run/2 and unbounded in
+        // the pause length, which is how a 3.7 s clip-opening silence put a
+        // Mandarin first character 1.86 s early (see MAX_PAUSE_SEC).
         {
             let (a, b) = blank_before[i];
             if a >= 0 {
-                let pad = mid(a, b);
+                let run_sec = (b - a + 1) as f64 / frame_rate;
+                let pad = if run_sec <= MAX_PAUSE_SEC {
+                    mid(a, b)
+                } else {
+                    (starts[i] - 1).max(0)
+                };
                 if pad < starts[i] {
                     starts[i] = pad;
                 }
@@ -207,16 +258,31 @@ mod tests {
     }
 
     #[test]
-    fn the_bound_never_reaches_a_start() {
-        // A single token, so its front pause is blank_before[0] and the
-        // trailing run is blank_before[1]. The pause is 800 frames -- 16 s --
-        // and the start still moves the whole way to its midpoint, unbounded:
-        // the clamp is one-sided by design, so a long pause before a word costs
-        // it start accuracy and costs it nothing at the end.
+    fn a_long_leading_run_is_silence_and_the_word_starts_on_its_evidence() {
+        // A single token, so its front pause is blank_before[0]. The pause is
+        // 800 frames -- 16 s, inter-utterance silence, nobody's property --
+        // and the start holds at the token's own first frame minus the one
+        // coarticulation frame, instead of the old midpoint (499), which
+        // invented 400 frames of early start out of pure silence.
         let mut starts = vec![900];
         let mut ends = vec![950];
         pad_into_silence(&mut starts, &mut ends, &[950], &[(100, 899), NONE], 50.0);
-        assert_eq!(starts[0], 499, "the start takes the whole midpoint");
+        assert_eq!(starts[0], 899, "long run: the evidence edge, not the midpoint");
+    }
+
+    #[test]
+    fn the_two_regimes_meet_at_the_bound() {
+        // 25 frames = exactly MAX_PAUSE_SEC at 50 fps: still a pause, still
+        // the midpoint. One frame more and it is silence: the evidence edge.
+        // Own start 30, run (0, 24) -> mid 12; run (0, 25) -> 29.
+        let mut starts = vec![30];
+        let mut ends = vec![35];
+        pad_into_silence(&mut starts, &mut ends, &[35], &[(0, 24), NONE], 50.0);
+        assert_eq!(starts[0], 12, "a pause at the bound is still split by midpoint");
+        let mut starts = vec![30];
+        let mut ends = vec![35];
+        pad_into_silence(&mut starts, &mut ends, &[35], &[(0, 25), NONE], 50.0);
+        assert_eq!(starts[0], 29, "one frame past the bound it is silence");
     }
 
     #[test]

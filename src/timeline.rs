@@ -14,12 +14,15 @@
 //! The order matters and is not arbitrary:
 //!
 //! 1. `pad_into_silence`  a boundary sits in the middle of the pause beside
-//!    it, with a bound on how much silence one token may claim. It runs first
-//!    because everything after it reads the padded ends.
+//!    it, with a bound on how much silence one token may claim — and a pause
+//!    longer than [`crate::timeline::pad::MAX_PAUSE_SEC`] is silence, which
+//!    belongs to nobody: the word starts where its own evidence starts. It
+//!    runs first because everything after it reads the padded ends.
 //! 2. `anchor_marks`      a mark has no phone, so it becomes a point at the
-//!    end of the sound before it. It must run before the unmeasured
-//!    characters are inserted, or a mark would become their anchor instead of
-//!    the speech that actually carries time.
+//!    end of the sound before it — or at the start of the sound after it when
+//!    no sound precedes, the mirror case for stream-opening marks. It must
+//!    run before the unmeasured characters are inserted, or a mark would
+//!    become their anchor instead of the speech that actually carries time.
 //! 3. `place_unmeasured`  a character the vocabulary had no target for lies
 //!    between its placed neighbours. It runs last of the three because it is
 //!    the only one that adds tokens, and it reads the spans the two above left.

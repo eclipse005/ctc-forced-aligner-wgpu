@@ -18,19 +18,19 @@ fn owns_time(piece: &str) -> bool {
     piece.chars().any(|ch| !PUNCT.contains(&ch))
 }
 
-/// Anchor word-boundary marks to the previous timed token's end, in place.
+/// Anchor word-boundary marks to a timed token, in place.
 ///
 /// The CTC path gives every vocabulary character a frame. Punctuation and
 /// spaces have no phone, so the path parks them at the end of the following
-/// pause; this moves only those marks, and only backward onto the token
-/// already placed before them. A token that contains anything other than a
-/// mark keeps its frames, so word spans built from those tokens do not move.
-/// Nothing is attached to a later token.
-///
-/// Anchored marks are points: `start == end` equals the previous token's end,
-/// and the frame fields name its end frame. Applying this twice changes
-/// nothing, which is what lets it sit in a pipeline rather than being a
-/// correction somebody has to remember to apply.
+/// pause; a mark with a timed token before it moves backward onto that
+/// token's end — a mark with nothing timed before it moves forward onto the
+/// next timed token's start, the mirror case. A token that contains anything
+/// other than a mark keeps its frames, so word spans built from those tokens
+/// do not move. The two passes write disjoint prefixes, and a mark is always
+/// a point: `start == end` equals the anchored token's boundary, and the
+/// frame fields name it. Applying this twice changes nothing, which is what
+/// lets it sit in a pipeline rather than being a correction somebody has to
+/// remember to apply.
 pub(crate) fn anchor_marks(tokens: &mut [TokenAlignment]) {
     let mut anchor: Option<(f64, i64)> = None;
     for token in tokens.iter_mut() {
@@ -43,6 +43,27 @@ pub(crate) fn anchor_marks(tokens: &mut [TokenAlignment]) {
         };
         token.start = end;
         token.end = end;
+        token.start_frame = frame;
+        token.end_frame = frame;
+    }
+    // LEADING MARKS. The forward pass above cannot anchor a mark that has no
+    // timed token before it — `<star>` does not own time, so a quotation mark
+    // opening the stream kept whatever frames the path left near it, and on
+    // material that opens into silence that span is pure fiction: measured on
+    // a Mandarin FLEURS clip, an opening `“` held frames 90–146 (1.1 s) over
+    // a blank run it had no sound in, dragging its host word's cue a second
+    // early with it. A mark with no sound before it belongs to the sound that
+    // follows: a point at the next timed token's start, the mirror of the
+    // forward rule. The prefix before the first timed token is exactly the
+    // set of marks the forward pass had to skip, so the two passes never
+    // touch the same token twice.
+    let Some(first_timed) = tokens.iter().position(|t| owns_time(&t.piece)) else {
+        return;
+    };
+    let (start, frame) = (tokens[first_timed].start, tokens[first_timed].start_frame);
+    for token in tokens[..first_timed].iter_mut() {
+        token.start = start;
+        token.end = start;
         token.start_frame = frame;
         token.end_frame = frame;
     }
@@ -89,6 +110,21 @@ mod tests {
         anchor_marks(&mut t);
         assert_eq!((t[2].start, t[2].end), (0.2, 0.2), "onto the speech, not the star");
     }
+
+    #[test]
+    fn a_leading_mark_belongs_to_the_sound_that_follows() {
+        // An opening quotation mark has no timed token before it (the star
+        // holds no time), so the forward pass skips it and the path's fiction
+        // would survive. It becomes a point at the first sound's start --
+        // the mirror of the trailing rule.
+        let mut t = vec![tok("“", 1.4), tok("<star>", 1.4), tok("它", 1.8), tok("们", 2.0)];
+        anchor_marks(&mut t);
+        assert_eq!((t[0].start, t[0].end), (1.6, 1.6), "a point at the first sound");
+        assert_eq!((t[1].start, t[1].end), (1.6, 1.6), "the star too");
+        assert!((t[2].start - 1.6).abs() < 1e-9, "the sound itself does not move");
+        assert!((t[2].end - 1.8).abs() < 1e-9);
+    }
+
     #[test]
     fn running_it_twice_changes_nothing() {
         let once = {
