@@ -47,6 +47,9 @@ impl DeviceSelector {
         if s.eq_ignore_ascii_case("cpu") {
             return Ok(Self::Cpu);
         }
+        if s.eq_ignore_ascii_case("gpu") {
+            bail!("`gpu` is a backend, not an adapter name — use Backend::Gpu or `--device gpu`");
+        }
         if let Some(rest) = s.strip_prefix('#') {
             return Ok(Self::Index(rest.trim().parse().context("device index")?));
         }
@@ -68,6 +71,46 @@ impl DeviceSelector {
             Self::Auto | Self::Index(_) | Self::Cpu => true,
             Self::Name(n) => info.name.to_lowercase().contains(n),
             Self::Runtime { api, .. } => info.backend == *api,
+        }
+    }
+}
+
+/// Which tower to run, separate from which adapter [`DeviceSelector`] names.
+///
+/// * [`Self::Auto`] — one real GPU, or the CPU tower when none can be opened.
+/// * [`Self::Cpu`] — the CPU tower. No adapter.
+/// * [`Self::Gpu`] — that adapter, or an error. `DeviceSelector::Auto` still
+///   picks the discrete GPU; it does not fall back to the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Backend {
+    Auto,
+    Cpu,
+    Gpu(DeviceSelector),
+}
+
+impl Backend {
+    /// `auto` / `cpu` / `gpu`, or anything [`DeviceSelector::parse`] accepts
+    /// wrapped as [`Self::Gpu`] (`vulkan:0`, `#1`, an adapter substring).
+    pub fn parse(spec: &str) -> Result<Self> {
+        let s = spec.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        if s.eq_ignore_ascii_case("cpu") {
+            return Ok(Self::Cpu);
+        }
+        if s.eq_ignore_ascii_case("gpu") {
+            return Ok(Self::Gpu(DeviceSelector::Auto));
+        }
+        Ok(Self::Gpu(DeviceSelector::parse(s)?))
+    }
+
+    /// `Cpu` and `Auto` keep their policies. Any other selector is a required GPU.
+    pub fn from_selector(selector: DeviceSelector) -> Self {
+        match selector {
+            DeviceSelector::Cpu => Self::Cpu,
+            DeviceSelector::Auto => Self::Auto,
+            other => Self::Gpu(other),
         }
     }
 }
@@ -559,16 +602,35 @@ impl<'a> BulkUpload<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::DeviceSelector;
+    use super::{Backend, DeviceSelector};
 
     #[test]
     fn one_device_only() {
         assert!(DeviceSelector::parse("dual").is_err());
+        assert!(DeviceSelector::parse("gpu").is_err());
         assert!(matches!(DeviceSelector::parse("auto").unwrap(), DeviceSelector::Auto));
         assert!(matches!(DeviceSelector::parse("cpu").unwrap(), DeviceSelector::Cpu));
         assert!(matches!(
             DeviceSelector::parse("vulkan:0").unwrap(),
             DeviceSelector::Runtime { index: 0, .. }
         ));
+    }
+
+    #[test]
+    fn backend_policy_is_auto_cpu_or_required_gpu() {
+        assert_eq!(Backend::parse("").unwrap(), Backend::Auto);
+        assert_eq!(Backend::parse("auto").unwrap(), Backend::Auto);
+        assert_eq!(Backend::parse("cpu").unwrap(), Backend::Cpu);
+        assert_eq!(Backend::parse("GPU").unwrap(), Backend::Gpu(DeviceSelector::Auto));
+        assert!(matches!(
+            Backend::parse("vulkan:1").unwrap(),
+            Backend::Gpu(DeviceSelector::Runtime { index: 1, .. })
+        ));
+        assert_eq!(Backend::from_selector(DeviceSelector::Auto), Backend::Auto);
+        assert_eq!(Backend::from_selector(DeviceSelector::Cpu), Backend::Cpu);
+        assert_eq!(
+            Backend::from_selector(DeviceSelector::Name("p104".into())),
+            Backend::Gpu(DeviceSelector::Name("p104".into()))
+        );
     }
 }

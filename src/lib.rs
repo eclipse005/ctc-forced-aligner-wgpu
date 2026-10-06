@@ -95,6 +95,6 @@ mod golden;
 mod testutil;
 
 pub use align_inference::{AlignOutput, AlignProgress, Aligner};
-pub use gpu::{list_targets, DeviceSelector};
+pub use gpu::{list_targets, Backend, DeviceSelector};
 pub use spans::{WordSpan, build_words};
 pub use viterbi::TokenAlignment;

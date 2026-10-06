@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use crate::audio::{load_audio, znorm, TARGET_SR};
 use crate::timeline::{anchor_marks, place_unmeasured};
-use crate::gpu::DeviceSelector;
+use crate::gpu::{Backend, DeviceSelector};
 use crate::spans::{build_segments, build_words, WordSpan};
 use crate::viterbi::{
     build_expanded_labels, ctc_forced_align_emissions_with_word_ids,
@@ -237,18 +237,36 @@ impl Aligner {
         Self::load_on(model_dir, DeviceSelector::Cpu)
     }
 
-    /// One backend. `Auto` uses a single wgpu GPU, or the CPU tower when none is present.
+    /// One device, with [`Backend::from_selector`]'s policy: `Auto` may use the
+    /// CPU tower, `Cpu` is the CPU tower, anything else requires that GPU.
     pub fn load_on(model_dir: &Path, selector: DeviceSelector) -> Result<Self> {
-        let tower = match selector {
-            DeviceSelector::Cpu => Tower::Cpu(Model::load(model_dir)?),
-            DeviceSelector::Auto => match GpuModel::load(model_dir, DeviceSelector::Auto) {
+        Self::load_with(model_dir, Backend::from_selector(selector))
+    }
+
+    /// [`Backend::Auto`] opens one GPU and uses the CPU tower only when no real
+    /// adapter can be created. [`Backend::Gpu`] is that same open with the
+    /// error returned instead. [`Backend::Cpu`] never touches wgpu.
+    pub fn load_with(model_dir: &Path, backend: Backend) -> Result<Self> {
+        let tower = match backend {
+            Backend::Cpu => Tower::Cpu(Model::load(model_dir)?),
+            Backend::Auto => match GpuModel::load(model_dir, DeviceSelector::Auto) {
                 Ok(gpu) => Tower::Gpu(gpu),
                 Err(e) if e.downcast_ref::<crate::gpu::NoGpuError>().is_some() => {
+                    eprintln!(
+                        "ctc-aligner: no usable wgpu adapter ({e:#}); using the CPU backend"
+                    );
                     Tower::Cpu(Model::load(model_dir)?)
                 }
                 Err(e) => return Err(e),
             },
-            other => Tower::Gpu(GpuModel::load(model_dir, other)?),
+            Backend::Gpu(selector) => {
+                if matches!(selector, DeviceSelector::Cpu) {
+                    anyhow::bail!(
+                        "Backend::Gpu does not take the CPU selector; use Backend::Cpu"
+                    );
+                }
+                Tower::Gpu(GpuModel::load(model_dir, selector)?)
+            }
         };
         let gpu_lm_head = match tower {
             Tower::Gpu(_) => Some(LmHeadCpu::load(model_dir)?),

@@ -68,7 +68,7 @@ align --audio speech.wav --text transcript.txt --format srt --output out.srt
 | `--audio <file>` | 音频文件（WAV） |
 | `--text <file/text>` | 转录文本：若为已存在的路径则读文件，否则当作文本本身 |
 | `--model <dir>` | 模型目录，或 `CTC_MODEL_DIR` 环境变量 |
-| `--device <spec>` | `auto`（默认，无 GPU 时用 CPU）、`cpu`、`vulkan[:i]`、`dx12[:i]`、`#n`，或名称子串 |
+| `--device <spec>` | `auto`（默认：有显卡用显卡，打不开才用 CPU）、`cpu`、`gpu`（没有显卡就报错）、`vulkan[:i]`、`dx12[:i]`、`#n`，或名称子串 |
 | `--window <sec>` | 显存与吞吐；**不影响时间戳**（默认 `30`）。上限约 90 s，受单次前向的显存限制 |
 | `--context <sec>` | 窗口两侧的编码器重叠（默认 `2`，下限约 1.3，须覆盖位置卷积感受野） |
 | `--format <json\|srt\|ass>` | `json` 为完整对齐（默认）；`srt` 为字幕；`ass` 为卡拉OK，逐字扫光 |

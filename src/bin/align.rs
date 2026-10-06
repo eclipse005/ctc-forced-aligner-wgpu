@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use ctc_forced_aligner_wgpu::align_inference::{AlignOutput, Aligner};
 use ctc_forced_aligner_wgpu::render::{ass, srt};
 use ctc_forced_aligner_wgpu::views;
-use ctc_forced_aligner_wgpu::DeviceSelector;
+use ctc_forced_aligner_wgpu::Backend;
 
 const USAGE: &str = "\
 usage: align --audio <wav> (--text <text|file>) [options]
@@ -30,7 +30,8 @@ usage: align --audio <wav> (--text <text|file>) [options]
   --model <dir>            model directory (default: $CTC_MODEL_DIR or the bundled checkpoint)
   --window <sec>           memory/throughput only; it does not move timestamps (default: 30)
   --context <sec>          encoder context each side of a window, at least 1.3 (default: 2)
-  --device <spec>          one device: auto (default, cpu if no gpu), cpu, vulkan[:i], dx12[:i], #n, or a name substring
+  --device <spec>          auto (default: gpu, or cpu when no gpu opens), cpu, gpu (error if no gpu),
+                           vulkan[:i], dx12[:i], #n, or a name substring
   --format <json|srt|ass>
                            json is the full alignment (default); srt is subtitles,
                            ass is karaoke (one sweep per character)
@@ -111,8 +112,8 @@ fn main() -> Result<()> {
     };
 
     let t0 = std::time::Instant::now();
-    let selector = DeviceSelector::parse(&device)?;
-    let aligner = Aligner::load_on(&model_dir, selector)
+    let backend = Backend::parse(&device)?;
+    let aligner = Aligner::load_with(&model_dir, backend)
         .with_context(|| format!("load model from {}", model_dir.display()))?;
     let load_s = t0.elapsed().as_secs_f64();
 
