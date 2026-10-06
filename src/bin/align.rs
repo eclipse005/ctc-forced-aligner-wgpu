@@ -111,7 +111,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("load model from {}", model_dir.display()))?;
     let load_s = t0.elapsed().as_secs_f64();
 
-    let out = aligner.align(&audio, &text, window, context)?;
+    let out = aligner.align(&audio, &text, window, context, None)?;
     let rtfx = out.duration / (out.encode_s + out.align_s).max(1e-9);
 
     // The karaoke style carries only what a user might genuinely need to

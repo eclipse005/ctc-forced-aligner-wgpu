@@ -103,7 +103,7 @@ use ctc_forced_aligner_wgpu::{Aligner, DeviceSelector};
 
 let aligner = Aligner::load_on(std::path::Path::new("model"),
                                DeviceSelector::parse("auto")?)?;
-let out = aligner.align(std::path::Path::new("speech.wav"), "hello world", Some(30.0), 2.0)?;
+let out = aligner.align(std::path::Path::new("speech.wav"), "hello world", Some(30.0), 2.0, None)?;
 for t in &out.tokens {
     println!("{:.3}s - {:.3}s  {}", t.start, t.end, t.piece);
 }
@@ -111,7 +111,7 @@ for t in &out.tokens {
 
 API 就这些：`Aligner` 加载与运行、`AlignOutput` 读结果、`TokenAlignment` 一个时间单元、`DeviceSelector` 选设备、`list_targets` 列设备。字幕是 `views::build_cues` 经 `render::srt` 或 `render::ass` 渲染。**其余一律 `pub(crate)`**——模型、Viterbi、边界规则、词句切分，全都不是对 crate 之外的承诺。
 
-`align` 的窗口与上下文长度以秒为单位（窗口传 `None` 表示整文件一次前向）。`TokenAlignment` 携带 `piece`、`start`、`end`、`start_frame`、`end_frame`、`word_id` 以及逐帧均值 `score`。`align_with_path` 额外返回逐帧状态路径——与参考实现对拍时比对的就是它。完整 API 见 `cargo doc`。
+`align` 的窗口与上下文长度以秒为单位（窗口传 `None` 表示整文件一次前向）。最后一个参数是可选的 `AlignProgress` 回调——`&mut dyn FnMut(done, total)`，每编完一个窗口在**调用方线程**上触发一次；分母是**窗口数**不是秒，因为窗口数开跑前就数得出来，秒只能估。传 `None` 的代价是每窗口一个分支。`TokenAlignment` 携带 `piece`、`start`、`end`、`start_frame`、`end_frame`、`word_id` 以及逐帧均值 `score`。`align_with_path` 额外返回逐帧状态路径——与参考实现对拍时比对的就是它。完整 API 见 `cargo doc`。
 
 ### 代码怎么分层
 

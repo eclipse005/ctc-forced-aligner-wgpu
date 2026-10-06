@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
     let aligner = Aligner::load_on(Path::new(&model), dev)?;
     let out_path = Path::new(&out);
     let transcript = std::fs::read_to_string(out_path.with_extension("txt"))?;
-    let out = aligner.align_with_path(Path::new(&wav), transcript.trim(), Some(30.0), 2.0)?;
+    let out = aligner.align_with_path(Path::new(&wav), transcript.trim(), Some(30.0), 2.0, None)?;
 
     // The path is a sequence of EXPANDED state indices: even is blank, odd is
     // token `(state - 1) / 2`. `-1` is padding, which never won a frame.

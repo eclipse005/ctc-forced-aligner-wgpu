@@ -65,7 +65,7 @@ fn align_job(
             .context("job has no audio_path")?,
     );
     let text = job["transcript"].as_str().context("job has no transcript")?;
-    let o = aligner.align_with_path(audio, text, None, 2.0)?;
+    let o = aligner.align_with_path(audio, text, None, 2.0, None)?;
 
     // Regroup the CTC targets into source words by `word_id`, dropping the
     // stars: word text, first start, last end, mean frame score.

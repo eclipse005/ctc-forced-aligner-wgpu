@@ -461,7 +461,7 @@ fn gpu_golden_tokens() {
     std::fs::create_dir_all("gpu_debug").unwrap();
     std::fs::write("gpu_debug/gpu_log_probs.bin", bytemuck::cast_slice(&lp)).unwrap();
 
-    let out = aligner.align(&wav_path, text, Some(30.0), 2.0).unwrap();
+    let out = aligner.align(&wav_path, text, Some(30.0), 2.0, None).unwrap();
     println!("gpu align: {:.2}s ({} frames)", t0.elapsed().as_secs_f64(), out.frames);
 
     for impl_name in ["eager", "sdpa"] {

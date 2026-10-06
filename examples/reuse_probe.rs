@@ -21,14 +21,14 @@ fn main() -> anyhow::Result<()> {
 
     // A) 复用实例：先 chunk1，再 chunk2
     let shared = Aligner::load_on(model, DeviceSelector::parse("nvidia")?)?;
-    let a1 = shared.align(chunk1, &text1, Some(30.0), 2.0)?;
-    let a2 = shared.align(chunk2, &text2, Some(30.0), 2.0)?;
+    let a1 = shared.align(chunk1, &text1, Some(30.0), 2.0, None)?;
+    let a2 = shared.align(chunk2, &text2, Some(30.0), 2.0, None)?;
     println!("reuse  chunk1: {:?}", summarize(&a1));
     println!("reuse  chunk2: {:?}", summarize(&a2));
 
     // B) 全新实例：只 align chunk2
     let fresh = Aligner::load_on(model, DeviceSelector::parse("nvidia")?)?;
-    let b2 = fresh.align(chunk2, &text2, Some(30.0), 2.0)?;
+    let b2 = fresh.align(chunk2, &text2, Some(30.0), 2.0, None)?;
     println!("fresh  chunk2: {:?}", summarize(&b2));
 
     let same = a2.tokens.len() == b2.tokens.len()

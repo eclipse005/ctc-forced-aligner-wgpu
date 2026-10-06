@@ -46,7 +46,7 @@ fn align_job(
 ) -> anyhow::Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
     let audio = Path::new(job["audio_path"].as_str().context("no audio_path")?);
     let text = job["transcript"].as_str().context("no transcript")?;
-    let o = aligner.align_with_path(audio, text, Some(30.0), 2.0)?;
+    let o = aligner.align_with_path(audio, text, Some(30.0), 2.0, None)?;
 
     // Words grouped by word_id (stars dropped), remembering each word's first
     // token index; then the blank run whose `before_token_index` is that index.

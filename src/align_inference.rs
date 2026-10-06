@@ -329,20 +329,29 @@ impl Aligner {
         }
     }
 
-    /// Progress sink for a windowed run: `(windows done, windows total)`.
+    /// Align one file against its transcript.
     ///
-    /// 报的是**窗口**不是秒：窗口数在开跑前就算得出来（`div_ceil`），而秒数要
-    /// 靠估计。一小时音频按 30 s 窗口是 120 刻度，够画一条不跳的条。
+    /// `window_sec = None` encodes the whole file in one pass (matches the
+    /// Python unchunked path); `Some(w)` uses w-second windows with
+    /// `context_sec` of context on each side (matches `log_probs_chunked`).
     ///
-    /// 回调在**调用方那个线程**上、同步触发（编码那一侧），所以它不需要跨线程
-    /// 的通道；想喂 UI 就在回调里 `send`。
-    pub fn align_with_progress(
+    /// `on_progress` is an optional [`AlignProgress`] sink — `(windows done,
+    /// windows total)`, fired once per encoded window on **this** thread, so a
+    /// UI just `send`s inside it. `None` costs nothing: `Option<&mut dyn FnMut>`
+    /// is one word, and the only added work is the branch in `report`.
+    ///
+    /// It is a parameter and not a second `align_with_progress` because
+    /// "report progress" is not a different algorithm — it is the same run with
+    /// somewhere to talk to. Two methods meant two doc blocks to keep true and
+    /// a combinatorial mess the moment a third variant (`…_with_path` and
+    /// progress) showed up.
+    pub fn align(
         &self,
         audio_path: &Path,
         text: &str,
         window_sec: Option<f64>,
         context_sec: f64,
-        on_progress: AlignProgress<'_>,
+        mut on_progress: Option<AlignProgress<'_>>,
     ) -> Result<AlignOutput> {
         self.align_impl(
             audio_path,
@@ -350,23 +359,8 @@ impl Aligner {
             window_sec,
             context_sec,
             false,
-            &mut Some(on_progress),
+            &mut on_progress,
         )
-    }
-
-    /// Align one file against its transcript.
-    ///
-    /// `window_sec = None` encodes the whole file in one pass (matches the
-    /// Python unchunked path); `Some(w)` uses w-second windows with
-    /// `context_sec` of context on each side (matches `log_probs_chunked`).
-    pub fn align(
-        &self,
-        audio_path: &Path,
-        text: &str,
-        window_sec: Option<f64>,
-        context_sec: f64,
-    ) -> Result<AlignOutput> {
-        self.align_impl(audio_path, text, window_sec, context_sec, false, &mut None)
     }
 
     /// `align`, but the per-frame trellis path is kept on the output.
@@ -381,8 +375,16 @@ impl Aligner {
         text: &str,
         window_sec: Option<f64>,
         context_sec: f64,
+        mut on_progress: Option<AlignProgress<'_>>,
     ) -> Result<AlignOutput> {
-        self.align_impl(audio_path, text, window_sec, context_sec, true, &mut None)
+        self.align_impl(
+            audio_path,
+            text,
+            window_sec,
+            context_sec,
+            true,
+            &mut on_progress,
+        )
     }
 
     fn align_impl(

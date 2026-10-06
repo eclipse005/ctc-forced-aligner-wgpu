@@ -20,7 +20,7 @@
 //!
 //! let aligner = Aligner::load_on(Path::new("models/omniASR-CTC-300M-v2-hf"),
 //!                                DeviceSelector::parse("auto")?)?;
-//! let out = aligner.align(Path::new("speech.wav"), "hello world", Some(30.0), 2.0)?;
+//! let out = aligner.align(Path::new("speech.wav"), "hello world", Some(30.0), 2.0, None)?;
 //! for t in &out.tokens {
 //!     println!("{:.3}s - {:.3}s  {}", t.start, t.end, t.piece);
 //! }
