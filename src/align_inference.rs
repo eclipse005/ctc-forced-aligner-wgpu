@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::audio::{load_audio, znorm, TARGET_SR};
 use crate::timeline::{anchor_marks, place_unmeasured};
 use crate::gpu::DeviceSelector;
-use crate::spans::{build_segments, build_words};
+use crate::spans::{build_segments, build_words, WordSpan};
 use crate::viterbi::{
     build_expanded_labels, ctc_forced_align_emissions_with_word_ids,
     ctc_forced_align_gathered_with_word_ids, AlignmentResult, Emissions, GatheredChunks,
@@ -117,6 +117,21 @@ pub struct AlignOutput {
     /// `serialize_token_rows`.
     #[serde(serialize_with = "serialize_token_rows")]
     pub tokens: Vec<TokenAlignment>,
+    /// The same alignment as timed units: a **character** where the script
+    /// writes without spaces, a **word** where it does not, decided from the
+    /// characters themselves with no language table. A transcript with both gets
+    /// both — `你好` is two units, `alignment` is one, `你好Whisper` is three.
+    ///
+    /// This is the view to read. `tokens` is one row per CTC target, which for
+    /// this character-level checkpoint is one row per *character* for every
+    /// script; a consumer that joins those with spaces renders `Whisper` as
+    /// `W h i s p e r`.
+    ///
+    /// Omitted from JSON: `tokens` already serializes as these same units (see
+    /// [`serialize_token_rows`]), and carrying both made the file 39% larger for
+    /// no reader that wanted it.
+    #[serde(skip)]
+    pub words: Vec<WordSpan>,
     /// Winning-label log-prob per frame, including blanks. Diagnostic only —
     /// `mean_frame_score` is the part worth reading.
     #[serde(skip)]
@@ -479,7 +494,11 @@ impl Aligner {
         // differs groups them again themselves. It carries no index into
         // `tokens`: a row that has to be joined up to mean anything is not
         // parallel to one that does not.
-        let segments = build_segments(&res.tokens, &build_words(&res.tokens));
+        // Built once and kept: `words` is the unit view a consumer should read
+        // (a character for an unspaced script, a word for a spaced one), and
+        // `segments` is cut from the very same units.
+        let words = build_words(&res.tokens);
+        let segments = build_segments(&res.tokens, &words);
 
         Ok(AlignOutput {
             audio: audio_path.display().to_string(),
@@ -500,6 +519,7 @@ impl Aligner {
                 })
                 .collect(),
             tokens: std::mem::take(&mut res.tokens),
+            words,
             encode_s,
             align_s,
             frame_scores: res.frame_scores,

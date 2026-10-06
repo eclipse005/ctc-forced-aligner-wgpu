@@ -5,7 +5,7 @@
 //! `cues` are subtitle lines whose times stay on the spoken characters
 //! (CrisperWhisper / OneAsr standard cost model).
 
-use crate::spans::{splits_between_characters, PUNCT};
+use crate::spans::PUNCT;
 use crate::viterbi::TokenAlignment;
 
 
@@ -123,14 +123,16 @@ fn discourse(word: &str) -> bool {
     )
 }
 
-/// The line-breaking unit, decided per word.
+/// The line-breaking unit, decided per run of characters.
 ///
-/// A word whose characters are mostly from a script that writes without spaces
-/// is split into its characters; every other word is one unit. Deciding this
-/// per word rather than per file is what lets `你好这个` break between
-/// characters while `alignment` stays whole -- the previous one-flag-per-file
-/// test called any transcript containing a Han character Chinese throughout,
-/// and cut Latin words in half at the cue boundaries.
+/// One unit is one character where the script writes without spaces between its
+/// words, one whole word where it does not. The cut is made by
+/// [`crate::spans::unit_runs`] -- the same function `spans::build_words` reads,
+/// so the line-breaker and the `words` view cannot disagree about what a unit
+/// is, and neither decides it per file: the previous one-flag-per-file test
+/// called any transcript containing a Han character Chinese throughout, and cut
+/// Latin words in half at the cue boundaries. Deciding per run also settles the
+/// mixed word, which asking once per word got wrong.
 pub(crate) fn cue_tokens(tokens: &[TokenAlignment]) -> Vec<Tok> {
     let mut out: Vec<Tok> = Vec::new();
     let mut buf: Vec<&TokenAlignment> = Vec::new();
@@ -140,22 +142,29 @@ pub(crate) fn cue_tokens(tokens: &[TokenAlignment]) -> Vec<Tok> {
         if buf.is_empty() {
             return;
         }
-        let text: String = buf.iter().map(|t| t.piece.as_str()).collect();
-        let (start, end) = (buf[0].start, buf[buf.len() - 1].end);
         let space_before = *pending && !out.is_empty();
-        if splits_between_characters(&buf) {
-            // One unit per character, so the splitter can break between them.
-            for (n, t) in buf.iter().enumerate() {
+        for (n, run) in crate::spans::unit_runs(buf).iter().enumerate() {
+            let piece = &buf[run.range.clone()];
+            if run.splittable {
+                // One unit per character, so the splitter can break between them.
+                for (m, t) in piece.iter().enumerate() {
+                    out.push(Tok {
+                        start: t.start,
+                        end: t.end,
+                        token: t.piece.clone(),
+                        space_before: space_before && n == 0 && m == 0,
+                        splittable: true,
+                    });
+                }
+            } else {
                 out.push(Tok {
-                    start: t.start,
-                    end: t.end,
-                    token: t.piece.clone(),
+                    start: piece[0].start,
+                    end: piece[piece.len() - 1].end,
+                    token: piece.iter().map(|t| t.piece.clone()).collect(),
                     space_before: space_before && n == 0,
-                    splittable: true,
+                    splittable: false,
                 });
             }
-        } else {
-            out.push(Tok { start, end, token: text, space_before, splittable: false });
         }
         buf.clear();
         *pending = false;

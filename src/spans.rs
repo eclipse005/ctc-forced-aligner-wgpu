@@ -41,8 +41,18 @@ pub(crate) const PUNCT: &[char] = &[
 /// Characters that terminate a segment.
 pub(crate) const SENTENCE_END: &[char] = &['.', '!', '?', '…', '。', '！', '？', '；', ';'];
 
+/// A timed unit of the transcript: the granularity a consumer should cut at.
+///
+/// One unit is one **character** where the script writes without spaces between
+/// its words, and one **word** where it does not — decided from the characters
+/// themselves, with no language table and no flag, so a transcript with both gets
+/// both: `你好` is two units, `alignment` is one, and `你好Whisper` is three.
+///
+/// A mark is never a unit of its own where it can avoid being one: it occupies no
+/// frames (`fix_timestamp` snapped it onto the sound before it), so it rides in
+/// the unit it follows and the unit keeps a duration it actually has.
 #[derive(Debug, Clone)]
-pub(crate) struct WordSpan {
+pub struct WordSpan {
     pub text: String,
     pub start: f64,
     pub end: f64,
@@ -68,28 +78,56 @@ pub(crate) struct SegmentSpan {
     pub end: f64,
 }
 
-/// Whether a run of characters belongs to a script that writes without spaces
-/// between words, and so may be broken between its characters.
+/// One run of characters from the same script, as a range into the slice it was
+/// cut from, and whether a consumer may break between its characters.
+pub(crate) struct UnitRun {
+    pub range: std::ops::Range<usize>,
+    /// True for a script that writes without spaces: one character per unit.
+    pub splittable: bool,
+}
+
+/// Cut one source word into runs of a single script.
 ///
-/// This is the ONE place the question is asked. The tokenizer's `word_id`
-/// marks a whitespace-delimited word, which for a script that does not space
-/// its words is a whole line: a 3,793-character Chinese transcript arrives as
-/// a single word, and a consumer that reads `words` gets one unusable entry.
-/// Deciding from the characters themselves instead of from the file turns that
-/// into 3,793 single-character words, and leaves `hello` alone.
+/// This is the ONE place the question "is this character part of a unit, or is
+/// it a unit?" is asked. It used to be asked once per WORD, and that is wrong
+/// for a word that holds both scripts: `word_id` marks the transcript's
+/// whitespace, so `原版Whisper` — a word with no space in it anywhere — arrives
+/// as one group of nine characters, "mostly Han" said yes, and all nine were
+/// reported separately. A consumer that joins units with spaces, the obvious way
+/// to render them, then printed `原 版 W h i s p e r`. No consumer can tell from
+/// a single Han character that the run in front of it is Chinese; it can only be
+/// told one run at a time. So the word is cut where the script changes and each
+/// piece is decided on its own: `原` `版` `Whisper`.
 ///
-/// It was decided per file once and per word now, and the two copies drifted
-/// the way duplicated code does -- the rendering copy had lost two of the
-/// blocks the tokenizer copy still had, so a text of extension-B ideographs
-/// could be called Chinese by one and not by the other. One function, one
-/// answer.
-pub(crate) fn splits_between_characters(run: &[&TokenAlignment]) -> bool {
+/// A mark never opens a run. It has no sound of its own — `fix_timestamp`
+/// snapped it onto the sound before it — so it rides in the run already open,
+/// which is what keeps `は、` and `hi,` each a single unit. A mark that opens
+/// its own word has nothing to ride in and stands alone.
+pub(crate) fn unit_runs(word: &[&TokenAlignment]) -> Vec<UnitRun> {
     use crate::vocab::is_cjk;
-    let letters = run
-        .iter()
-        .filter(|t| !t.piece.chars().all(|c| c.is_whitespace()))
-        .count();
-    letters > 0 && run.iter().filter(|t| t.piece.chars().any(is_cjk)).count() * 2 > letters
+    let mut out: Vec<UnitRun> = Vec::new();
+    // The script of the run currently open: `None` before the first letter,
+    // which is also what a leading mark inherits (and therefore stands alone).
+    let mut class: Option<bool> = None;
+    for (i, t) in word.iter().enumerate() {
+        let c = if is_mark(&t.piece) {
+            class
+        } else {
+            Some(t.piece.chars().any(is_cjk))
+        };
+        if let (Some(last), Some(c)) = (out.last_mut(), c) {
+            if class == Some(c) {
+                last.range.end = i + 1;
+                continue;
+            }
+        }
+        out.push(UnitRun {
+            range: i..i + 1,
+            splittable: c.unwrap_or(false),
+        });
+        class = c;
+    }
+    out
 }
 
 /// Split a run of tokens into timed units: a sound, and the marks that trail it.
@@ -127,43 +165,54 @@ pub(crate) fn is_mark(piece: &str) -> bool {
     !piece.is_empty() && piece.chars().all(|c| PUNCT.contains(&c))
 }
 
-pub(crate) fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
+/// The timed units of a transcript, in order.
+///
+/// This is the granularity [`WordSpan`] describes and the one a consumer should
+/// cut at: a character where the script writes without spaces, a word where it
+/// does not, decided per run of characters rather than per file and not per
+/// whole word either (see [`unit_runs`]).
+pub fn build_words(tokens: &[TokenAlignment]) -> Vec<WordSpan> {
     let mut words: Vec<WordSpan> = Vec::new();
     let mut buf: Vec<&TokenAlignment> = Vec::new();
 
     macro_rules! flush {
         () => {
             if !buf.is_empty() {
-                // A word of an unspaced script is reported per character -- the
-                // same unit the line-breaker cuts on, so `words` and `cues` can
-                // never disagree about what a unit is -- except that a mark
-                // rides in the character it follows, because it has no time of
-                // its own to be a unit.
+                // The gap belongs to the source word, so only its very first
+                // unit carries one; the rest of that word, and every unit of the
+                // words after it, follow it directly.
                 let space_before = !words.is_empty();
-                if splits_between_characters(&buf) {
-                    for (n, g) in mark_groups(&buf).iter().enumerate() {
-                        let span = &buf[g.clone()];
+                for (n, run) in unit_runs(&buf).iter().enumerate() {
+                    // An unspaced script is reported a character at a time --
+                    // the same unit the line-breaker cuts on, so `words` and
+                    // `cues` can never disagree about what a unit is -- except
+                    // that a mark rides in the character it follows, because it
+                    // has no time of its own to be a unit. A spaced run is one
+                    // unit whole.
+                    let pieces: Vec<&[&TokenAlignment]> = if run.splittable {
+                        // `mark_groups` numbers within the slice it is given, so
+                        // its ranges come back relative to the run and have to be
+                        // rebased onto `buf` before they index anything. Taking
+                        // them as they are works only while the run starts at 0:
+                        // `N四六` then came out as `N` `N` `四`.
+                        let base = run.range.start;
+                        mark_groups(&buf[run.range.clone()])
+                            .iter()
+                            .map(|g| &buf[(base + g.start)..(base + g.end)])
+                            .collect()
+                    } else {
+                        vec![&buf[run.range.clone()]]
+                    };
+                    for (m, piece) in pieces.iter().enumerate() {
                         words.push(WordSpan {
-                            text: span.iter().map(|t| t.piece.as_str()).collect(),
-                            start: span[0].start,
-                            end: span[span.len() - 1].end,
-                            char_start: span[0].index,
-                            char_end: span[span.len() - 1].index,
-                            // only the first unit of the word carries the
-                            // gap; the rest follow it directly
-                            space_before: space_before && n == 0,
+                            text: piece.iter().map(|t| t.piece.as_str()).collect(),
+                            start: piece[0].start,
+                            end: piece[piece.len() - 1].end,
+                            char_start: piece[0].index,
+                            char_end: piece[piece.len() - 1].index,
+                            space_before: space_before && n == 0 && m == 0,
                         });
                     }
-                } else {
-                    let text: String = buf.iter().map(|t| t.piece.as_str()).collect();
-                    words.push(WordSpan {
-                        text,
-                        start: buf[0].start,
-                        end: buf[buf.len() - 1].end,
-                        char_start: buf[0].index,
-                        char_end: buf[buf.len() - 1].index,
-                        space_before,
-                    });
                 }
                 buf.clear();
             }
@@ -376,5 +425,52 @@ mod tests {
         assert!(words[1].space_before, "but the source had a space there");
         let segments = build_segments(&t, &words);
         assert_eq!(segments[0].text, "hello, world!");
+    }
+
+    /// A Latin word glued to Chinese is ONE source word -- there is no
+    /// whitespace in it anywhere -- and asking once per word said "Han" and
+    /// reported all nine characters separately. A consumer joining units with
+    /// spaces then printed `原 版 W h i s p e r`. Decided per run of characters,
+    /// the same word is `原` `版` `Whisper`.
+    #[test]
+    fn a_mixed_word_is_cut_where_the_script_changes() {
+        let t = tokens(&[&["原", "版", "W", "h", "i", "s", "p", "e", "r", "，"]]);
+        let words = build_words(&t);
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["原", "版", "Whisper，"], "one unit per script, not per word");
+        // Rendering the units the way a consumer would, with a space between
+        // those that carry the transcript's gap, gives the transcript back --
+        // and no gap inside the word, because there is none in it.
+        assert_eq!(rendered(&words), "原版Whisper，");
+        // The units are in order and none of them is a bare point in time: the
+        // Latin run kept the mark `fix_timestamp` snapped onto the end of `r`.
+        assert!(words.iter().all(|w| w.end > w.start), "{words:?}");
+        for pair in words.windows(2) {
+            assert!(pair[1].start >= pair[0].end, "units overlap: {words:?}");
+        }
+    }
+
+    /// The mirror image: a Latin letter in front of Chinese is its own unit, and
+    /// the gap stays where the transcript put it (nowhere). This is also the
+    /// case that caught `mark_groups` ranges being taken relative to the run and
+    /// used to index the whole word.
+    #[test]
+    fn a_latin_prefix_before_cjk_is_a_unit_of_its_own() {
+        let t = tokens(&[&["N", "四", "六"]]);
+        let words = build_words(&t);
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["N", "四", "六"]);
+        assert_eq!(rendered(&words), "N四六", "no gap was invented inside the word");
+    }
+
+    /// Two scripts in one utterance, separated by real whitespace: the gap is
+    /// the transcript's, and each word is decided on its own.
+    #[test]
+    fn two_scripts_in_one_utterance_keep_their_own_units() {
+        let t = tokens(&[&["用"], &["Whisper"], &["和"], &["GPT"]]);
+        let words = build_words(&t);
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["用", "Whisper", "和", "GPT"]);
+        assert_eq!(rendered(&words), "用 Whisper 和 GPT");
     }
 }

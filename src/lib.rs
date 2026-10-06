@@ -28,10 +28,26 @@
 //! ```
 //!
 //! That is the whole of it: [`Aligner`] to load and run, [`AlignOutput`] to
-//! read, [`TokenAlignment`] for one unit, [`DeviceSelector`] to pick a device,
-//! [`list_targets`] to list them. Subtitles are [`views::build_cues`] rendered
-//! by [`render::srt`] or [`render::ass`]. Everything else is `pub(crate)` and
-//! free to change.
+//! read, [`WordSpan`] for one timed unit, [`TokenAlignment`] for one CTC
+//! target, [`DeviceSelector`] to pick a device, [`list_targets`] to list them.
+//! Subtitles are [`views::build_cues`] rendered by [`render::srt`] or
+//! [`render::ass`]. Everything else is `pub(crate)` and free to change.
+//!
+//! # Which view to read
+//!
+//! `AlignOutput::words` is the alignment as units: one **character** where the
+//! script writes without spaces between its words, one **word** where it does
+//! not, decided from the characters themselves with no language table and no
+//! flag. `你好` is two units, `alignment` is one, `你好Whisper` is three, and
+//! [`space_before`](WordSpan::space_before) carries the transcript's own gaps so
+//! the units can be rendered back into the text they came from.
+//!
+//! `AlignOutput::tokens` is the other view, and the one to reach for only when a
+//! character is the unit you want: one row per CTC target, which for this
+//! character-level checkpoint means one row per character for *every* script. A
+//! consumer that joins those with spaces renders `Whisper` as `W h i s p e r`,
+//! which is why [`tokens`](AlignOutput::tokens) serializes as units in JSON even
+//! though it holds targets in memory.
 //!
 //! # How it is put together
 //!
@@ -80,4 +96,5 @@ mod testutil;
 
 pub use align_inference::{AlignOutput, Aligner};
 pub use gpu::{list_targets, DeviceSelector};
+pub use spans::{WordSpan, build_words};
 pub use viterbi::TokenAlignment;
