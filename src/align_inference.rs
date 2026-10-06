@@ -22,6 +22,23 @@ use crate::vocab::Vocab;
 use crate::wav2vec2::{LmHeadCpu, Model};
 use crate::wav2vec2_gpu::GpuModel;
 
+/// Progress sink for a windowed run: `(windows done, windows total)`.
+///
+/// 报的是**窗口**不是秒：窗口数开跑前就算得出来（`div_ceil`），秒数只能估。
+/// 一小时音频按 30 s 窗口是 120 刻度，够画一条不跳的条。
+///
+/// 回调在**调用方那个线程**上、同步触发（编码那一侧），所以不需要跨线程通道；
+/// 想喂 UI 就在回调里 `send`。
+pub type AlignProgress<'a> = &'a mut dyn FnMut(usize, usize);
+
+/// 火一次进度。`None`（没接回调）是一个分支，不是每窗口一次的重活。
+#[inline]
+fn report(progress: &mut Option<AlignProgress<'_>>, done: usize, total: usize) {
+    if let Some(p) = progress.as_deref_mut() {
+        p(done, total);
+    }
+}
+
 /// The model on one backend. Both towers are token-identical to the
 /// Python reference (see tests/golden.rs).
 pub(crate) enum Tower {
@@ -312,6 +329,31 @@ impl Aligner {
         }
     }
 
+    /// Progress sink for a windowed run: `(windows done, windows total)`.
+    ///
+    /// 报的是**窗口**不是秒：窗口数在开跑前就算得出来（`div_ceil`），而秒数要
+    /// 靠估计。一小时音频按 30 s 窗口是 120 刻度，够画一条不跳的条。
+    ///
+    /// 回调在**调用方那个线程**上、同步触发（编码那一侧），所以它不需要跨线程
+    /// 的通道；想喂 UI 就在回调里 `send`。
+    pub fn align_with_progress(
+        &self,
+        audio_path: &Path,
+        text: &str,
+        window_sec: Option<f64>,
+        context_sec: f64,
+        on_progress: AlignProgress<'_>,
+    ) -> Result<AlignOutput> {
+        self.align_impl(
+            audio_path,
+            text,
+            window_sec,
+            context_sec,
+            false,
+            &mut Some(on_progress),
+        )
+    }
+
     /// Align one file against its transcript.
     ///
     /// `window_sec = None` encodes the whole file in one pass (matches the
@@ -324,7 +366,7 @@ impl Aligner {
         window_sec: Option<f64>,
         context_sec: f64,
     ) -> Result<AlignOutput> {
-        self.align_impl(audio_path, text, window_sec, context_sec, false)
+        self.align_impl(audio_path, text, window_sec, context_sec, false, &mut None)
     }
 
     /// `align`, but the per-frame trellis path is kept on the output.
@@ -340,7 +382,7 @@ impl Aligner {
         window_sec: Option<f64>,
         context_sec: f64,
     ) -> Result<AlignOutput> {
-        self.align_impl(audio_path, text, window_sec, context_sec, true)
+        self.align_impl(audio_path, text, window_sec, context_sec, true, &mut None)
     }
 
     fn align_impl(
@@ -350,6 +392,7 @@ impl Aligner {
         window_sec: Option<f64>,
         context_sec: f64,
         keep_path: bool,
+        progress: &mut Option<AlignProgress<'_>>,
     ) -> Result<AlignOutput> {
         // One file, one fresh scratch: see `GpuModel::reset_scratch`. Within
         // this file the windows keep sharing the recorded graph.
@@ -414,11 +457,11 @@ impl Aligner {
         let (mut res, encode_s, align_s) = match stream {
             Some((win, kind)) => self.align_streaming(
                 waveform, win, context_sec, kind, &expanded, &star_state_idx, &ids, &pieces,
-                &word_ids,
+                &word_ids, progress,
             )?,
             None => {
                 let trellis = self.log_probs_trellis(
-                    &waveform, window_sec, context_sec, &expanded, &star_state_idx,
+                    &waveform, window_sec, context_sec, &expanded, &star_state_idx, progress,
                 )?;
                 // The DP never reads the waveform — everything it consumes is
                 // in the trellis — so free it before the traceback allocates
@@ -537,6 +580,7 @@ impl Aligner {
         context_sec: f64,
         expanded: &[usize],
         star_state_idx: &[usize],
+        progress: &mut Option<AlignProgress<'_>>,
     ) -> Result<Trellis> {
         // The DP reads one f32 per (frame, expanded state), so the trellis is
         // T×(2·tokens+1).  Two things can stand in for it, both holding the
@@ -580,7 +624,7 @@ impl Aligner {
                 })
             }
             Some(win) => self.log_probs_chunked(
-                waveform, win, context_sec, expanded, star_state_idx, form,
+                waveform, win, context_sec, expanded, star_state_idx, form, progress,
             ),
         }
     }
@@ -726,6 +770,7 @@ impl Aligner {
     /// the file is encoded instead of doubling a single 5 GB allocation on the
     /// way (see `GatheredChunks`), or — in `Lazy` mode — never materialising
     /// the wide trellis at all.
+    #[allow(clippy::too_many_arguments)]
     fn log_probs_chunked(
         &self,
         waveform: &[f32],
@@ -734,6 +779,7 @@ impl Aligner {
         expanded: &[usize],
         star_state_idx: &[usize],
         form: Form,
+        progress: &mut Option<AlignProgress<'_>>,
     ) -> Result<Trellis> {
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
         let states = expanded.len();
@@ -777,7 +823,8 @@ impl Aligner {
         anyhow::ensure!(win_frames > 0, "window must span at least one frame");
 
         let n = waveform.len();
-        let extension = n.div_ceil(win) * win - n;
+        let n_chunks = n.div_ceil(win);
+        let extension = n_chunks * win - n;
         // padded = [ctx zeros | waveform | ctx+extension zeros]
         let padded_len = n + 2 * ctx + extension;
         let ext_frames = ((extension as f64 / TARGET_SR as f64 * self.frame_rate).ceil()) as usize;
@@ -796,10 +843,17 @@ impl Aligner {
                     // buffers — so collecting window N-1 below overlaps
                     // window N's compute instead of idling the GPU behind a
                     // readback. The last window flushes inside the helper.
-                    self.encode_lazy_gpu_windows(waveform, win, ctx, kind, |_i, g| {
-                        blocks.push(g);
-                        Ok(())
-                    })?;
+                    self.encode_lazy_gpu_windows(
+                        waveform,
+                        win,
+                        ctx,
+                        kind,
+                        progress,
+                        |_i, g| {
+                            blocks.push(g);
+                            Ok(())
+                        },
+                    )?;
                 }
                 Tower::Cpu(_) => {
                     let mut start = 0usize; // chunk start inside `padded`
@@ -817,6 +871,7 @@ impl Aligner {
                                 kept_of(rows),
                             );
                         }
+                        report(progress, blocks.len(), n_chunks);
                         start += win;
                     }
                 }
@@ -851,6 +906,7 @@ impl Aligner {
                                     blocks[c].capacity() * 4 >> 20
                                 );
                             }
+                            report(progress, blocks.len(), n_chunks);
                         }
                     }
                     Tower::Cpu(_) => {
@@ -871,6 +927,7 @@ impl Aligner {
                                 blocks[c].capacity() * 4 >> 20
                             );
                         }
+                        report(progress, blocks.len(), n_chunks);
                     }
                 }
                 start += win;
@@ -882,6 +939,7 @@ impl Aligner {
                     Tower::Gpu(gpu) => blocks.push(gpu.collect(p)?),
                     Tower::Cpu(_) => anyhow::bail!("pending result without the GPU tower"),
                 }
+                report(progress, blocks.len(), n_chunks);
             }
         }
 
@@ -942,6 +1000,7 @@ impl Aligner {
         win: usize,
         ctx: usize,
         kind: BlockKind,
+        progress: &mut Option<AlignProgress<'_>>,
         mut sink: impl FnMut(usize, Vec<f32>) -> Result<()>,
     ) -> Result<()> {
         let n = waveform.len();
@@ -979,6 +1038,7 @@ impl Aligner {
                 }
                 sink(collected, g)?;
                 collected += 1;
+                report(progress, collected, n_chunks);
             }
             start += win;
         }
@@ -986,6 +1046,7 @@ impl Aligner {
             let g = gpu.collect(p)?;
             sink(collected, g)?;
             collected += 1;
+            report(progress, collected, n_chunks);
         }
         debug_assert_eq!(collected, n_chunks, "the loop's window arithmetic drifted");
         Ok(())
@@ -1017,6 +1078,7 @@ impl Aligner {
         ids: &[usize],
         pieces: &[String],
         word_ids: &[usize],
+        progress: &mut Option<AlignProgress<'_>>,
     ) -> Result<(AlignmentResult, f64, f64)> {
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
         let states = expanded.len();
@@ -1088,7 +1150,7 @@ impl Aligner {
                 // ---- the encode, on the calling thread ----
                 let enc = (|| -> Result<()> {
                     let mut tail = 0usize;
-                    self.encode_lazy_gpu_windows(waveform.as_slice(), win, ctx, kind, |i, g| {
+                    self.encode_lazy_gpu_windows(waveform.as_slice(), win, ctx, kind, progress, |i, g| {
                         // cross-check the block against the span the DP was
                         // predicted. The chunk→frames mapping is the model's
                         // own conv arithmetic — NOT `len / subsampling` (this
@@ -1932,6 +1994,30 @@ impl Emissions for LazyEmissions<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_progress_sink_passes_the_ticks_through_untouched() {
+        // 回调收到的必须就是循环数出来的那两个数：`done` 是**已经编完的窗口数**
+        // （不是下一个的下标），`total` 在整个 run 里不变。一个画成 12/42 的进度
+        // 条要求这两件事都是真的。
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut sink = |done: usize, total: usize| seen.push((done, total));
+            let mut slot = Some(&mut sink as AlignProgress<'_>);
+            for done in 1..=3 {
+                report(&mut slot, done, 3);
+            }
+        }
+        assert_eq!(seen, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[test]
+    fn no_sink_is_a_no_op_not_a_crash() {
+        // `align()` 走的正是这个分支：一小时的 run 也要照跑不误。
+        let mut slot: Option<AlignProgress<'_>> = None;
+        report(&mut slot, 1, 120);
+        report(&mut slot, 120, 120);
+    }
 
     /// The whole point of putting a timestamp on text: the text must come out
     /// the other side untouched.

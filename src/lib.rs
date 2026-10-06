@@ -94,7 +94,7 @@ mod golden;
 #[cfg(test)]
 mod testutil;
 
-pub use align_inference::{AlignOutput, Aligner};
+pub use align_inference::{AlignOutput, AlignProgress, Aligner};
 pub use gpu::{list_targets, DeviceSelector};
 pub use spans::{WordSpan, build_words};
 pub use viterbi::TokenAlignment;
