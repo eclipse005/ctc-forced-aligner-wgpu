@@ -15,6 +15,7 @@
 static GLOBAL: ctc_forced_aligner_wgpu::alloc_stats::Stats =
     ctc_forced_aligner_wgpu::alloc_stats::Stats;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -38,6 +39,10 @@ usage: align --audio <wav> (--text <text|file>) [options]
   --ass-font <name>        ass only: font family (default Malgun Gothic); size is fixed at 64
   --output <path>          write here (default: print to stdout)
   --list-devices           list wgpu adapters and exit
+
+Progress goes to stderr, never to stdout: one rewriting line on a terminal, or a
+line every 10% when stderr is redirected to a file. stdout stays byte-exactly
+what --format asked for.
 ";
 
 fn main() -> Result<()> {
@@ -111,7 +116,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("load model from {}", model_dir.display()))?;
     let load_s = t0.elapsed().as_secs_f64();
 
-    let out = aligner.align(&audio, &text, window, context, None)?;
+    let out = {
+        let mut ticker = Ticker::new();
+        aligner.align(&audio, &text, window, context, Some(&mut |done, total| {
+            ticker.tick(done, total)
+        }))?
+    };
     let rtfx = out.duration / (out.encode_s + out.align_s).max(1e-9);
 
     // The karaoke style carries only what a user might genuinely need to
@@ -165,6 +175,65 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// stderr 上的进度条，分两种接收端：
+///
+/// * **终端**里一行到底，用 `\r` 覆盖 —— 这是人盯着看的那种。
+/// * **重定向到文件/管道**时按 10% 打点成独立行 —— `\r` 写进日志就是一串控制符，
+///   而每窗口打一行在日志里是 120 行几乎一样的字。两个都不想要。
+///
+/// 没有窗口可数的运行（`--window 0`）一个刻度都不发，所以这里也不会画一条永远
+/// 停在 0% 的线出来。
+struct Ticker {
+    tty: bool,
+    last_pct: u8,
+}
+
+/// 非终端时每隔多少个百分点打一行。
+const TICK_STEP: u8 = 10;
+
+impl Ticker {
+    fn new() -> Self {
+        Self::with_tty(std::io::stderr().is_terminal())
+    }
+
+    fn with_tty(tty: bool) -> Self {
+        Self { tty, last_pct: 0 }
+    }
+
+    /// 这一格要不要写；返回要写的百分比。终端恒为 `Some`（每次都重写一行），
+    /// 非终端才按 [`TICK_STEP`] 打点。与打印分开，是为了能在没有终端的单测里
+    /// 断言「该打几次、什么时候打」——`\r` 分支在管道里永远走不到。
+    fn due(&mut self, done: usize, total: usize) -> Option<u8> {
+        if total == 0 {
+            return None;
+        }
+        let pct = ((done.min(total) * 100) / total).min(100) as u8;
+        if self.tty {
+            return Some(pct);
+        }
+        if pct == 100 || pct >= self.last_pct + TICK_STEP {
+            self.last_pct = pct;
+            return Some(pct);
+        }
+        None
+    }
+
+    fn tick(&mut self, done: usize, total: usize) {
+        let Some(pct) = self.due(done, total) else {
+            return;
+        };
+        if self.tty {
+            // 行尾多两个空格：百分比 9→100 变宽，不补的话上一次会露在后面。
+            eprint!("\r[align] {pct:>3}%  window {done}/{total}   ");
+            if pct == 100 {
+                eprintln!();
+            }
+        } else {
+            eprintln!("[align] {pct:>3}%  window {done}/{total}");
+        }
+    }
+}
+
 fn render(out: &AlignOutput, format: &str, karaoke: &ass::KaraokeStyle) -> Result<String> {
     match format {
         // Compact, not pretty. This is a machine-read format and a 73-minute
@@ -184,4 +253,64 @@ fn default_model_dir() -> PathBuf {
     std::env::var_os("CTC_MODEL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"D:\omnilingual-asr\models\omniASR-CTC-300M-v2-hf"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TICK_STEP, Ticker};
+
+    /// 一次运行里实际会打出的每一格的百分比（非终端）。
+    fn ticks(total: usize) -> Vec<u8> {
+        let mut t = Ticker::with_tty(false);
+        (1..=total).filter_map(|done| t.due(done, total)).collect()
+    }
+
+    /// `--window 0`（整文件一次前向）没有窗口可数：一个刻度都不发，
+    /// 而不是画一条永远停在 0% 的线。
+    #[test]
+    fn no_windows_means_no_progress_at_all() {
+        assert_eq!(Ticker::with_tty(false).due(0, 0), None);
+        assert_eq!(Ticker::with_tty(true).due(0, 0), None);
+    }
+
+    /// 日志里应该是十来行，不是 42 行几乎一样的字。
+    #[test]
+    fn a_redirected_run_reports_every_ten_percent() {
+        let got = ticks(42);
+        assert_eq!(got.first().copied(), Some(11));
+        assert_eq!(*got.last().unwrap(), 100);
+        // 每一步都至少跨了一个 TICK_STEP，且严格递增。
+        assert!(
+            got.windows(2).all(|w| w[1] > w[0]),
+            "progress went backwards or repeated: {got:?}"
+        );
+        assert!(
+            got.windows(2).all(|w| w[1] - w[0] >= TICK_STEP),
+            "a step under {TICK_STEP}% slipped through: {got:?}"
+        );
+    }
+
+    /// 窗口少的时候（短音频）不该只剩首尾两行——10% 的步长比整段还粗。
+    #[test]
+    fn a_short_run_reports_every_window() {
+        assert_eq!(ticks(3), vec![33, 66, 100]);
+    }
+
+    /// 终端里每一格都要重写，所以每一格都给 Some。
+    #[test]
+    fn a_terminal_rewrites_on_every_window() {
+        let mut t = Ticker::with_tty(true);
+        let got: Vec<Option<u8>> = (1..=42).map(|d| t.due(d, 42)).collect();
+        assert_eq!(got.len(), 42, "the tty branch must never skip a window");
+        assert!(got.iter().all(|p| p.is_some()));
+        assert_eq!(*got.last().unwrap(), Some(100));
+    }
+
+    /// 引擎报上来的 done 偶尔会越界（换了分母、旧值还在飞），夹住而不是画出
+    /// 一个 140% 的条。
+    #[test]
+    fn a_done_past_the_total_clamps_instead_of_overshooting() {
+        let mut t = Ticker::with_tty(false);
+        assert_eq!(t.due(9, 3), Some(100));
+    }
 }
