@@ -513,6 +513,24 @@ impl GpuModel {
         self.gpu.describe()
     }
 
+    /// Drop the activation scratch (recorded dispatch graph + buffers); the
+    /// next encode rebuilds it.
+    ///
+    /// `align()` calls this once per file. The recorded-graph replay is only
+    /// sound for the file whose dispatches recorded it: a scratch reused
+    /// across files has regions no dispatch of the new file writes (the
+    /// zero-padded context holes in front of window 1, buffers sized by the
+    /// previous file), and those regions still hold the previous file's
+    /// samples. The first window then encodes against the wrong context and
+    /// the DP mis-places the transcript from its first word on — measured on
+    /// a 60 s slice re-aligned after a 51 s one: the first token landed 4.4 s
+    /// late with the scratch shared, on the frame-accurate mark with a fresh
+    /// one. Within one file the windows keep sharing the scratch; that is
+    /// the reuse the cache exists for.
+    pub fn reset_scratch(&self) {
+        *self.scratch.lock().unwrap() = None;
+    }
+
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {

@@ -29,6 +29,17 @@ pub(crate) enum Tower {
     Gpu(GpuModel),
 }
 
+impl Tower {
+    /// Drop the GPU activation scratch; a no-op on the CPU tower, whose
+    /// forward allocates per call. See `GpuModel::reset_scratch`.
+    pub fn reset_scratch(&self) {
+        match self {
+            Tower::Cpu(_) => {}
+            Tower::Gpu(m) => m.reset_scratch(),
+        }
+    }
+}
+
 
 /// The score the reference gives `<star>`: the column it appends to its
 /// emissions is `torch.cat([emissions, zeros(..., 1)], dim=1)` AFTER the
@@ -325,6 +336,9 @@ impl Aligner {
         context_sec: f64,
         keep_path: bool,
     ) -> Result<AlignOutput> {
+        // One file, one fresh scratch: see `GpuModel::reset_scratch`. Within
+        // this file the windows keep sharing the recorded graph.
+        self.tower.reset_scratch();
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         // `<star>` between words, the reference's per-script placement. See
         // `Vocab::tokenise_with_stars` for why this is not cosmetic: the star is
