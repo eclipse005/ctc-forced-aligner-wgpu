@@ -87,7 +87,7 @@ align --audio speech.wav --text transcript.txt --format srt --output out.srt
 | `tokens` | where each **timed unit** is said: `text`, `start`, `end`, `space_before`, `score`, `inferred` |
 | `segments` | the same read a sentence at a time: `text`, `start`, `end` |
 
-A unit is a word, and which kind is decided **per word** with no language table: a whole word where the script spaces its words, a single character where it does not. A Chinese "word" is a whole sentence and the test applies inside it, so a mixed transcript gets both kinds in the same file. Where a script is cut per character, a **mark rides in the character it follows** — `は、` is one unit, not two — because a mark is snapped onto the preceding token's end and occupies no frames of its own, so a row that was only a mark was a point in time rather than a timing. On the 73-minute Japanese transcript that was 2,490 rows of 26,355 saying nothing; 4 remain, the marks the transcript put after a space, which open a word of their own.
+A unit is a word, and which kind is decided **per run of characters** with no language table: a whole word where the script spaces its words, a single character where it does not. A Chinese "word" is a whole sentence and the test applies inside it, so a mixed transcript gets both kinds in the same file. The run is the unit of the decision, not the word: `word_id` marks the transcript's whitespace, so `原版Whisper` — a word with no space in it anywhere — arrives as one group of nine characters, and asked once, "mostly Han?" said yes and reported all nine separately, which renders as `原 版 W h i s p e r`. Decided per run it is `原` `版` `Whisper`. Where a script is cut per character, a **mark rides in the character it follows** — `は、` is one unit, not two — because a mark is snapped onto the preceding token's end and occupies no frames of its own, so a row that was only a mark was a point in time rather than a timing. On the 73-minute Japanese transcript that was 2,490 rows of 26,355 saying nothing; 4 remain, the marks the transcript put after a space, which open a word of their own.
 
 Two of the six fields are there so the row cannot lie:
 
@@ -104,12 +104,12 @@ use ctc_forced_aligner_wgpu::{Aligner, DeviceSelector};
 let aligner = Aligner::load_on(std::path::Path::new("model"),
                                DeviceSelector::parse("auto")?)?;
 let out = aligner.align(std::path::Path::new("speech.wav"), "hello world", Some(30.0), 2.0)?;
-for t in &out.tokens {
-    println!("{:.3}s - {:.3}s  {}", t.start, t.end, t.piece);
+for w in &out.words {
+    println!("{:.3}s - {:.3}s  {}", w.start, w.end, w.text);
 }
 ```
 
-That is the whole of the API: `Aligner` to load and run, `AlignOutput` to read, `TokenAlignment` for one unit, `DeviceSelector` to pick a device, `list_targets` to list them. Subtitles are `views::build_cues` rendered by `render::srt` or `render::ass`. **Everything else is `pub(crate)`** — the model, the Viterbi, the boundary rules, the word and sentence grouping, all of it, because none of it is a promise to anyone but this crate.
+That is the whole of the API: `Aligner` to load and run, `AlignOutput` to read, `WordSpan` for one timed unit, `TokenAlignment` for one CTC target, `DeviceSelector` to pick a device, `list_targets` to list them. Subtitles are `views::build_cues` rendered by `render::srt` or `render::ass`. **Everything else is `pub(crate)`** — the model, the Viterbi, the boundary rules, the sentence grouping, all of it, because none of it is a promise to anyone but this crate. The unit grouping is now a promise, which is why `words` is public: it is the one thing every consumer has to agree on, and agreeing on it twice is how `W h i s p e r` happens.
 
 `align` takes the window and context lengths in seconds (`None` for the window runs the whole file in one pass). `TokenAlignment` carries `piece`, `start`, `end`, `start_frame`, `end_frame`, `word_id` and a per-frame mean `score`. `align_with_path` additionally returns the per-frame state path, which is what the reference comparison is made against. See `cargo doc` for the full API.
 
@@ -142,7 +142,7 @@ The model's convolutional frontend subsamples by 320, so **timestamps land on a 
 
 **What gets aligned is the character. Spaces do not** — a space is a tokenizer separator, and the audio has no such acoustic event. **Punctuation does, but occupies no time**: it is in the vocabulary and a real CTC target, but it is snapped onto the preceding token's end, so `start == end` and it takes zero frames. The model has no opinion about it either — measured confidence runs −12 to −24 — and giving it a duration would be inventing one.
 
-Whether the output is per character or per word is decided **per word**, with no language table: a word whose characters are mostly CJK is split into characters, every other word is one unit the line-breaker cannot cut inside. So Korean and Japanese come out per character, Chinese likewise (a Chinese "word" is a whole sentence, and the test applies inside it), and English, Spanish and French per word.
+Whether the output is per character or per word is decided **per run of characters**, with no language table: a run from a script that writes without spaces is split into characters, every other run is one unit the line-breaker cannot cut inside. So Korean and Japanese come out per character, Chinese likewise (a Chinese "word" is a whole sentence, and the test applies inside it), and English, Spanish and French per word. A word holding both scripts is cut where the script changes rather than judged once, so `原版Whisper` is `原` `版` `Whisper` and not nine single characters.
 
 Characters outside the checkpoint's vocabulary have no CTC target and so never reach the DP, but they are **not** dropped from the output: a forced alignment is a monotone path, so a character written between two placed ones must fall between them, and it is placed at the midpoint of that interval with `inferred: true` to say so. A transcript that mentions a rare han character four times used to ship a subtitle missing all four, and the only trace was a line in a `skipped` list that nobody read. There is no such list now — the character is in `tokens` with the flag set, which is the same information without the risk of it reading as "this was thrown away". (That list was 96% spaces anyway: a space is a tokenizer separator and was never a target to begin with.)
 
