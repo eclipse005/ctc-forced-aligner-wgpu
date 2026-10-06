@@ -68,7 +68,7 @@ align --audio speech.wav --text transcript.txt --format srt --output out.srt
 | `--audio <file>` | Audio file (WAV) |
 | `--text <file/text>` | Transcript: an existing path is read as a file, otherwise the argument is used as text |
 | `--model <dir>` | Model directory, or the `CTC_MODEL_DIR` environment variable |
-| `--device <spec>` | `auto` (default: GPU, or CPU when no GPU opens), `cpu`, `gpu` (error when no GPU opens), `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring |
+| `--device <spec>` | `auto` (default: discrete GPU, then integrated, else CPU), `cpu`, `gpu` (discrete then integrated, error when none opens), `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring |
 | `--window <sec>` | Memory and throughput; **does not move timestamps** (default `30`). Capped near 90 s by the single-forward VRAM limit |
 | `--context <sec>` | Encoder overlap on each side of a window (default `2`, floor near 1.3 — it must cover the positional conv) |
 | `--format <json\|srt\|ass>` | `json` is the full alignment (default); `srt` is subtitles; `ass` is karaoke, one sweep per character |

@@ -77,10 +77,11 @@ impl DeviceSelector {
 
 /// Which tower to run, separate from which adapter [`DeviceSelector`] names.
 ///
-/// * [`Self::Auto`] — one real GPU, or the CPU tower when none can be opened.
+/// * [`Self::Auto`] — a real GPU, or the CPU tower when none can be opened.
+///   An unpinned selector tries discrete, then integrated, then a virtual GPU.
 /// * [`Self::Cpu`] — the CPU tower. No adapter.
-/// * [`Self::Gpu`] — that adapter, or an error. `DeviceSelector::Auto` still
-///   picks the discrete GPU; it does not fall back to the host.
+/// * [`Self::Gpu`] — that adapter, or an error. `DeviceSelector::Auto` walks
+///   discrete then integrated and does not fall back to the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
     Auto,
@@ -180,14 +181,19 @@ impl std::fmt::Display for NoGpuError {
 
 impl std::error::Error for NoGpuError {}
 
-fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
-    let class = match info.device_type {
+/// Discrete, then integrated, then virtual. A CPU adapter is not a GPU.
+fn device_class(kind: wgpu::DeviceType) -> u8 {
+    match kind {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
         wgpu::DeviceType::VirtualGpu => 2,
         wgpu::DeviceType::Cpu => 3,
         _ => 4,
-    };
+    }
+}
+
+fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
+    let class = device_class(info.device_type);
     let api = match info.backend {
         wgpu::Backend::Vulkan => 0,
         wgpu::Backend::Metal => 1,
@@ -273,14 +279,16 @@ impl Gpu {
             bail!("no wgpu adapters found (selector {selector:?})");
         }
 
-        let adapter = match &selector {
-            DeviceSelector::Index(i) => adapters.get(*i).ok_or_else(|| {
+        // `Auto` walks every real GPU, discrete before integrated. A named
+        // adapter or a runtime index stays on that one device.
+        let candidates: Vec<&wgpu::Adapter> = match &selector {
+            DeviceSelector::Index(i) => vec![adapters.get(*i).ok_or_else(|| {
                 anyhow::anyhow!(
                     "device #{i} does not exist ({} adapter(s) visible: {})",
                     adapters.len(),
                     list_names(&adapters)
                 )
-            })?,
+            })?],
             sel => {
                 let mut hits: Vec<&wgpu::Adapter> = adapters
                     .iter()
@@ -295,35 +303,59 @@ impl Gpu {
                 }
                 hits.sort_by_key(|a| rank(&a.get_info()));
                 match sel {
-                    DeviceSelector::Runtime { index, .. } => hits.get(*index).copied().ok_or_else(
-                        || {
+                    DeviceSelector::Runtime { index, .. } => {
+                        vec![hits.get(*index).copied().ok_or_else(|| {
                             anyhow::anyhow!(
                                 "that runtime has {} device(s), index {index} is out of range",
                                 hits.len()
                             )
-                        },
-                    )?,
-                    _ => hits[0],
+                        })?]
+                    }
+                    DeviceSelector::Auto => hits,
+                    _ => vec![hits[0]],
                 }
             }
         };
 
-        let info = adapter.get_info();
-        let features = adapter.features();
-        let limits = adapter.limits();
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("ctc-forced-aligner-wgpu"),
-                required_features: features
-                    & (wgpu::Features::TIMESTAMP_QUERY
-                        | wgpu::Features::PIPELINE_CACHE
-                        | wgpu::Features::SUBGROUP),
-                required_limits: limits.clone(),
-                ..Default::default()
-            })
-            .await
-            .context("request_device")?;
+        let mut opened = None;
+        let mut skipped: Option<anyhow::Error> = None;
+        for adapter in &candidates {
+            let info = adapter.get_info();
+            let features = adapter.features();
+            let limits = adapter.limits();
+            match adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("ctc-forced-aligner-wgpu"),
+                    required_features: features
+                        & (wgpu::Features::TIMESTAMP_QUERY
+                            | wgpu::Features::PIPELINE_CACHE
+                            | wgpu::Features::SUBGROUP),
+                    required_limits: limits.clone(),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok((device, queue)) => {
+                    opened = Some((info, features, limits, device, queue));
+                    break;
+                }
+                Err(e) => {
+                    if candidates.len() > 1 {
+                        eprintln!(
+                            "ctc-aligner: skip {} ({:?}, {:?}): {e:#}",
+                            info.name, info.backend, info.device_type
+                        );
+                    }
+                    skipped = Some(e.into());
+                }
+            }
+        }
+        let Some((info, features, _limits, device, queue)) = opened else {
+            if matches!(selector, DeviceSelector::Auto) {
+                return Err(NoGpuError.into());
+            }
+            return Err(skipped.context("request_device")?);
+        };
 
         device.on_uncaptured_error(std::sync::Arc::new(|e| {
             eprintln!("[wgpu uncaptured error] {e:?}");
@@ -602,7 +634,15 @@ impl<'a> BulkUpload<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, DeviceSelector};
+    use super::{device_class, Backend, DeviceSelector};
+
+    #[test]
+    fn auto_orders_discrete_before_integrated() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, VirtualGpu};
+        assert!(device_class(DiscreteGpu) < device_class(IntegratedGpu));
+        assert!(device_class(IntegratedGpu) < device_class(VirtualGpu));
+        assert!(device_class(VirtualGpu) < device_class(Cpu));
+    }
 
     #[test]
     fn one_device_only() {
