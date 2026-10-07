@@ -630,6 +630,13 @@ impl GpuModel {
     /// returns without waiting, so the next window's encoder can be recorded
     /// while this one is still on the device. Returns the chunk's frame count,
     /// context rows included.
+    ///
+    /// A window longer than the DP's per-submit cap (a 60 s window is 3000
+    /// frames against a 2048-frame cap) splits into consecutive submits. The
+    /// DP is a chain of per-frame dispatches, so the split continues it
+    /// exactly: frames accumulate, each submit reads its own row range of the
+    /// same encoded window, and each carries its own slice of the hidden and
+    /// choice readbacks.
     pub(crate) fn gpu_dp_window(
         &self,
         input: &[f32],
@@ -653,14 +660,27 @@ impl GpuModel {
                 row0 + n_kept <= t,
                 "window kept rows {row0}+{n_kept} outside chunk of {t}"
             );
-            dp.submit_window(
-                &self.gpu,
-                &logits,
-                &out_x,
-                self.cfg.vocab_size,
-                row0,
-                n_kept,
-            )?;
+            let mut off = 0usize;
+            loop {
+                let m = (n_kept - off).min(dp.chunk_limit());
+                if off > 0 {
+                    // The split consumes readback slots faster than one per
+                    // window; wait out the slot this submit reuses.
+                    dp.prepare_slot(&self.gpu)?;
+                }
+                dp.submit_window(
+                    &self.gpu,
+                    &logits,
+                    &out_x,
+                    self.cfg.vocab_size,
+                    row0 + off,
+                    m,
+                )?;
+                off += m;
+                if off == n_kept {
+                    break;
+                }
+            }
         }
         Ok(t)
     }
