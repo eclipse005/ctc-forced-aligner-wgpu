@@ -82,6 +82,13 @@ pub mod shaders;
 pub mod simd;
 pub mod spans;
 pub mod timeline;
+// The Vulkan transfer-queue fast path only exists where Vulkan can: wgpu-hal
+// does not build a Vulkan backend on macOS, so `wgpu::hal::api::Vulkan` is
+// not even a type there. macOS and friends get a stub with the same API.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod xfer;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[path = "xfer_stub.rs"]
 mod xfer;
 pub mod viterbi;
 mod viterbi_gpu;

@@ -21,6 +21,7 @@ pub(crate) struct Gpu {
 
 /// Outlives the device-create callback. The callback's queue priority slice
 /// has to stay valid until `vkCreateDevice` returns.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 static XFER_Q_PRIO: f32 = 1.0;
 
 /// One device: `auto`, `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring.
@@ -344,6 +345,10 @@ impl Gpu {
             // encoder occupies the compute queue. Failure here is not fatal:
             // the same adapter opens again without the extra queue.
             let mut xfer_family = None;
+            // On Vulkan-capable platforms try for a dedicated transfer queue;
+            // elsewhere (macOS) no adapter can report `Backend::Vulkan`, so
+            // this branch is dead code and must not be compiled at all.
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             let requested = if info.backend == wgpu::Backend::Vulkan {
                 match open_vulkan_transfer(adapter, &desc) {
                     Ok((device, queue, family)) => {
@@ -361,6 +366,8 @@ impl Gpu {
             } else {
                 adapter.request_device(&desc).await
             };
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            let requested = adapter.request_device(&desc).await;
             match requested {
                 Ok((device, queue)) => {
                     opened = Some((info, features, limits, device, queue, xfer_family));
@@ -591,6 +598,7 @@ impl Gpu {
 
 /// A copy-only queue family. Family 0 is the graphics queue wgpu always
 /// opens. A compute family also sets TRANSFER and is not the DMA engine.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn transfer_family(hal: &wgpu::hal::vulkan::Adapter) -> Result<u32> {
     let props = unsafe {
         hal.shared_instance()
@@ -617,6 +625,7 @@ fn transfer_family(hal: &wgpu::hal::vulkan::Adapter) -> Result<u32> {
 /// Open `adapter` with wgpu's graphics queue plus one transfer queue.
 /// The caller falls back to [`wgpu::Adapter::request_device`] on `Err`,
 /// so this must not leave a device behind when it fails.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn open_vulkan_transfer(
     adapter: &wgpu::Adapter,
     desc: &wgpu::DeviceDescriptor<'_>,
