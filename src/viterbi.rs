@@ -137,6 +137,7 @@ fn row_bytes(states: usize) -> usize {
 
 /// Move each of the low four bits to bit `2·i`, so a movemask's four lanes
 /// land in four 2-bit fields of one byte.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn spread2(x: u8) -> u8 {
     let x = x & 0x0f;
@@ -284,6 +285,7 @@ fn dp_range(
     next: &mut [f64],
     back: Option<&mut [u8]>,
     st0: usize,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
     use_avx2: bool,
 ) {
     #[cfg(target_arch = "x86_64")]

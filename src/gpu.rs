@@ -344,6 +344,7 @@ impl Gpu {
             // A copy-only queue lets the logits download run while the next
             // encoder occupies the compute queue. Failure here is not fatal:
             // the same adapter opens again without the extra queue.
+            #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(unused_mut))]
             let mut xfer_family = None;
             // On Vulkan-capable platforms try for a dedicated transfer queue;
             // elsewhere (macOS) no adapter can report `Backend::Vulkan`, so
