@@ -14,7 +14,14 @@ pub(crate) struct Gpu {
     pub(crate) info: wgpu::AdapterInfo,
     pub features: wgpu::Features,
     pub pipeline_cache: Option<wgpu::PipelineCache>,
+    /// Dedicated Vulkan transfer family, alongside the compute queue on family 0.
+    /// `None` when the device has no copy-only queue or the open fell back.
+    pub xfer_family: Option<u32>,
 }
+
+/// Outlives the device-create callback. The callback's queue priority slice
+/// has to stay valid until `vkCreateDevice` returns.
+static XFER_Q_PRIO: f32 = 1.0;
 
 /// One device: `auto`, `cpu`, `vulkan[:i]`, `dx12[:i]`, `#n`, or a name substring.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -323,20 +330,40 @@ impl Gpu {
             let info = adapter.get_info();
             let features = adapter.features();
             let limits = adapter.limits();
-            match adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("ctc-forced-aligner-wgpu"),
-                    required_features: features
-                        & (wgpu::Features::TIMESTAMP_QUERY
-                            | wgpu::Features::PIPELINE_CACHE
-                            | wgpu::Features::SUBGROUP),
-                    required_limits: limits.clone(),
-                    ..Default::default()
-                })
-                .await
-            {
+            let desc = wgpu::DeviceDescriptor {
+                label: Some("ctc-forced-aligner-wgpu"),
+                required_features: features
+                    & (wgpu::Features::TIMESTAMP_QUERY
+                        | wgpu::Features::PIPELINE_CACHE
+                        | wgpu::Features::SUBGROUP
+                        | wgpu::Features::SHADER_F64),
+                required_limits: limits.clone(),
+                ..Default::default()
+            };
+            // A copy-only queue lets the logits download run while the next
+            // encoder occupies the compute queue. Failure here is not fatal:
+            // the same adapter opens again without the extra queue.
+            let mut xfer_family = None;
+            let requested = if info.backend == wgpu::Backend::Vulkan {
+                match open_vulkan_transfer(adapter, &desc) {
+                    Ok((device, queue, family)) => {
+                        xfer_family = family;
+                        Ok((device, queue))
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "ctc-aligner: no transfer queue on {} ({e:#})",
+                            info.name
+                        );
+                        adapter.request_device(&desc).await
+                    }
+                }
+            } else {
+                adapter.request_device(&desc).await
+            };
+            match requested {
                 Ok((device, queue)) => {
-                    opened = Some((info, features, limits, device, queue));
+                    opened = Some((info, features, limits, device, queue, xfer_family));
                     break;
                 }
                 Err(e) => {
@@ -350,7 +377,7 @@ impl Gpu {
                 }
             }
         }
-        let Some((info, features, _limits, device, queue)) = opened else {
+        let Some((info, features, _limits, device, queue, xfer_family)) = opened else {
             if matches!(selector, DeviceSelector::Auto) {
                 return Err(NoGpuError.into());
             }
@@ -383,6 +410,7 @@ impl Gpu {
             info,
             features,
             pipeline_cache,
+            xfer_family,
         })
     }
 
@@ -559,6 +587,71 @@ impl Gpu {
         }
         Ok(pipe)
     }
+}
+
+/// A copy-only queue family. Family 0 is the graphics queue wgpu always
+/// opens. A compute family also sets TRANSFER and is not the DMA engine.
+fn transfer_family(hal: &wgpu::hal::vulkan::Adapter) -> Result<u32> {
+    let props = unsafe {
+        hal.shared_instance()
+            .raw_instance()
+            .get_physical_device_queue_family_properties(hal.raw_physical_device())
+    };
+    if let Some((index, _)) = props.iter().enumerate().find(|(i, fam)| {
+        *i != 0
+            && fam.queue_count > 0
+            && fam.queue_flags.contains(ash::vk::QueueFlags::TRANSFER)
+            && !fam.queue_flags.contains(ash::vk::QueueFlags::GRAPHICS)
+            && !fam.queue_flags.contains(ash::vk::QueueFlags::COMPUTE)
+    }) {
+        return Ok(index as u32);
+    }
+    let listed: Vec<String> = props
+        .iter()
+        .enumerate()
+        .map(|(i, fam)| format!("{i}: {:?} x{}", fam.queue_flags, fam.queue_count))
+        .collect();
+    anyhow::bail!("no dedicated transfer queue ({})", listed.join(", "))
+}
+
+/// Open `adapter` with wgpu's graphics queue plus one transfer queue.
+/// The caller falls back to [`wgpu::Adapter::request_device`] on `Err`,
+/// so this must not leave a device behind when it fails.
+fn open_vulkan_transfer(
+    adapter: &wgpu::Adapter,
+    desc: &wgpu::DeviceDescriptor<'_>,
+) -> Result<(wgpu::Device, wgpu::Queue, Option<u32>)> {
+    let family = {
+        let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+            .context("vulkan hal adapter")?;
+        transfer_family(&hal)?
+    };
+    // The hal guard borrows `adapter`. Drop it before `create_device_from_hal`.
+    let hal_open = {
+        let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+            .context("vulkan hal adapter")?;
+        unsafe {
+            hal.open_with_callback(
+                desc.required_features,
+                &desc.required_limits,
+                &desc.memory_hints,
+                Some(Box::new(move |args| {
+                    args.queue_create_infos.push(
+                        ash::vk::DeviceQueueCreateInfo::default()
+                            .queue_family_index(family)
+                            .queue_priorities(std::slice::from_ref(&XFER_Q_PRIO)),
+                    );
+                })),
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("vulkan device with transfer queue: {e:?}"))?
+    };
+    let (device, queue) = unsafe {
+        adapter.create_device_from_hal::<wgpu::hal::api::Vulkan>(hal_open, desc)
+    }
+    .map_err(|e| anyhow::anyhow!("wrap vulkan device: {e:?}"))?;
+    eprintln!("ctc-aligner: transfer queue family {family}");
+    Ok((device, queue, Some(family)))
 }
 
 fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {

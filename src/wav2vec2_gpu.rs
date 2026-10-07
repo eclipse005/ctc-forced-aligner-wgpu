@@ -192,6 +192,14 @@ pub(crate) struct GpuModel {
     /// covers the same output with a different grid.
     gemm_mt: u32,
     gemm_nt: u32,
+    /// Staging recycled across windows. Two sets: the one being copied and
+    /// the one being collected. A window above 16 MB uses the transfer queue
+    /// when the device has one. The hidden readback (~7 MB) stays on wgpu's
+    /// cached MAP_READ buffers.
+    readback: std::sync::Mutex<Vec<StagingSet>>,
+    /// Transfer-queue pool. After `readback` so the staging sets drop first:
+    /// they wait out their fence, then this destroys the command pool.
+    xfer: std::sync::OnceLock<Option<crate::xfer::Engine>>,
     conv0_w: wgpu::Buffer,
     conv_wt: Vec<wgpu::Buffer>,
     conv_b: Vec<wgpu::Buffer>,
@@ -227,6 +235,23 @@ pub(crate) struct GpuModel {
     star_flags: wgpu::Buffer,
     /// Activation workspace reused across chunks of the same length.
     scratch: std::sync::Mutex<Option<Scratch>>,
+}
+
+struct ReplayChunk {
+    index: wgpu::SubmissionIndex,
+    frame: usize,
+    rows: usize,
+    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    slot: usize,
+    seg_i: usize,
+}
+
+struct LiveSeg {
+    lo: usize,
+    hi: usize,
+    rows: Vec<u8>,
+    got: usize,
+    need: usize,
 }
 
 impl GpuModel {
@@ -475,6 +500,8 @@ impl GpuModel {
             pipes,
             gemm_mt,
             gemm_nt,
+            readback: std::sync::Mutex::new(Vec::new()),
+            xfer: std::sync::OnceLock::new(),
             conv0_w,
             conv_wt: conv_wt_b,
             conv_b,
@@ -534,7 +561,7 @@ impl GpuModel {
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
-        let p = self.forward_begin(input, None, false, None, &[], None)?;
+        let p = self.forward_begin(input, None, false, None, &[], None, true)?;
         self.collect(p)
     }
 
@@ -553,7 +580,7 @@ impl GpuModel {
         keep: Option<(usize, usize)>,
         stars: &[u32],
     ) -> Result<Vec<f32>> {
-        let p = self.forward_begin(input, Some(expanded), false, keep, stars, None)?;
+        let p = self.forward_begin(input, Some(expanded), false, keep, stars, None, true)?;
         self.collect(p)
     }
 
@@ -570,7 +597,7 @@ impl GpuModel {
         stars: &[u32],
         prev: Option<&mut GpuPending>,
     ) -> Result<GpuPending> {
-        self.forward_begin(input, Some(expanded), false, keep, stars, prev)
+        self.forward_begin(input, Some(expanded), false, keep, stars, prev, true)
     }
 
     /// Pipelined [`forward_hidden`] — see [`GpuModel::forward_gathered_begin`].
@@ -579,7 +606,7 @@ impl GpuModel {
         input: &[f32],
         prev: Option<&mut GpuPending>,
     ) -> Result<GpuPending> {
-        self.forward_begin(input, None, true, None, &[], prev)
+        self.forward_begin(input, None, true, None, &[], prev, true)
     }
 
     /// Pipelined full-logits [`forward`] — see
@@ -589,7 +616,489 @@ impl GpuModel {
         input: &[f32],
         prev: Option<&mut GpuPending>,
     ) -> Result<GpuPending> {
-        self.forward_begin(input, None, false, None, &[], prev)
+        self.forward_begin(input, None, false, None, &[], prev, true)
+    }
+
+    pub(crate) fn supports_f64(&self) -> bool {
+        self.gpu.features.contains(wgpu::Features::SHADER_F64)
+    }
+
+    /// Compile the f64 Viterbi pipelines and allocate the per-file buffers.
+    /// Fails if the shader does not validate; the caller keeps the CPU DP only
+    /// when the device never advertised [`wgpu::Features::SHADER_F64`].
+    pub(crate) fn new_dp(
+        &self,
+        token_ids: &[usize],
+        star_id: usize,
+        blank_id: usize,
+        n_frames: usize,
+    ) -> Result<crate::viterbi_gpu::GpuDp> {
+        crate::viterbi_gpu::GpuDp::new(
+            &self.gpu,
+            token_ids,
+            star_id,
+            blank_id,
+            n_frames,
+            self.cfg.hidden_size,
+        )
+    }
+
+    /// Encode one window and queue its DP behind that encode. The DP submit
+    /// returns without waiting, so the next window's encoder can be recorded
+    /// while this one is still on the device. Returns the chunk's frame count,
+    /// context rows included.
+    pub(crate) fn gpu_dp_window(
+        &self,
+        input: &[f32],
+        dp: &mut crate::viterbi_gpu::GpuDp,
+        row0: usize,
+        n_kept: usize,
+    ) -> Result<usize> {
+        if n_kept > 0 {
+            dp.prepare_slot(&self.gpu)?;
+        }
+        let (logits, out_x, t) = {
+            let _pending = self.forward_begin(input, None, false, None, &[], None, false)?;
+            let guard = self.scratch.lock().unwrap();
+            let s = guard
+                .as_ref()
+                .context("scratch dropped before gpu viterbi")?;
+            (s.logits.clone(), s.out_x.clone(), s.t)
+        };
+        if n_kept > 0 {
+            anyhow::ensure!(
+                row0 + n_kept <= t,
+                "window kept rows {row0}+{n_kept} outside chunk of {t}"
+            );
+            dp.submit_window(
+                &self.gpu,
+                &logits,
+                &out_x,
+                self.cfg.vocab_size,
+                row0,
+                n_kept,
+            )?;
+        }
+        Ok(t)
+    }
+
+    /// Map the windows still in flight. Called once, after the last encoder.
+    pub(crate) fn gpu_dp_finish(&self, dp: &mut crate::viterbi_gpu::GpuDp) -> Result<()> {
+        dp.finish(&self.gpu)
+    }
+
+    pub(crate) fn gpu_dp_alpha(&self, dp: &crate::viterbi_gpu::GpuDp) -> Result<Vec<f64>> {
+        dp.read_alpha(&self.gpu)
+    }
+
+    /// Rebuild choices from the alpha checkpoints, walking the file backwards.
+    ///
+    /// Segments share the alpha buffers, so they run in order, but the next
+    /// segment is submitted before the previous one is mapped. The device
+    /// therefore does not go idle at each segment boundary.
+    pub(crate) fn gpu_dp_traceback(
+        &self,
+        dp: &mut crate::viterbi_gpu::GpuDp,
+        alpha_last: &[f64],
+    ) -> Result<(Vec<i32>, f64)> {
+        let t_len = dp.frames();
+        anyhow::ensure!(alpha_last.len() == dp.state_count(), "alpha width");
+        anyhow::ensure!(t_len >= 1, "empty traceback");
+        let mut s_end = alpha_last.len() - 1;
+        if alpha_last.len() >= 2 && alpha_last[s_end - 1] > alpha_last[s_end] {
+            s_end -= 1;
+        }
+        let total = alpha_last[s_end];
+        let mut states = vec![0i32; t_len];
+        states[t_len - 1] = s_end as i32;
+        let mut cur = s_end;
+        let (logits, rows_cap) = {
+            let guard = self.scratch.lock().unwrap();
+            let s = guard
+                .as_ref()
+                .context("scratch dropped before viterbi traceback")?;
+            (s.logits.clone(), s.t)
+        };
+        anyhow::ensure!(rows_cap >= 1, "empty traceback chunk");
+        let seg = dp.seg();
+        let rb = dp.row_bytes();
+        let chunk = rows_cap.min(dp.chunk_limit());
+        let mut b = ((t_len - 1) / seg) * seg;
+        let segments = b / seg + 1;
+        let mut segs: Vec<LiveSeg> = Vec::new();
+        let mut inflight = std::collections::VecDeque::<ReplayChunk>::new();
+        let mut nsub = 0usize;
+        let mut queued = 0usize;
+        loop {
+            let k = b / seg;
+            let lo = b + 1;
+            let hi = (b + seg).min(t_len - 1);
+            if lo <= hi {
+                let start_alpha = dp.checkpoint(k)?.to_vec();
+                dp.load_alpha(&self.gpu, &start_alpha)?;
+                let seg_i = segs.len();
+                let need = hi - lo + 1;
+                // Allocate on the first collect, after the previous segment's
+                // rows have been dropped. The pipe only overlaps submits.
+                segs.push(LiveSeg {
+                    lo,
+                    hi,
+                    rows: Vec::new(),
+                    got: 0,
+                    need,
+                });
+                let mut frame = lo;
+                while frame <= hi {
+                    if inflight.len() == crate::viterbi_gpu::PIPE_DEPTH {
+                        let prev = inflight.pop_front().unwrap();
+                        self.finish_replay_chunk(dp, prev, &mut segs, rb, &mut cur, &mut states)?;
+                    }
+                    let m = (hi - frame + 1).min(chunk);
+                    let slot = nsub % crate::viterbi_gpu::PIPE_DEPTH;
+                    inflight.push_back(self.submit_replay_chunk(
+                        dp, &logits, frame, m, slot, seg_i,
+                    )?);
+                    frame += m;
+                    nsub += 1;
+                }
+            }
+            queued += 1;
+            if queued == 1 || queued == segments || queued % (segments / 10).max(1) == 0 {
+                eprintln!("[align] traceback queued {queued}/{segments}");
+            }
+            if b == 0 {
+                break;
+            }
+            b -= seg;
+        }
+        while let Some(prev) = inflight.pop_front() {
+            self.finish_replay_chunk(dp, prev, &mut segs, rb, &mut cur, &mut states)?;
+        }
+        Ok((states, total))
+    }
+
+    fn finish_replay_chunk(
+        &self,
+        dp: &crate::viterbi_gpu::GpuDp,
+        chunk: ReplayChunk,
+        segs: &mut [LiveSeg],
+        rb: usize,
+        cur: &mut usize,
+        states: &mut [i32],
+    ) -> Result<()> {
+        let seg_i = chunk.seg_i;
+        if segs[seg_i].rows.is_empty() {
+            segs[seg_i].rows = vec![0u8; segs[seg_i].need * rb];
+        }
+        let off = (chunk.frame - segs[seg_i].lo) * rb;
+        let take = chunk.rows * rb;
+        dp.read_mapped_back(
+            &self.gpu,
+            chunk.slot,
+            chunk.index,
+            &chunk.rx,
+            chunk.rows,
+            &mut segs[seg_i].rows[off..off + take],
+        )?;
+        segs[seg_i].got += chunk.rows;
+        if segs[seg_i].got == segs[seg_i].need {
+            let lo = segs[seg_i].lo;
+            let hi = segs[seg_i].hi;
+            crate::viterbi::rewind_segment(&segs[seg_i].rows, rb, lo, hi, cur, states);
+            segs[seg_i].rows = Vec::new();
+        }
+        Ok(())
+    }
+
+    fn submit_replay_chunk(
+        &self,
+        dp: &mut crate::viterbi_gpu::GpuDp,
+        logits: &wgpu::Buffer,
+        frame: usize,
+        m: usize,
+        slot: usize,
+        seg_i: usize,
+    ) -> Result<ReplayChunk> {
+        let hidden = self.cfg.hidden_size;
+        let vocab = u32::try_from(self.cfg.vocab_size).context("vocab")?;
+        let hidden_u = u32::try_from(hidden).context("hidden")?;
+        self.gpu
+            .upload(dp.stage(), bytemuck::cast_slice(dp.hidden_rows(frame, m)?));
+        let dims = GemmDims {
+            m: m as u32,
+            n: vocab,
+            k: hidden_u,
+            a_stride: hidden_u,
+            b_stride: vocab,
+            c_stride: vocab,
+            a_off: 0,
+            b_off: 0,
+            c_off: 0,
+            a_z: 0,
+            b_z: 0,
+            c_z: 0,
+            epilogue: 0,
+            scale: 1.0,
+            a_vec: vec4_ok(0, hidden_u, 0),
+            b_vec: vec4_ok(0, vocab, 0),
+            _p0: 0,
+        };
+        let ls = Cfg4 {
+            a: m as u32,
+            b: vocab,
+            c: 0,
+            d: 0,
+        };
+        let gemm_bytes = bytemuck::bytes_of(&dims);
+        let ls_bytes = bytemuck::bytes_of(&ls);
+        let mut raw = vec![0u8; 512];
+        raw[..gemm_bytes.len()].copy_from_slice(gemm_bytes);
+        raw[256..256 + ls_bytes.len()].copy_from_slice(ls_bytes);
+        let uni = self.gpu.uniform("dp-replay-uni", 512);
+        self.gpu.queue.write_buffer(&uni, 0, &raw);
+        let gemm_layout = self.pipes.gemm.get_bind_group_layout(0);
+        let ls_layout = self.pipes.log_softmax.get_bind_group_layout(0);
+        let stage = dp.stage().clone();
+        let gemm_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dp-replay-gemm"),
+            layout: &gemm_layout,
+            entries: &[
+                score_buf(0, &stage),
+                score_buf(1, &self.lm_wt),
+                score_buf(2, &self.lm_b),
+                score_buf(3, logits),
+                score_uni(4, &uni, 0, gemm_bytes.len() as u64),
+                score_buf(5, &self.zeros),
+                score_buf(6, &stage),
+                score_buf(7, &self.lm_wt),
+            ],
+        });
+        let ls_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dp-replay-logsoftmax"),
+            layout: &ls_layout,
+            entries: &[
+                score_buf(0, logits),
+                score_uni(1, &uni, 256, ls_bytes.len() as u64),
+            ],
+        });
+        let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dp-replay"),
+        });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dp-replay-gemm"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipes.gemm);
+            pass.set_bind_group(0, &gemm_bg, &[]);
+            pass.dispatch_workgroups(
+                (m as u32).div_ceil(self.gemm_mt),
+                vocab.div_ceil(self.gemm_nt),
+                1,
+            );
+        }
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dp-replay-logsoftmax"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipes.log_softmax);
+            pass.set_bind_group(0, &ls_bg, &[]);
+            let (gx, gy) = row_grid(m as u32);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+        let steps = dp.record_steps(&self.gpu, &mut enc, logits, self.cfg.vocab_size, m)?;
+        let src = dp.device_back().clone();
+        let dst = dp.map_back(slot).clone();
+        let bytes = m as u64 * dp.back_stride();
+        enc.copy_buffer_to_buffer(&src, 0, &dst, 0, bytes);
+        let index = self.gpu.queue.submit([enc.finish()]);
+        drop((gemm_bg, ls_bg, uni, steps, src, dst));
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|e| anyhow::anyhow!("poll for viterbi traceback: {e}"))?;
+        if let Some(e) = pollster::block_on(guard.pop()) {
+            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            anyhow::bail!("gpu viterbi traceback: {e}");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        dp.map_back(slot)
+            .slice(..crate::viterbi_gpu::map_end(bytes as usize))
+            .map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+        Ok(ReplayChunk {
+            index,
+            frame,
+            rows: m,
+            rx,
+            slot,
+            seg_i,
+        })
+    }
+
+    /// Replay the lm head over the archived encoder rows and gather the f32
+    /// the DP added on the traced state. One chunk of the scratch logits at a time.
+    pub(crate) fn gpu_dp_scores(
+        &self,
+        dp: &crate::viterbi_gpu::GpuDp,
+        states: &[i32],
+    ) -> Result<Vec<f64>> {
+        let t_len = states.len();
+        if t_len == 0 {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(t_len == dp.frames(), "score frame count");
+        let (logits, rows_cap) = {
+            let guard = self.scratch.lock().unwrap();
+            let s = guard
+                .as_ref()
+                .context("scratch dropped before score replay")?;
+            (s.logits.clone(), s.t)
+        };
+        anyhow::ensure!(rows_cap >= 1, "empty score chunk");
+        let mut packed = Vec::with_capacity(t_len);
+        for &st in states {
+            anyhow::ensure!(st >= 0, "negative trellis state");
+            packed.push(st as u32);
+        }
+        self.gpu
+            .upload(dp.states_buf(), bytemuck::cast_slice(&packed));
+
+        let hidden = self.cfg.hidden_size;
+        let vocab = u32::try_from(self.cfg.vocab_size).context("vocab")?;
+        let hidden_u = u32::try_from(hidden).context("hidden")?;
+        let gemm_layout = self.pipes.gemm.get_bind_group_layout(0);
+        let ls_layout = self.pipes.log_softmax.get_bind_group_layout(0);
+        let uni = self.gpu.uniform("dp-score-uni", 768);
+        let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let mut row = 0usize;
+        while row < t_len {
+            let m = (t_len - row).min(rows_cap).min(dp.chunk_limit());
+            self.gpu.upload(
+                dp.stage(),
+                bytemuck::cast_slice(dp.hidden_rows(row, m)?),
+            );
+            let dims = GemmDims {
+                m: m as u32,
+                n: vocab,
+                k: hidden_u,
+                a_stride: hidden_u,
+                b_stride: vocab,
+                c_stride: vocab,
+                a_off: 0,
+                b_off: 0,
+                c_off: 0,
+                a_z: 0,
+                b_z: 0,
+                c_z: 0,
+                epilogue: 0,
+                scale: 1.0,
+                a_vec: vec4_ok(0, hidden_u, 0),
+                b_vec: vec4_ok(0, vocab, 0),
+                _p0: 0,
+            };
+            let ls = Cfg4 {
+                a: m as u32,
+                b: vocab,
+                c: 0,
+                d: 0,
+            };
+            let gather = dp.gather_cfg(row as u32, m as u32, vocab);
+            let gemm_bytes = bytemuck::bytes_of(&dims);
+            let ls_bytes = bytemuck::bytes_of(&ls);
+            let mut raw = vec![0u8; 768];
+            raw[..gemm_bytes.len()].copy_from_slice(gemm_bytes);
+            raw[256..256 + ls_bytes.len()].copy_from_slice(ls_bytes);
+            raw[512..512 + gather.len()].copy_from_slice(&gather);
+            self.gpu.queue.write_buffer(&uni, 0, &raw);
+
+            let gemm_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dp-score-gemm"),
+                layout: &gemm_layout,
+                entries: &[
+                    score_buf(0, dp.stage()),
+                    score_buf(1, &self.lm_wt),
+                    score_buf(2, &self.lm_b),
+                    score_buf(3, &logits),
+                    score_uni(4, &uni, 0, gemm_bytes.len() as u64),
+                    score_buf(5, &self.zeros),
+                    score_buf(6, dp.stage()),
+                    score_buf(7, &self.lm_wt),
+                ],
+            });
+            let ls_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dp-score-logsoftmax"),
+                layout: &ls_layout,
+                entries: &[
+                    score_buf(0, &logits),
+                    score_uni(1, &uni, 256, ls_bytes.len() as u64),
+                ],
+            });
+            let gather_bg = dp.gather_bind_group(&self.gpu, &logits, &uni, 512);
+            let mut enc = self
+                .gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("dp-score"),
+                });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("dp-score-gemm"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipes.gemm);
+                pass.set_bind_group(0, &gemm_bg, &[]);
+                pass.dispatch_workgroups(
+                    (m as u32).div_ceil(self.gemm_mt),
+                    vocab.div_ceil(self.gemm_nt),
+                    1,
+                );
+            }
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("dp-score-logsoftmax"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipes.log_softmax);
+                pass.set_bind_group(0, &ls_bg, &[]);
+                let (gx, gy) = row_grid(m as u32);
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("dp-score-gather"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(dp.gather_pipeline());
+                pass.set_bind_group(0, &gather_bg, &[]);
+                pass.dispatch_workgroups((m as u32).div_ceil(256).max(1), 1, 1);
+            }
+            self.gpu.queue.submit([enc.finish()]);
+            drop((gemm_bg, ls_bg, gather_bg));
+            row += m;
+        }
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|e| anyhow::anyhow!("poll for score replay: {e}"))?;
+        if let Some(e) = pollster::block_on(guard.pop()) {
+            let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            anyhow::bail!("gpu score replay: {e}");
+        }
+
+        let bytes = self.gpu.readback(dp.score_buf(), (t_len * 4) as u64)?;
+        anyhow::ensure!(bytes.len() == t_len * 4, "score readback short");
+        let mut out = Vec::with_capacity(t_len);
+        for c in bytes.chunks_exact(4) {
+            let mut b = [0u8; 4];
+            b.copy_from_slice(c);
+            out.push(f64::from(f32::from_le_bytes(b)));
+        }
+        Ok(out)
     }
 
     /// Same forward, but the lm head and log-softmax never run: the host gets
@@ -598,7 +1107,7 @@ impl GpuModel {
     /// ([`crate::wav2vec2::LmHeadCpu`]) when the DP needs trellis columns,
     /// which is what keeps a long transcript's emissions out of RAM.
     pub fn forward_hidden(&self, input: &[f32]) -> Result<Vec<f32>> {
-        let p = self.forward_begin(input, None, true, None, &[], None)?;
+        let p = self.forward_begin(input, None, true, None, &[], None, true)?;
         self.collect(p)
     }
 
@@ -623,6 +1132,7 @@ impl GpuModel {
         keep: Option<(usize, usize)>,
         stars: &[u32],
         mut prev: Option<&mut GpuPending>,
+        download: bool,
     ) -> Result<GpuPending> {
         let gpu = &self.gpu;
         // the GEMM pipelines were compiled with this tile; every grid below
@@ -1148,12 +1658,12 @@ impl GpuModel {
         // Input and every uniform slot go out before the first command buffer.
         // The three layer-groups are queued back to back; each buffer stays
         // under the Windows TDR window, and one wait keeps the GPU busy.
-        // The window pipeline's hinge: the previous chunk's result buffers are
-        // scratch-resident and THIS chunk's dispatches are what overwrite them,
-        // so its device->host copies must be enqueued here, ahead of our
-        // compute. Arming the maps now means the map callbacks fire when those
-        // copies execute -- not when this chunk's compute does -- so the
-        // caller's collect() below overlaps our 500+ ms of compute.
+        // The previous chunk's result still lives in scratch, and this chunk's
+        // dispatches overwrite it. Arm the download first. The cached path
+        // copies on this queue, so the copy finishes before the overwrite.
+        // The logits path only bounces into a side buffer here; its DMA is on
+        // the transfer queue. On this P104 the copy still finishes after the
+        // compute submitted below.
         if let Some(p) = prev.as_deref_mut() {
             p.arm(&self.gpu)?;
         }
@@ -1328,16 +1838,52 @@ impl GpuModel {
         } else {
             (act.logits.clone(), 0, t * vocab)
         };
-        Ok(GpuPending::new(&self.gpu, buffer, offset, floats))
+        if !download {
+            // The DP reads logits on device. Allocating the staging buffer
+            // here would pin a full logits copy on the host.
+            return Ok(GpuPending {
+                buffer,
+                pieces: Vec::new(),
+                staging: StagingSet::Plain(Vec::new()),
+                floats: 0,
+                armed: None,
+            });
+        }
+        Ok(GpuPending::new(
+            &self.gpu,
+            &self.readback,
+            self.xfer_engine((floats * 4) as u64),
+            buffer,
+            offset,
+            floats,
+        ))
+    }
+
+    /// The transfer queue, for a logits-sized readback. Hidden stays on
+    /// cached `MAP_READ`. `CTC_READBACK=cached` forces that path too.
+    fn xfer_engine(&self, bytes: u64) -> Option<&crate::xfer::Engine> {
+        if bytes < crate::xfer::MIN_BYTES || self.gpu.xfer_family.is_none() {
+            return None;
+        }
+        if std::env::var("CTC_READBACK").ok().as_deref() == Some("cached") {
+            return None;
+        }
+        self.xfer
+            .get_or_init(|| crate::xfer::Engine::open(&self.gpu))
+            .as_ref()
     }
 
     /// Map a pending chunk's result back to the host.
     ///
-    /// A pending whose staging copies were armed by the *next* chunk's begin
-    /// collects while the GPU still computes: the pump below waits only for
-    /// the copies' maps, which execute ahead of that compute. The last chunk
-    /// of a run arms itself here and waits for its own copy.
+    /// A pending armed by the next chunk's begin collects while that chunk's
+    /// compute is in flight. The cached path waits on map callbacks. The
+    /// transfer path waits on its own fence: `poll(Wait)` would also wait out
+    /// the compute the DMA is supposed to overlap. The last chunk arms itself
+    /// here.
     pub fn collect(&self, mut p: GpuPending) -> Result<Vec<f32>> {
+        if p.staging.is_xfer() {
+            return self.collect_xfer(p);
+        }
         let gpu = &self.gpu;
         if p.armed.is_none() {
             p.arm(gpu)?;
@@ -1345,9 +1891,12 @@ impl GpuModel {
                 .poll(wgpu::PollType::wait_indefinitely())
                 .map_err(|e| anyhow::anyhow!("poll for readback: {e}"))?;
         }
-        let rxs = p.armed.take().context("pending maps already consumed")?;
+        let Some(Armed::Maps(rxs)) = p.armed.take() else {
+            anyhow::bail!("pending maps already consumed");
+        };
         // pump until every piece's map has landed; each poll also retires
         // whatever compute is in flight
+        let t_wait = std::time::Instant::now();
         let mut got: Vec<Option<()>> = vec![None; rxs.len()];
         loop {
             let mut done = true;
@@ -1375,30 +1924,219 @@ impl GpuModel {
                 .map_err(|e| anyhow::anyhow!("poll for maps: {e}"))?;
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
+        let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+        let t_host = std::time::Instant::now();
+        let staging = std::mem::take(&mut p.staging);
+        let StagingSet::Plain(bufs) = &staging else {
+            anyhow::bail!("cached readback missing its buffers");
+        };
         let mut out: Vec<f32> = Vec::with_capacity(p.floats);
-        for (piece, &(_, take)) in p.staging.iter().zip(&p.pieces) {
-            let slice = piece.slice(..);
+        for (buf, &(_, take)) in bufs.iter().zip(&p.pieces) {
+            let slice = buf.slice(..);
             let mapped = slice.get_mapped_range()?;
             out.extend_from_slice(bytemuck::cast_slice(&mapped[..take as usize]));
             drop(mapped);
-            piece.unmap();
+            buf.unmap();
         }
+        let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
+        log_readback(wait_ms, host_ms, out.len(), "cached");
+        self.recycle_readback(staging);
         Ok(out)
+    }
+
+    fn collect_xfer(&self, mut p: GpuPending) -> Result<Vec<f32>> {
+        if !matches!(p.armed, Some(Armed::Xfer)) {
+            p.arm(&self.gpu)?;
+        }
+        let StagingSet::Xfer(set) = &p.staging else {
+            anyhow::bail!("transfer readback missing its buffers");
+        };
+        let wait_ms = set.wait()?;
+        let t_host = std::time::Instant::now();
+        let mut out = Vec::with_capacity(p.floats);
+        set.copy_out(&p.pieces, &mut out);
+        let host_ms = t_host.elapsed().as_secs_f64() * 1000.0;
+        log_readback(wait_ms, host_ms, out.len(), "xfer");
+        // Reclaim the bounce submit. `Poll` does not wait for the encoder
+        // that is still overlapping this DMA.
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|e| anyhow::anyhow!("poll after transfer: {e}"))?;
+        let staging = std::mem::take(&mut p.staging);
+        self.recycle_readback(staging);
+        Ok(out)
+    }
+
+    fn recycle_readback(&self, staging: StagingSet) {
+        let keep = match &staging {
+            StagingSet::Plain(pieces) => !pieces.is_empty(),
+            StagingSet::Xfer(_) => true,
+        };
+        if !keep {
+            return;
+        }
+        let mut pool = self.readback.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < 2 {
+            pool.push(staging);
+        }
     }
 }
 
 const UNIFORM_ALIGN: u64 = 256;
 
-const READBACK_CHUNK: u64 = 16 << 20;
+fn score_buf(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    }
+}
+
+fn score_uni(
+    binding: u32,
+    buffer: &wgpu::Buffer,
+    offset: u64,
+    size: u64,
+) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset,
+            size: Some(std::num::NonZeroU64::new(size).unwrap()),
+        }),
+    }
+}
+
+/// Plain `MAP_READ` stays in 16 MiB pieces. One large map fails after a long
+/// dispatch sequence on some drivers. Transfer-queue bounces are not this map,
+/// so those copies can be one piece per window.
+const PLAIN_READBACK_CHUNK: u64 = 16 << 20;
+const XFER_READBACK_CHUNK: u64 = 128 << 20;
+
+fn log_readback(wait_ms: f64, host_ms: f64, floats: usize, kind: &str) {
+    if matches!(
+        std::env::var("CTC_PROFILE").ok().as_deref(),
+        Some("1") | Some("2")
+    ) {
+        let mb = (floats * 4) as f64 / (1024.0 * 1024.0);
+        eprintln!("[readback] wait {wait_ms:.1} ms  host {host_ms:.1} ms  {mb:.1} MB {kind}");
+    }
+}
+
+enum StagingSet {
+    Plain(Vec<wgpu::Buffer>),
+    Xfer(crate::xfer::XferSet),
+}
+
+impl Default for StagingSet {
+    fn default() -> Self {
+        Self::Plain(Vec::new())
+    }
+}
+
+impl StagingSet {
+    fn is_xfer(&self) -> bool {
+        matches!(self, Self::Xfer(_))
+    }
+
+    fn fits(&self, pieces: &[(u64, u64)], xfer: bool) -> bool {
+        match self {
+            Self::Plain(bufs) if !xfer => {
+                bufs.len() == pieces.len()
+                    && bufs
+                        .iter()
+                        .zip(pieces)
+                        .all(|(buf, &(_, take))| buf.size() >= take)
+            }
+            Self::Xfer(set) if xfer => set.fits(pieces),
+            _ => false,
+        }
+    }
+}
+
+/// A recycled staging set whose pieces are each at least as big as `pieces`.
+/// The first two windows allocate; every later window of the same shape
+/// reuses one of those two.
+fn split_pieces(offset: u64, bytes: u64, chunk: u64) -> Vec<(u64, u64)> {
+    let mut pieces = Vec::new();
+    let mut off = offset;
+    let end = offset + bytes;
+    while off < end {
+        let take = chunk.min(end - off);
+        pieces.push((off, take));
+        off += take;
+    }
+    pieces
+}
+
+/// A transfer-queue set for these pieces, from the pool or a fresh alloc.
+/// `None` means the caller should use 16 MiB `MAP_READ` pieces instead.
+fn take_xfer(
+    gpu: &Gpu,
+    engine: &crate::xfer::Engine,
+    pool: &std::sync::Mutex<Vec<StagingSet>>,
+    pieces: &[(u64, u64)],
+) -> Option<StagingSet> {
+    {
+        let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = pool.iter().position(|set| set.fits(pieces, true)) {
+            return Some(pool.swap_remove(i));
+        }
+    }
+    let takes: Vec<u64> = pieces.iter().map(|&(_, take)| take).collect();
+    engine.alloc_set(&gpu.device, &takes).map(StagingSet::Xfer)
+}
+
+fn take_readback(
+    gpu: &Gpu,
+    engine: Option<&crate::xfer::Engine>,
+    pool: &std::sync::Mutex<Vec<StagingSet>>,
+    pieces: &[(u64, u64)],
+) -> StagingSet {
+    let xfer = engine.is_some();
+    {
+        let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = pool.iter().position(|set| set.fits(pieces, xfer)) {
+            return pool.swap_remove(i);
+        }
+    }
+    if let Some(engine) = engine {
+        let takes: Vec<u64> = pieces.iter().map(|&(_, take)| take).collect();
+        if let Some(set) = engine.alloc_set(&gpu.device, &takes) {
+            return StagingSet::Xfer(set);
+        }
+    }
+    StagingSet::Plain(
+        pieces
+            .iter()
+            .map(|&(_, take)| plain_staging(gpu, take))
+            .collect(),
+    )
+}
+
+fn plain_staging(gpu: &Gpu, take: u64) -> wgpu::Buffer {
+    let size = (take + 3) & !3;
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+enum Armed {
+    Maps(Vec<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>),
+    Xfer,
+}
 
 /// One submitted chunk whose result is still on the device.
 ///
-/// The staging pieces are allocated at submit time. The NEXT chunk's begin
-/// enqueues the device->host copies into them — ahead of its own compute,
-/// which is what overwrites the result buffers — and arms the maps, so
-/// `collect` pumps until the copies land while the GPU keeps computing. A
-/// pending that no begin follows (the last chunk of a run) arms itself in
-/// `collect` and waits for its own copy.
+/// Staging is allocated at submit time. The next chunk's begin arms the
+/// download before its own compute overwrites the result. On the cached path
+/// that is a queue copy plus a map. On the logits path it is a device-local
+/// bounce; the DMA runs on the transfer queue. On this P104 it does not
+/// overlap that compute. The last chunk arms itself in `collect`.
 pub(crate) struct GpuPending {
     /// the device buffer holding this chunk's result: the gather-out buffer
     /// (gathered form), the recorded final LN's output (hidden form), or the
@@ -1406,30 +2144,37 @@ pub(crate) struct GpuPending {
     buffer: wgpu::Buffer,
     /// source byte offset and byte length of each staging piece
     pieces: Vec<(u64, u64)>,
-    staging: Vec<wgpu::Buffer>,
+    staging: StagingSet,
     floats: usize,
-    /// map receivers, once armed
-    armed: Option<Vec<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>>,
+    armed: Option<Armed>,
 }
 
 impl GpuPending {
-    fn new(gpu: &Gpu, buffer: wgpu::Buffer, offset: u64, floats: usize) -> Self {
+    fn new(
+        gpu: &Gpu,
+        pool: &std::sync::Mutex<Vec<StagingSet>>,
+        engine: Option<&crate::xfer::Engine>,
+        buffer: wgpu::Buffer,
+        offset: u64,
+        floats: usize,
+    ) -> Self {
         let bytes = (floats * 4) as u64;
-        let mut pieces = Vec::new();
-        let mut staging = Vec::new();
-        let mut off = offset;
-        while off < offset + bytes {
-            let take = READBACK_CHUNK.min(offset + bytes - off);
-            let size = (take + 3) & !3;
-            staging.push(gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("readback"),
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            pieces.push((off, take));
-            off += take;
+        if bytes >= crate::xfer::MIN_BYTES {
+            if let Some(engine) = engine {
+                let pieces = split_pieces(offset, bytes, XFER_READBACK_CHUNK);
+                if let Some(staging) = take_xfer(gpu, engine, pool, &pieces) {
+                    return Self {
+                        buffer,
+                        pieces,
+                        staging,
+                        floats,
+                        armed: None,
+                    };
+                }
+            }
         }
+        let pieces = split_pieces(offset, bytes, PLAIN_READBACK_CHUNK);
+        let staging = take_readback(gpu, None, pool, &pieces);
         Self {
             buffer,
             pieces,
@@ -1439,28 +2184,34 @@ impl GpuPending {
         }
     }
 
-    /// Enqueue this pending's staging copies and arm the maps. Called from the
-    /// next chunk's begin, before its compute submits: the queue executes the
-    /// copies first, so they read the result before the compute overwrites it,
-    /// and the map callbacks fire when the copies do.
+    /// Enqueue this pending's download. Called from the next chunk's begin,
+    /// before that chunk's compute submits.
     fn arm(&mut self, gpu: &Gpu) -> Result<()> {
-        {
-            let mut enc = gpu.device.create_command_encoder(&Default::default());
-            for (piece, &(src_off, take)) in self.staging.iter().zip(&self.pieces) {
-                enc.copy_buffer_to_buffer(&self.buffer, src_off, piece, 0, take);
+        match &mut self.staging {
+            StagingSet::Xfer(set) => {
+                set.arm(gpu, &self.buffer, &self.pieces)?;
+                self.armed = Some(Armed::Xfer);
             }
-            gpu.queue.submit([enc.finish()]);
+            StagingSet::Plain(bufs) => {
+                {
+                    let mut enc = gpu.device.create_command_encoder(&Default::default());
+                    for (buf, &(src_off, take)) in bufs.iter().zip(&self.pieces) {
+                        enc.copy_buffer_to_buffer(&self.buffer, src_off, buf, 0, take);
+                    }
+                    gpu.queue.submit([enc.finish()]);
+                }
+                let mut rxs = Vec::new();
+                for buf in bufs {
+                    let slice = buf.slice(..);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    slice.map_async(wgpu::MapMode::Read, move |r| {
+                        let _ = tx.send(r);
+                    });
+                    rxs.push(rx);
+                }
+                self.armed = Some(Armed::Maps(rxs));
+            }
         }
-        let mut rxs = Vec::with_capacity(self.staging.len());
-        for piece in &self.staging {
-            let slice = piece.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            rxs.push(rx);
-        }
-        self.armed = Some(rxs);
         Ok(())
     }
 }

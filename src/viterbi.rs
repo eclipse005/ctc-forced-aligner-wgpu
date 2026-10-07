@@ -1236,17 +1236,30 @@ const DEFAULT_BUDGET: usize = 512 << 20;
 /// Recomputing a segment replays the DP over every frame once whatever the
 /// segment length, so a larger segment saves nothing but the per-segment
 /// overhead.
+fn viterbi_budget() -> usize {
+    match std::env::var("CTC_VITERBI_BUDGET_MB").ok().as_deref().map(str::parse::<usize>) {
+        Some(Ok(mb)) => mb << 20,
+        _ => DEFAULT_BUDGET,
+    }
+}
+
 fn segment_len(t_len: usize, s: usize, rb: usize) -> usize {
-    segment_len_with(
-        match std::env::var("CTC_VITERBI_BUDGET_MB").ok().as_deref().map(str::parse::<usize>)
-        {
-            Some(Ok(mb)) => mb << 20,
-            _ => DEFAULT_BUDGET,
-        },
-        t_len,
-        s,
-        rb,
-    )
+    segment_len_with(viterbi_budget(), t_len, s, rb)
+}
+
+/// `(segment length, recompute)`. The whole choice table stays only when it
+/// fits the fixed budget. Longer files keep an alpha checkpoint per segment
+/// and rebuild one segment of choices while tracing back, so peak DP memory
+/// does not grow with the audio.
+pub(crate) fn dp_plan(t_len: usize, s: usize, rb: usize) -> (usize, bool) {
+    let t_len = t_len.max(1);
+    let budget = viterbi_budget();
+    let nback = t_len.saturating_sub(1).saturating_mul(rb);
+    if nback.saturating_add(s.saturating_mul(8)) <= budget {
+        (t_len, false)
+    } else {
+        (segment_len_with(budget, t_len, s, rb).max(1), true)
+    }
 }
 
 fn segment_len_with(budget: usize, t_len: usize, s: usize, rb: usize) -> usize {
@@ -1551,6 +1564,49 @@ fn align_with(
     })
 }
 
+/// Walk one recomputed segment. `back` row 0 is frame `lo`.
+pub(crate) fn rewind_segment(
+    back: &[u8],
+    rb: usize,
+    lo: usize,
+    hi: usize,
+    cur: &mut usize,
+    states: &mut [i32],
+) {
+    for t in (lo..=hi).rev() {
+        let row = &back[(t - lo) * rb..(t - lo + 1) * rb];
+        *cur = cur.saturating_sub(get_back(row, *cur));
+        states[t - 1] = *cur as i32;
+    }
+}
+
+/// Collapse a path that was already traced. `total` is the alpha at the
+/// chosen end state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_from_states(
+    states: &[i32],
+    total: f64,
+    frame_scores: &[f64],
+    token_ids: &[usize],
+    frame_rate: f64,
+    pieces: Option<&[String]>,
+    word_ids: &[usize],
+) -> AlignmentResult {
+    let t_len = frame_scores.len();
+    let (tokens, blank_runs) = with_word_ids(word_ids, || {
+        collapse(states, frame_scores, token_ids, pieces, frame_rate)
+    });
+    AlignmentResult {
+        tokens,
+        frames: t_len,
+        frame_rate,
+        log_prob: total,
+        frame_path: None,
+        frame_scores: frame_scores.to_vec(),
+        blank_runs,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collapse(
     states: &[i32],
@@ -1706,6 +1762,24 @@ fn collapse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GPU row stores 16 choices in one little-endian u32: byte i holds
+    /// states 4i..4i+3, two bits each, low pair first. That is the byte
+    /// `get_back` already indexes with `st >> 2`.
+    #[test]
+    fn gpu_backpointer_word_matches_get_back() {
+        let choices = [0u8, 1, 2, 0, 1, 1, 0, 2, 2, 0, 1, 2, 0, 2, 1, 0];
+        let mut packed = 0u32;
+        for (k, &choice) in choices.iter().enumerate() {
+            let byte_i = k >> 2;
+            let shift = (k & 3) * 2;
+            packed |= u32::from(choice) << (byte_i * 8 + shift);
+        }
+        let bytes = packed.to_le_bytes();
+        for (st, &choice) in choices.iter().enumerate() {
+            assert_eq!(get_back(&bytes, st), choice as usize, "state {st}");
+        }
+    }
 
     /// The blank-padding rule must be SYMMETRIC at the utterance edges, and
     /// bounded by the same cap everywhere.

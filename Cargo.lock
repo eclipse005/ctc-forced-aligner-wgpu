@@ -286,6 +286,7 @@ name = "ctc-forced-aligner-wgpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "bytemuck",
  "bytes",
  "criterion",

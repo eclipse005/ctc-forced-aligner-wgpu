@@ -15,8 +15,8 @@ use crate::gpu::{Backend, DeviceSelector};
 use crate::spans::{build_segments, build_words, WordSpan};
 use crate::viterbi::{
     build_expanded_labels, ctc_forced_align_emissions_with_word_ids,
-    ctc_forced_align_gathered_with_word_ids, AlignmentResult, Emissions, GatheredChunks,
-    TokenAlignment,
+    ctc_forced_align_gathered_with_word_ids, finish_from_states,
+    AlignmentResult, Emissions, GatheredChunks, TokenAlignment,
 };
 use crate::vocab::Vocab;
 use crate::wav2vec2::{LmHeadCpu, Model};
@@ -77,10 +77,11 @@ const CTC_STAR_SCORE: f32 = -1.0;
 pub struct Aligner {
     pub(crate) tower: Tower,
     pub(crate) vocab: Vocab,
-    /// Host-side lm head weights, loaded for the GPU tower only: its hidden
-    /// form stores the encoder stream and re-runs the head per window
-    /// ([`RowGather::Head`]).  `None` on the CPU tower, which owns a full
-    /// [`Model`].
+    /// Host-side lm head weights, loaded for the GPU tower only. The hidden
+    /// trellis form (`CTC_TRELLIS=hidden`) stores the encoder stream and
+    /// re-runs this head per window ([`RowGather::Head`]). A GPU window's
+    /// default keeps the head on device. `None` on the CPU tower, which owns
+    /// a full [`Model`].
     pub(crate) gpu_lm_head: Option<LmHeadCpu>,
     /// Input samples per output frame, from the feature extractor's conv
     /// strides. Not a constant: it is a property of the checkpoint, and
@@ -511,7 +512,11 @@ impl Aligner {
                                     .gpu_lm_head
                                     .as_ref()
                                     .context("GPU tower is missing the host-side lm head")?),
-                                BlockKind::Logits { .. } => RowGather::Gpu,
+                                // logits rows and gathered columns are both
+                                // log-probs already; columns are state order
+                                BlockKind::Logits { .. } | BlockKind::Columns { .. } => {
+                                    RowGather::Gpu
+                                }
                             },
                         };
                         let em = LazyEmissions::new(&blocks, gather, &expanded, &star_state_idx);
@@ -602,13 +607,12 @@ impl Aligner {
         star_state_idx: &[usize],
         progress: &mut Option<AlignProgress<'_>>,
     ) -> Result<Trellis> {
-        // The DP reads one f32 per (frame, expanded state), so the trellis is
-        // T×(2·tokens+1).  Two things can stand in for it, both holding the
-        // identical f32s: the lm head's T×vocab output, and — if even that is
-        // too much — the encoder's own T×hidden stream, from which the lm head
-        // is re-run on demand.  Whichever of the three is the narrowest one
-        // that fits, so RAM is bounded no matter how long the audio is.
-        // `CTC_TRELLIS=auto|gathered|logits|hidden` forces any of them.
+        // The DP reads one f32 per (frame, expanded state). On the GPU the lm
+        // head stays on device: the block is the gathered matrix when it fits,
+        // otherwise the smaller per-window download (state columns, or full
+        // logits when the transcript is wider than the vocabulary). The CPU
+        // tower still parks the encoder stream and re-runs the head.
+        // `CTC_TRELLIS=gathered|logits|hidden|columns` forces one of them.
         let states = expanded.len();
         let frames = (waveform.len() / self.subsampling).max(1);
         let form = self.choose_form(frames, states, window_sec);
@@ -656,25 +660,28 @@ impl Aligner {
         }
     }
 
-    /// Which of the three equivalent trellis storage forms a run takes.
+    /// Which trellis storage a run takes.
     ///
-    /// Past the gathered trellis, the encoder stream (4 KB/frame) beats
-    /// parking the lm head's logits (41 KB/frame) for a windowed run: the
-    /// per-window head re-run costs ~25 ms against a 34 s window, while the
-    /// logits form's extra 37 KB/frame sits resident for the whole DP.
-    /// Measured on 15 m: hidden 2.24 GB / RTFx 17.8 vs logits 4.19 GB / 17.1,
-    /// outputs byte-identical.  An unchunked forward has no windows to re-run
-    /// over — the head would materialise the whole (T, V) matrix anyway — so
-    /// it keeps the logits form.
+    /// A file whose gathered matrix fits the emission budget stays gathered:
+    /// the GPU tower runs the lm head and the column gather on device. Past
+    /// that budget, a GPU window keeps the head on device and downloads the
+    /// smaller matrix — gathered columns when the trellis is narrower than
+    /// the vocabulary, otherwise the full logit rows. A CPU window still
+    /// stores the encoder stream and re-runs the head on the host. An
+    /// unchunked forward has no per-window head to re-run, so it keeps the
+    /// logits form. `CTC_TRELLIS=gathered|logits|hidden|columns` forces one.
     fn choose_form(&self, frames: usize, states: usize, window_sec: Option<f64>) -> Form {
         let vocab = self.vocab_size();
         let hidden = self.hidden_size();
         let windowed = window_sec.is_some();
+        let gpu = matches!(self.tower, Tower::Gpu(_));
         match std::env::var("CTC_TRELLIS").ok().as_deref() {
             Some("gathered") => Form::Gathered,
             Some("logits") => Form::Lazy(BlockKind::Logits { vocab }),
             Some("hidden") => Form::Lazy(BlockKind::Hidden { hidden }),
+            Some("columns") => Form::Lazy(BlockKind::Columns { states }),
             _ if fits(frames, states) => Form::Gathered,
+            _ if gpu && windowed => Form::Lazy(windowed_gpu_block(states, vocab)),
             _ if windowed => Form::Lazy(BlockKind::Hidden { hidden }),
             _ => Form::Lazy(BlockKind::Logits { vocab }),
         }
@@ -704,6 +711,11 @@ impl Aligner {
             (Tower::Gpu(g), BlockKind::Hidden { .. }) => g.forward_hidden(input),
             // no gather kernel: (t, vocab) log-probs instead of (t, S) trellis
             (Tower::Gpu(g), BlockKind::Logits { .. }) => g.forward(input),
+            // columns need the label list; the windowed encode passes it to
+            // `forward_gathered_begin`. This arm is the unchunked caller.
+            (_, BlockKind::Columns { .. }) => anyhow::bail!(
+                "gathered-column blocks are produced by the windowed GPU gather"
+            ),
         }
     }
 
@@ -868,6 +880,8 @@ impl Aligner {
                         win,
                         ctx,
                         kind,
+                        expanded,
+                        star_state_idx,
                         progress,
                         |_i, g| {
                             blocks.push(g);
@@ -1014,12 +1028,15 @@ impl Aligner {
     /// windows, the tail padding existing exactly to fill the last one — so
     /// every block holds `(win + 2·ctx) / subsampling` rows, which is what the
     /// streaming spans are predicted from.
+    #[allow(clippy::too_many_arguments)]
     fn encode_lazy_gpu_windows(
         &self,
         waveform: &[f32],
         win: usize,
         ctx: usize,
         kind: BlockKind,
+        expanded: &[usize],
+        star_state_idx: &[usize],
         progress: &mut Option<AlignProgress<'_>>,
         mut sink: impl FnMut(usize, Vec<f32>) -> Result<()>,
     ) -> Result<()> {
@@ -1031,19 +1048,38 @@ impl Aligner {
             Tower::Gpu(g) => g,
             Tower::Cpu(_) => anyhow::bail!("lazy GPU windows need the GPU tower"),
         };
-        // window N's begin arms window N-1's pending — its staging copies are
-        // enqueued ahead of window N's compute, which is what overwrites the
-        // result buffers — so collecting window N-1 overlaps window N's
-        // compute. The last window flushes after the loop: no next begin to
-        // arm it, so its collect waits for its own copy.
+        // Window N's begin arms window N-1 before submitting the compute that
+        // overwrites the result. The cached path copies on that same queue.
+        // The logits path only bounces into a side buffer there; the DMA runs
+        // on the transfer queue. On this P104 that copy does not overlap
+        // window N. The last window has no
+        // following begin, so its collect arms itself and waits.
         let mut pending: Option<crate::wav2vec2_gpu::GpuPending> = None;
         let mut collected = 0usize;
         let mut start = 0usize; // chunk start inside `padded`
+        // Columns keep the whole chunk, context rows included. The DP's
+        // span starts at `ctx` frames, the same layout logits and hidden use,
+        // so the streaming row check stays valid. Stars are stamped on device.
+        let (exp32, star32) = if matches!(kind, BlockKind::Columns { .. }) {
+            (
+                expanded.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+                star_state_idx.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         while start + win + 2 * ctx <= padded_len {
             let chunk = window_chunk(waveform, start, win, ctx);
             let new = match kind {
                 BlockKind::Hidden { .. } => gpu.forward_hidden_begin(&chunk, pending.as_mut())?,
                 BlockKind::Logits { .. } => gpu.forward_logits_begin(&chunk, pending.as_mut())?,
+                BlockKind::Columns { .. } => gpu.forward_gathered_begin(
+                    &chunk,
+                    &exp32,
+                    None,
+                    &star32,
+                    pending.as_mut(),
+                )?,
             };
             if let Some(p) = pending.replace(new) {
                 let g = gpu.collect(p)?;
@@ -1100,6 +1136,11 @@ impl Aligner {
         word_ids: &[usize],
         progress: &mut Option<AlignProgress<'_>>,
     ) -> Result<(AlignmentResult, f64, f64)> {
+        if self.use_gpu_viterbi(&kind) {
+            return self.align_streaming_on_gpu(
+                waveform, win, ctx_sec, ids, pieces, word_ids, progress,
+            );
+        }
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
         let states = expanded.len();
         let n = waveform.len();
@@ -1126,7 +1167,7 @@ impl Aligner {
                     "GPU tower is missing the host-side lm head",
                 )?)
             }
-            BlockKind::Logits { .. } => RowGather::Gpu,
+            BlockKind::Logits { .. } | BlockKind::Columns { .. } => RowGather::Gpu,
         };
 
         let (tx, rx) = mpsc::channel();
@@ -1170,7 +1211,15 @@ impl Aligner {
                 // ---- the encode, on the calling thread ----
                 let enc = (|| -> Result<()> {
                     let mut tail = 0usize;
-                    self.encode_lazy_gpu_windows(waveform.as_slice(), win, ctx, kind, progress, |i, g| {
+                    self.encode_lazy_gpu_windows(
+                        waveform.as_slice(),
+                        win,
+                        ctx,
+                        kind,
+                        expanded,
+                        star_state_idx,
+                        progress,
+                        |i, g| {
                         // cross-check the block against the span the DP was
                         // predicted. The chunk→frames mapping is the model's
                         // own conv arithmetic — NOT `len / subsampling` (this
@@ -1221,6 +1270,120 @@ impl Aligner {
             None => Ok((res?, encode_s, (wall_s - encode_s).max(0.0))),
         }
     }
+
+    /// Logits streaming on a GPU that can run f64 shaders. `CTC_GPU_DP=0`
+    /// keeps the CPU row team. Columns and hidden stay on the CPU path.
+    fn use_gpu_viterbi(&self, kind: &BlockKind) -> bool {
+        if !matches!(kind, BlockKind::Logits { .. }) {
+            return false;
+        }
+        if std::env::var("CTC_GPU_DP").ok().as_deref() == Some("0") {
+            eprintln!("ctc-aligner: CTC_GPU_DP=0, viterbi on cpu");
+            return false;
+        }
+        match &self.tower {
+            Tower::Gpu(g) if g.supports_f64() => true,
+            Tower::Gpu(_) => {
+                eprintln!("ctc-aligner: no f64 shaders on this adapter, viterbi stays on cpu");
+                false
+            }
+            Tower::Cpu(_) => false,
+        }
+    }
+
+    /// The logits window loop with the Viterbi on the same queue as the encoder.
+    /// Each window's DP is queued behind its encoder. Choices stay in memory
+    /// only when the whole table fits the Viterbi budget; longer files keep
+    /// alpha checkpoints and rebuild one segment while tracing back. The
+    /// lm-head replay that rebuilds token scores is part of the align tail.
+    #[allow(clippy::too_many_arguments)]
+    fn align_streaming_on_gpu(
+        &self,
+        waveform: Vec<f32>,
+        win: usize,
+        ctx_sec: f64,
+        ids: &[usize],
+        pieces: &[String],
+        word_ids: &[usize],
+        progress: &mut Option<AlignProgress<'_>>,
+    ) -> Result<(AlignmentResult, f64, f64)> {
+        let model = match &self.tower {
+            Tower::Gpu(g) => g,
+            Tower::Cpu(_) => anyhow::bail!("gpu viterbi needs the GPU tower"),
+        };
+        let ctx = (ctx_sec * TARGET_SR as f64) as usize;
+        let n = waveform.len();
+        let ctx_frames = ctx / self.subsampling;
+        let win_frames = win / self.subsampling;
+        let n_chunks = n.div_ceil(win);
+        let extension = n_chunks * win - n;
+        let ext_frames = ((extension as f64 / TARGET_SR as f64 * self.frame_rate).ceil()) as usize;
+        let kept_of = |rows: usize| (ctx_frames + win_frames).min(rows) - ctx_frames.min(rows);
+        let kept_last = win_frames.saturating_sub(ext_frames);
+        let frames = (n_chunks - 1) * win_frames + kept_last;
+        anyhow::ensure!(
+            frames >= ids.len(),
+            "Audio too short: {frames} frames cannot hold {} tokens.",
+            ids.len()
+        );
+        if ids.is_empty() {
+            return Ok((
+                AlignmentResult {
+                    tokens: Vec::new(),
+                    frames,
+                    frame_rate: self.frame_rate,
+                    log_prob: 0.0,
+                    frame_path: None,
+                    frame_scores: Vec::new(),
+                    blank_runs: Vec::new(),
+                },
+                0.0,
+                0.0,
+            ));
+        }
+        // Pipeline compile on the first file is device work; count it in encode.
+        let t_all = std::time::Instant::now();
+        let mut dp = model.new_dp(ids, self.vocab.star_id, self.blank_id, frames)?;
+        let padded_len = n + 2 * ctx + extension;
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while start + win + 2 * ctx <= padded_len {
+            let chunk = window_chunk(waveform.as_slice(), start, win, ctx);
+            let n_kept = if i + 1 == n_chunks { kept_last } else { win_frames };
+            let rows = model.gpu_dp_window(&chunk, &mut dp, ctx_frames, n_kept)?;
+            anyhow::ensure!(
+                kept_of(rows) == win_frames,
+                "window {i} produced {rows} rows, keeping {}, predicted {win_frames}",
+                kept_of(rows)
+            );
+            i += 1;
+            report(progress, i, n_chunks);
+            start += win;
+        }
+        anyhow::ensure!(i == n_chunks, "the loop's window arithmetic drifted");
+        anyhow::ensure!(
+            dp.frames() == frames,
+            "gpu dp produced {} frames, predicted {frames}",
+            dp.frames()
+        );
+        drop(waveform);
+        model.gpu_dp_finish(&mut dp)?;
+        let encode_s = t_all.elapsed().as_secs_f64();
+        dp.check_store()?;
+        let t_tail = std::time::Instant::now();
+        let alpha = model.gpu_dp_alpha(&dp)?;
+        let (states, total) = if dp.is_linear() {
+            model.gpu_dp_traceback(&mut dp, &alpha)?
+        } else {
+            dp.trace_states(&alpha)?
+        };
+        let scores = model.gpu_dp_scores(&dp, &states)?;
+        let res = finish_from_states(
+            &states, total, &scores, ids, self.frame_rate, Some(pieces), word_ids,
+        );
+        let align_s = t_tail.elapsed().as_secs_f64();
+        Ok((res, encode_s, align_s))
+    }
 }
 
 /// `[ctx zeros | win real samples | ctx zeros]`, gathered from the waveform
@@ -1256,7 +1419,7 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 /// How the aligner holds one file's trellis between the forward pass and the
 /// Viterbi.  Both variants hold the same f32 values, so the alignment does
 /// not depend on which one a run picks.
-/// Which of the three equivalent trellis storage forms a run takes.
+/// Which trellis storage a run takes. See [`Aligner::choose_form`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Form {
     Gathered,
@@ -1276,6 +1439,18 @@ fn emission_budget() -> usize {
 
 fn fits(frames: usize, width: usize) -> bool {
     frames.saturating_mul(width).saturating_mul(4) <= emission_budget()
+}
+
+/// On-GPU windowed block once the whole-file gathered matrix does not fit.
+/// Columns are `rows × states` and already log-probs; logits are
+/// `rows × vocab`. The row count cancels, so the narrower width is the
+/// smaller download across the PCIe link.
+fn windowed_gpu_block(states: usize, vocab: usize) -> BlockKind {
+    if states < vocab {
+        BlockKind::Columns { states }
+    } else {
+        BlockKind::Logits { vocab }
+    }
 }
 
 impl std::fmt::Debug for Trellis {
@@ -1546,8 +1721,8 @@ fn slice_frames(states: usize) -> usize {
 }
 
 /// What a stored per-window block holds, and how its rows become trellis
-/// columns.  All three widths produce the same f32s; they only differ in how
-/// much memory has to stay resident between the forward pass and the traceback.
+/// columns.  The DP sees the same f32s from each; they differ in what was
+/// downloaded and whether the lm head already ran.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BlockKind {
     /// `(rows × vocab)` bias-free logits: 41 KB per frame.  The gather is a
@@ -1556,6 +1731,11 @@ enum BlockKind {
     /// `(rows × hidden)` normalised encoder stream: 4 KB per frame, ~40x
     /// smaller, and the lm head is re-run to get the columns back.
     Hidden { hidden: usize },
+    /// `(rows × states)` log-probs already gathered on the GPU, in state
+    /// order. Star columns are [`CTC_STAR_SCORE`]. Narrower than
+    /// [`BlockKind::Logits`] when the trellis has fewer states than the
+    /// vocabulary, so that is the download a windowed GPU run keeps.
+    Columns { states: usize },
 }
 
 impl BlockKind {
@@ -1563,6 +1743,7 @@ impl BlockKind {
         match self {
             BlockKind::Logits { vocab } => *vocab,
             BlockKind::Hidden { hidden } => *hidden,
+            BlockKind::Columns { states } => *states,
         }
     }
 }
@@ -1570,8 +1751,10 @@ impl BlockKind {
 /// Turns a stored block's rows into trellis columns, per tower: the CPU tower
 /// sweeps the row (or re-runs the lm head), the GPU tower's logits rows are
 /// already log-softmaxed (its gather kernel is a plain column copy, so this
-/// reproduces it exactly), and the GPU tower's *hidden* rows go through the
-/// host-side lm head ([`LmHeadCpu`]) the same way the CPU tower's do.
+/// reproduces it exactly), the GPU tower's *column* rows are already that
+/// gather (state order — index them by state, not by vocabulary id), and the
+/// GPU tower's *hidden* rows go through the host-side lm head ([`LmHeadCpu`])
+/// the same way the CPU tower's do.
 enum RowGather<'a> {
     Cpu(&'a Model),
     Head(&'a LmHeadCpu),
@@ -1624,9 +1807,21 @@ impl RowGather<'_> {
     ) {
         let s = cols.len();
         match (self, kind) {
+            // Already gathered on device, one cell per state. `cols[j]` is a
+            // vocabulary id and is larger than the row on any real transcript.
+            (RowGather::Gpu, BlockKind::Columns { .. }) => {
+                let w = kind.width();
+                debug_assert_eq!(w, s);
+                src[block_row_lo * w..][..rows * w]
+                    .par_chunks_exact(w)
+                    .zip(out.par_chunks_mut(s))
+                    .for_each(|(row, dst)| dst.copy_from_slice(row));
+                norm.fill(0.0);
+            }
             // GPU logits rows are log-probs already: pure column copy, and the
             // recorded normaliser stays 0 (the value path adds nothing)
-            (RowGather::Gpu, _) | (RowGather::Head(_), BlockKind::Logits { .. }) => {
+            (RowGather::Gpu, BlockKind::Logits { .. })
+            | (RowGather::Head(_), BlockKind::Logits { .. }) => {
                 let w = kind.width();
                 src[block_row_lo * w..][..rows * w]
                     .par_chunks_exact(w)
@@ -1662,6 +1857,15 @@ impl RowGather<'_> {
                     .zip(norm.par_iter_mut())
                     .for_each(|((x, dst), c)| *c = h.gather_lp_row(x, cols, dst));
             }
+            // Columns are the GPU gather's output. Hidden rows on that tower
+            // go through RowGather::Head, never Gpu.
+            (RowGather::Cpu(_), BlockKind::Columns { .. })
+            | (RowGather::Head(_), BlockKind::Columns { .. })
+            | (RowGather::Gpu, BlockKind::Hidden { .. }) => {
+                unreachable!(
+                    "column blocks are GPU-gathered state rows; hidden rows use the host head"
+                )
+            }
         }
     }
 
@@ -1696,10 +1900,14 @@ impl RowGather<'_> {
             // GPU-produced logits rows are log-probs already: no bias, no normaliser
             (RowGather::Head(_), BlockKind::Logits { .. })
             | (RowGather::Gpu, BlockKind::Logits { .. }) => src[col],
+            // `col` is the state index: the row is already in state order
+            (RowGather::Gpu, BlockKind::Columns { .. }) => src[col],
             // hidden rows are pre-lm-head: the column only exists once gathered
             (RowGather::Cpu(_), BlockKind::Hidden { .. })
             | (RowGather::Head(_), BlockKind::Hidden { .. })
-            | (RowGather::Gpu, BlockKind::Hidden { .. }) => f32::NAN,
+            | (RowGather::Gpu, BlockKind::Hidden { .. })
+            | (RowGather::Cpu(_), BlockKind::Columns { .. })
+            | (RowGather::Head(_), BlockKind::Columns { .. }) => f32::NAN,
         }
     }
 }
@@ -1952,6 +2160,14 @@ impl Emissions for LazyEmissions<'_> {
             let s = b.num_states;
             return block[(t % b.frames_per_chunk - lo) * s + st];
         }
+        if matches!(self.kind, BlockKind::Columns { .. }) {
+            // state order already; `self.cols[st]` is a vocabulary id
+            let (blk, row, kept) = b.span_of(t);
+            let w = b.kind.width();
+            let r = t - b.frame_base(blk);
+            debug_assert!(r < kept);
+            return b.with_block(blk, |src| src[(row + r) * w + st]);
+        }
         let col = self.cols[st] as usize;
         let (block, row, kept) = b.span_of(t);
         let _ = self.slice_at(t); // records this row's normaliser
@@ -1991,6 +2207,21 @@ impl Emissions for LazyEmissions<'_> {
                             self.gather.lp_value(&wl[r * vocab..][..vocab], col, norm[t]) as f64;
                     }
                 }
+            } else if matches!(self.kind, BlockKind::Columns { .. }) {
+                // state order; a vocabulary id does not address this row
+                let w = b.kind.width();
+                b.with_block(bi, |src| {
+                    let src = &src[row * w..][..kept * w];
+                    for r in 0..kept {
+                        let t = base + r;
+                        let st = states[t] as usize;
+                        out[t] = if self.star_cols.contains(&st) {
+                            CTC_STAR_SCORE as f64
+                        } else {
+                            src[r * w + st] as f64
+                        };
+                    }
+                });
             } else {
                 let w = b.kind.width();
                 b.with_block(bi, |src| {
@@ -2619,5 +2850,122 @@ mod tests {
             );
         }
         assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
+    }
+
+    #[test]
+    fn windowed_gpu_block_picks_the_narrower_download() {
+        let vocab = 10288;
+        assert!(matches!(
+            windowed_gpu_block(6531, vocab),
+            BlockKind::Columns { states: 6531 }
+        ));
+        assert!(matches!(
+            windowed_gpu_block(vocab, vocab),
+            BlockKind::Logits { vocab: 10288 }
+        ));
+        assert!(matches!(
+            windowed_gpu_block(25435, vocab),
+            BlockKind::Logits { vocab: 10288 }
+        ));
+    }
+
+    /// Column blocks are already state order. Indexing them with the
+    /// vocabulary id (`cols[st]`) reads off the end of the row: several ids
+    /// here are past `s`. The star cell is a tempting blank-like value, and
+    /// `score` still has to return the reference constant.
+    #[test]
+    fn lazy_columns_reads_state_order_not_vocab_ids() {
+        let blank = 0usize;
+        let token_ids: Vec<usize> = vec![15, 2, 20, 15, 18];
+        let star = 15usize;
+        let pieces: Vec<String> = token_ids.iter().map(|i| i.to_string()).collect();
+        let expanded = crate::viterbi::build_expanded_labels(&token_ids, blank);
+        let s = expanded.len();
+        assert!(token_ids.iter().any(|&id| id >= s), "the mis-index has to be out of range");
+        let star_state_idx: Vec<usize> = (0..token_ids.len())
+            .filter(|&i| token_ids[i] == star)
+            .map(|i| 2 * i + 1)
+            .collect();
+
+        let (row_offset, kept_last, per) = (5usize, 7usize, 13usize);
+        let rows_per = row_offset + per;
+        let total_kept = 2 * per + kept_last;
+        let mut block_all: Vec<f32> = (0..3 * rows_per * s)
+            .map(|i| -((i % 37) as f32) * 0.07 - 0.3)
+            .collect();
+        for row in block_all.chunks_exact_mut(s) {
+            for &si in &star_state_idx {
+                row[si] = -0.001;
+            }
+        }
+
+        let mut blocks = Vec::new();
+        let mut spans = Vec::new();
+        for i in 0..3 {
+            let kept = if i == 2 { kept_last } else { per };
+            blocks.push(block_all[i * rows_per * s..(i + 1) * rows_per * s].to_vec());
+            spans.push((i, row_offset, kept));
+        }
+        let lb = LazyBlocks::owned(
+            blocks,
+            BlockKind::Columns { states: s },
+            s,
+            per,
+            row_offset,
+            spans,
+        );
+        let em = LazyEmissions::new(&lb, RowGather::Gpu, &expanded, &star_state_idx);
+        em.validate().unwrap();
+
+        for t in 0..total_kept {
+            for &si in &star_state_idx {
+                assert_eq!(em.score(t, si), CTC_STAR_SCORE, "score({t}, star {si})");
+            }
+        }
+
+        let mut flat = Vec::with_capacity(total_kept * s);
+        for (b, &(_, row, kept)) in lb.spans.iter().enumerate() {
+            for r in 0..kept {
+                let src = &lb.owned_blocks()[b][(row + r) * s..][..s];
+                for (j, &v) in src.iter().enumerate() {
+                    flat.push(if star_state_idx.contains(&j) {
+                        CTC_STAR_SCORE
+                    } else {
+                        v
+                    });
+                }
+            }
+        }
+        let gc = GatheredChunks {
+            chunks: flat.chunks(per * s).map(|c| c.to_vec()).collect(),
+            frames_per_chunk: per,
+            num_states: s,
+        };
+        gc.validate().unwrap();
+
+        let word_ids: Vec<usize> = (0..token_ids.len()).collect();
+        let want = ctc_forced_align_gathered_with_word_ids(
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false,
+        )
+        .unwrap();
+        let got = ctc_forced_align_emissions_with_word_ids(
+            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids,
+        )
+        .unwrap();
+
+        assert_eq!(got.tokens.len(), want.tokens.len());
+        for (g, w) in got.tokens.iter().zip(&want.tokens) {
+            assert_eq!(
+                (g.start_frame, g.end_frame),
+                (w.start_frame, w.end_frame),
+                "token {} moved",
+                w.piece
+            );
+            assert_eq!(g.score.to_bits(), w.score.to_bits(), "token score bits");
+        }
+        assert_eq!(got.log_prob.to_bits(), want.log_prob.to_bits());
+        for (i, (a, b)) in got.frame_scores.iter().zip(&want.frame_scores).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "frame {i} score bits");
+        }
     }
 }
