@@ -1372,16 +1372,25 @@ impl Aligner {
         dp.check_store()?;
         let t_tail = std::time::Instant::now();
         let alpha = model.gpu_dp_alpha(&dp)?;
-        let (states, total) = if dp.is_linear() {
-            model.gpu_dp_traceback(&mut dp, &alpha)?
-        } else {
-            dp.trace_states(&alpha)?
-        };
-        let scores = model.gpu_dp_scores(&dp, &states)?;
+        let (states, total) = crate::viterbi_gpu::dp_prof::time(
+            &crate::viterbi_gpu::dp_prof::TRACE_US,
+            || -> Result<(Vec<i32>, f64)> {
+                if dp.is_linear() {
+                    model.gpu_dp_traceback(&mut dp, &alpha)
+                } else {
+                    dp.trace_states(&alpha)
+                }
+            },
+        )?;
+        let scores = crate::viterbi_gpu::dp_prof::time(
+            &crate::viterbi_gpu::dp_prof::SCORES_US,
+            || model.gpu_dp_scores(&dp, &states),
+        )?;
         let res = finish_from_states(
             &states, total, &scores, ids, self.frame_rate, Some(pieces), word_ids,
         );
         let align_s = t_tail.elapsed().as_secs_f64();
+        crate::viterbi_gpu::dp_prof::dump("gpu dp");
         Ok((res, encode_s, align_s))
     }
 }

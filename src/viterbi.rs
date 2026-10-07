@@ -1564,22 +1564,6 @@ fn align_with(
     })
 }
 
-/// Walk one recomputed segment. `back` row 0 is frame `lo`.
-pub(crate) fn rewind_segment(
-    back: &[u8],
-    rb: usize,
-    lo: usize,
-    hi: usize,
-    cur: &mut usize,
-    states: &mut [i32],
-) {
-    for t in (lo..=hi).rev() {
-        let row = &back[(t - lo) * rb..(t - lo + 1) * rb];
-        *cur = cur.saturating_sub(get_back(row, *cur));
-        states[t - 1] = *cur as i32;
-    }
-}
-
 /// Collapse a path that was already traced. `total` is the alpha at the
 /// chosen end state.
 #[allow(clippy::too_many_arguments)]

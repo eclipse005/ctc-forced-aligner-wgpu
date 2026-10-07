@@ -237,23 +237,6 @@ pub(crate) struct GpuModel {
     scratch: std::sync::Mutex<Option<Scratch>>,
 }
 
-struct ReplayChunk {
-    index: wgpu::SubmissionIndex,
-    frame: usize,
-    rows: usize,
-    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
-    slot: usize,
-    seg_i: usize,
-}
-
-struct LiveSeg {
-    lo: usize,
-    hi: usize,
-    rows: Vec<u8>,
-    got: usize,
-    need: usize,
-}
-
 impl GpuModel {
     pub fn load(model_dir: &Path, selector: crate::gpu::DeviceSelector) -> Result<Self> {
         let gpu = match selector {
@@ -709,9 +692,6 @@ impl GpuModel {
             s_end -= 1;
         }
         let total = alpha_last[s_end];
-        let mut states = vec![0i32; t_len];
-        states[t_len - 1] = s_end as i32;
-        let mut cur = s_end;
         let (logits, rows_cap) = {
             let guard = self.scratch.lock().unwrap();
             let s = guard
@@ -721,13 +701,17 @@ impl GpuModel {
         };
         anyhow::ensure!(rows_cap >= 1, "empty traceback chunk");
         let seg = dp.seg();
-        let rb = dp.row_bytes();
         let chunk = rows_cap.min(dp.chunk_limit());
+        // Seed the walk's end state: every segment's trace starts from
+        // states[hi], and the first segment processed covers hi = t_len-1.
+        let seed = s_end as u32;
+        self.gpu.queue.write_buffer(
+            dp.states_buf(),
+            ((t_len - 1) * 4) as u64,
+            bytemuck::bytes_of(&seed),
+        );
         let mut b = ((t_len - 1) / seg) * seg;
         let segments = b / seg + 1;
-        let mut segs: Vec<LiveSeg> = Vec::new();
-        let mut inflight = std::collections::VecDeque::<ReplayChunk>::new();
-        let mut nsub = 0usize;
         let mut queued = 0usize;
         loop {
             let k = b / seg;
@@ -736,31 +720,16 @@ impl GpuModel {
             if lo <= hi {
                 let start_alpha = dp.checkpoint(k)?.to_vec();
                 dp.load_alpha(&self.gpu, &start_alpha)?;
-                let seg_i = segs.len();
-                let need = hi - lo + 1;
-                // Allocate on the first collect, after the previous segment's
-                // rows have been dropped. The pipe only overlaps submits.
-                segs.push(LiveSeg {
-                    lo,
-                    hi,
-                    rows: Vec::new(),
-                    got: 0,
-                    need,
-                });
                 let mut frame = lo;
                 while frame <= hi {
-                    if inflight.len() == crate::viterbi_gpu::PIPE_DEPTH {
-                        let prev = inflight.pop_front().unwrap();
-                        self.finish_replay_chunk(dp, prev, &mut segs, rb, &mut cur, &mut states)?;
-                    }
                     let m = (hi - frame + 1).min(chunk);
-                    let slot = nsub % crate::viterbi_gpu::PIPE_DEPTH;
-                    inflight.push_back(self.submit_replay_chunk(
-                        dp, &logits, frame, m, slot, seg_i,
-                    )?);
+                    self.submit_replay_chunk(dp, &logits, frame, m, frame - lo)?;
                     frame += m;
-                    nsub += 1;
                 }
+                // Walk this segment's choices on the device. Ordered after
+                // the replay chunks, and the next segment's trace reads the
+                // state this one leaves in states[lo-1] — no host round trip.
+                dp.trace_segment(&self.gpu, lo, hi)?;
             }
             queued += 1;
             if queued == 1 || queued == segments || queued % (segments / 10).max(1) == 0 {
@@ -771,57 +740,35 @@ impl GpuModel {
             }
             b -= seg;
         }
-        while let Some(prev) = inflight.pop_front() {
-            self.finish_replay_chunk(dp, prev, &mut segs, rb, &mut cur, &mut states)?;
-        }
+        // The state path is complete on the device; one readback replaces the
+        // per-chunk choice maps this used to wait on.
+        let bytes = self.gpu.readback(dp.states_buf(), (t_len * 4) as u64)?;
+        anyhow::ensure!(bytes.len() == t_len * 4, "state readback short");
+        let states: Vec<i32> = bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         Ok((states, total))
     }
 
-    fn finish_replay_chunk(
-        &self,
-        dp: &crate::viterbi_gpu::GpuDp,
-        chunk: ReplayChunk,
-        segs: &mut [LiveSeg],
-        rb: usize,
-        cur: &mut usize,
-        states: &mut [i32],
-    ) -> Result<()> {
-        let seg_i = chunk.seg_i;
-        if segs[seg_i].rows.is_empty() {
-            segs[seg_i].rows = vec![0u8; segs[seg_i].need * rb];
-        }
-        let off = (chunk.frame - segs[seg_i].lo) * rb;
-        let take = chunk.rows * rb;
-        dp.read_mapped_back(
-            &self.gpu,
-            chunk.slot,
-            chunk.index,
-            &chunk.rx,
-            chunk.rows,
-            &mut segs[seg_i].rows[off..off + take],
-        )?;
-        segs[seg_i].got += chunk.rows;
-        if segs[seg_i].got == segs[seg_i].need {
-            let lo = segs[seg_i].lo;
-            let hi = segs[seg_i].hi;
-            crate::viterbi::rewind_segment(&segs[seg_i].rows, rb, lo, hi, cur, states);
-            segs[seg_i].rows = Vec::new();
-        }
-        Ok(())
-    }
-
+    /// Replay one chunk's DP from the segment checkpoint: upload the chunk's
+    /// archived hidden rows, re-run the lm head and log-softmax on device,
+    /// re-run the DP steps, leaving the chunk's packed choices in the device
+    /// back buffer at rows `back_row0..back_row0+m`. No readback.
     fn submit_replay_chunk(
         &self,
         dp: &mut crate::viterbi_gpu::GpuDp,
         logits: &wgpu::Buffer,
         frame: usize,
         m: usize,
-        slot: usize,
-        seg_i: usize,
-    ) -> Result<ReplayChunk> {
+        back_row0: usize,
+    ) -> Result<()> {
         let hidden = self.cfg.hidden_size;
         let vocab = u32::try_from(self.cfg.vocab_size).context("vocab")?;
         let hidden_u = u32::try_from(hidden).context("hidden")?;
+        let prof = crate::viterbi_gpu::dp_prof::enabled();
+        let t_rec = prof.then(std::time::Instant::now);
+        let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         self.gpu
             .upload(dp.stage(), bytemuck::cast_slice(dp.hidden_rows(frame, m)?));
         let dims = GemmDims {
@@ -881,7 +828,6 @@ impl GpuModel {
                 score_uni(1, &uni, 256, ls_bytes.len() as u64),
             ],
         });
-        let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("dp-replay"),
         });
@@ -908,13 +854,16 @@ impl GpuModel {
             let (gx, gy) = row_grid(m as u32);
             pass.dispatch_workgroups(gx, gy, 1);
         }
-        let steps = dp.record_steps(&self.gpu, &mut enc, logits, self.cfg.vocab_size, m)?;
-        let src = dp.device_back().clone();
-        let dst = dp.map_back(slot).clone();
-        let bytes = m as u64 * dp.back_stride();
-        enc.copy_buffer_to_buffer(&src, 0, &dst, 0, bytes);
-        let index = self.gpu.queue.submit([enc.finish()]);
-        drop((gemm_bg, ls_bg, uni, steps, src, dst));
+        let steps = dp.record_steps(&self.gpu, &mut enc, logits, self.cfg.vocab_size, m, back_row0)?;
+        self.gpu.queue.submit([enc.finish()]);
+        drop((gemm_bg, ls_bg, uni, steps));
+        if let Some(t) = t_rec {
+            crate::viterbi_gpu::dp_prof::add(
+                &crate::viterbi_gpu::dp_prof::RECORD_US,
+                t.elapsed(),
+            );
+        }
+        let t_sub = prof.then(std::time::Instant::now);
         self.gpu
             .device
             .poll(wgpu::PollType::Poll)
@@ -923,20 +872,13 @@ impl GpuModel {
             let _ = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
             anyhow::bail!("gpu viterbi traceback: {e}");
         }
-        let (tx, rx) = std::sync::mpsc::channel();
-        dp.map_back(slot)
-            .slice(..crate::viterbi_gpu::map_end(bytes as usize))
-            .map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-        Ok(ReplayChunk {
-            index,
-            frame,
-            rows: m,
-            rx,
-            slot,
-            seg_i,
-        })
+        if let Some(t) = t_sub {
+            crate::viterbi_gpu::dp_prof::add(
+                &crate::viterbi_gpu::dp_prof::SUBMIT_US,
+                t.elapsed(),
+            );
+        }
+        Ok(())
     }
 
     /// Replay the lm head over the archived encoder rows and gather the f32

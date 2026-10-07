@@ -7,7 +7,7 @@
 //!
 //! Mapped copies wait on their own submission index. `poll(wait_indefinitely)`
 //! would also wait for the encoder already queued behind that copy. A slot is
-//! reused `PIPE_DEPTH` windows later.
+//! reused `PIPE_DEPTH` submissions later.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,8 +51,22 @@ struct GatherCfg {
     s: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TraceCfg {
+    lo: u32,
+    hi: u32,
+    t_len: u32,
+    rb_u32: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+    pad3: u32,
+}
+
 const _: () = assert!(std::mem::size_of::<StepCfg>() == 32);
 const _: () = assert!(std::mem::size_of::<GatherCfg>() == 16);
+const _: () = assert!(std::mem::size_of::<TraceCfg>() == 32);
 
 const STEP_WGSL: &str = r#"
 struct StepCfg {
@@ -76,6 +90,14 @@ struct StepCfg {
 @group(0) @binding(7) var<storage, read> ninf_buf: array<f64>;
 @group(0) @binding(8) var<uniform> cfg: StepCfg;
 
+// One workgroup covers 4096 states (256 threads x 16 states). A thread's 16
+// states are STRIDED by the workgroup width, not contiguous: at loop step k
+// the 32 threads of a warp touch 32 consecutive states, so every f64 row
+// load is a coalesced 256 B. The row-major mapping this replaced made each
+// thread own states [g*16, g*16+16), which read 16 cache lines per warp load
+// — measured 120 us per frame on the DP, 16x the row's actual traffic.
+var<workgroup> choices: array<u32, 4096>;
+
 fn emit_at(st: u32) -> f32 {
     if (star[st] != 0u) {
         return -1.0;
@@ -84,45 +106,51 @@ fn emit_at(st: u32) -> f32 {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let g = gid.x;
-    let base = g * 16u;
-    if (base >= cfg.s) {
-        return;
-    }
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * 4096u;
+    let me = lid.x;
     let ninf = ninf_buf[0];
-    var packed = 0u;
     for (var k = 0u; k < 16u; k = k + 1u) {
-        let st = base + k;
-        if (st >= cfg.s) {
-            break;
-        }
-        let stay = prev_row[st];
-        var adv = ninf;
-        var skip_v = ninf;
-        if (st >= 1u) {
-            adv = prev_row[st - 1u];
-        }
-        if (st >= 2u && skip_dead[st] == 0u) {
-            skip_v = prev_row[st - 2u];
-        }
+        let st = base + k * 256u + me;
         var choice = 0u;
-        var best = stay;
-        if (stay >= adv && stay >= skip_v) {
-            // stay: choice 0
-        } else if (adv >= skip_v) {
-            choice = 1u;
-            best = adv;
-        } else {
-            choice = 2u;
-            best = skip_v;
+        if (st < cfg.s) {
+            let stay = prev_row[st];
+            var adv = ninf;
+            var skip_v = ninf;
+            if (st >= 1u) {
+                adv = prev_row[st - 1u];
+            }
+            if (st >= 2u && skip_dead[st] == 0u) {
+                skip_v = prev_row[st - 2u];
+            }
+            var best = stay;
+            if (stay >= adv && stay >= skip_v) {
+                // stay: choice 0
+            } else if (adv >= skip_v) {
+                choice = 1u;
+                best = adv;
+            } else {
+                choice = 2u;
+                best = skip_v;
+            }
+            next_row[st] = best + f64(emit_at(st));
         }
-        next_row[st] = best + f64(emit_at(st));
-        let byte_i = k >> 2u;
-        let shift = (k & 3u) * 2u;
-        packed = packed | (choice << (byte_i * 8u + shift));
+        choices[k * 256u + me] = choice;
     }
-    back[cfg.back_row * cfg.rb_u32 + g] = packed;
+    workgroupBarrier();
+    // Pack the row's 2-bit choices: u32 u holds states [u*16, u*16+16), the
+    // layout the CPU traceback (and the device trace kernel) read.
+    let u = wid.x * 256u + me;
+    if (u < cfg.rb_u32) {
+        var packed = 0u;
+        for (var j = 0u; j < 16u; j = j + 1u) {
+            let local = u * 16u + j - base;
+            let c = choices[(local >> 8u) * 256u + (local & 255u)];
+            packed = packed | ((c & 3u) << (j * 2u));
+        }
+        back[cfg.back_row * cfg.rb_u32 + u] = packed;
+    }
 }
 "#;
 
@@ -191,6 +219,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+const TRACE_WGSL: &str = r#"
+struct TraceCfg {
+    lo: u32,
+    hi: u32,
+    t_len: u32,
+    rb_u32: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+    pad3: u32,
+}
+@group(0) @binding(0) var<storage, read> back: array<u32>;
+@group(0) @binding(1) var<storage, read_write> states: array<u32>;
+@group(0) @binding(2) var<uniform> cfg: TraceCfg;
+
+// One thread walks the segment's packed choices backwards, exactly the
+// arithmetic of the CPU rewind: cur -= choice(row = t - lo, cur), states[t-1]
+// = cur. Serial by nature — every step reads the step before it — so a single
+// invocation is the whole point: the choices never leave the device. The walk
+// starts from states[hi], which the segment after this one wrote (the file's
+// last state is seeded before the first segment runs), so segments chain on
+// the device and the CPU never waits per segment.
+@compute @workgroup_size(1)
+fn main() {
+    var cur = states[cfg.hi];
+    var t = cfg.hi;
+    loop {
+        if (t < cfg.lo) {
+            break;
+        }
+        let row = t - cfg.lo;
+        let v = (back[row * cfg.rb_u32 + (cur >> 4u)] >> ((cur & 15u) * 2u)) & 3u;
+        cur = cur - min(cur, v);
+        states[t - 1u] = cur;
+        t = t - 1u;
+    }
+}
+"#;
+
 /// Device state for one file.
 ///
 /// The choice table is Θ(frames × states). An hour is about 5.5 GB, and
@@ -215,9 +282,12 @@ pub(crate) struct GpuDp {
     init_pipe: wgpu::ComputePipeline,
     step_pipe: wgpu::ComputePipeline,
     gather_pipe: wgpu::ComputePipeline,
+    trace_pipe: wgpu::ComputePipeline,
     init_layout: wgpu::BindGroupLayout,
     step_layout: wgpu::BindGroupLayout,
     gather_layout: wgpu::BindGroupLayout,
+    trace_layout: wgpu::BindGroupLayout,
+    trace_uni: wgpu::Buffer,
     front: usize,
     frames: usize,
     n_frames: usize,
@@ -304,7 +374,13 @@ impl GpuDp {
 
         let slot = (gpu.device.limits().min_uniform_buffer_offset_alignment as u64).max(UNI_SIZE);
         let cfg = gpu.uniform("dp-cfg", slot * BACK_CAP as u64);
-        let back_bytes = (BACK_CAP as u64)
+        let (seg, linear) = dp_plan(n_frames, s, rb);
+        // Non-linear: the whole table is read back per window, so the device
+        // buffer holds one window. Linear: the choices are traced back ON the
+        // device one segment at a time, so it holds one segment instead —
+        // bounded by the same budget that picked `seg`.
+        let back_rows = if linear { seg } else { BACK_CAP };
+        let back_bytes = (back_rows as u64)
             .checked_mul(rb_u32 as u64)
             .and_then(|n| n.checked_mul(4))
             .context("back buffer size")?;
@@ -314,11 +390,15 @@ impl GpuDp {
             .and_then(|n| n.checked_mul(4))
             .context("hidden stage size")?;
         let stage = gpu.storage("dp-stage", stage_bytes);
+        // The per-window readback maps hold one window of hidden rows and one
+        // window of choice rows. The linear plan traces choices back on the
+        // device instead, so its slots only ever carry the hidden rows.
+        let slot_back_bytes = if linear { 16 } else { back_bytes };
         let slots = [
-            MapSlot::new(gpu, 0, stage_bytes, back_bytes)?,
-            MapSlot::new(gpu, 1, stage_bytes, back_bytes)?,
-            MapSlot::new(gpu, 2, stage_bytes, back_bytes)?,
-            MapSlot::new(gpu, 3, stage_bytes, back_bytes)?,
+            MapSlot::new(gpu, 0, stage_bytes, slot_back_bytes)?,
+            MapSlot::new(gpu, 1, stage_bytes, slot_back_bytes)?,
+            MapSlot::new(gpu, 2, stage_bytes, slot_back_bytes)?,
+            MapSlot::new(gpu, 3, stage_bytes, slot_back_bytes)?,
         ];
         let states_buf = gpu.storage("dp-states", (n_frames * 4) as u64);
         let score_out = gpu.storage("dp-scores", (n_frames * 4) as u64);
@@ -362,11 +442,21 @@ impl GpuDp {
                 uniform_static(5, 16),
             ],
         );
+        let trace_layout = bind_layout(
+            gpu,
+            "viterbi-trace",
+            &[
+                storage_layout(0, true),
+                storage_layout(1, false),
+                uniform_static(2, 32),
+            ],
+        );
         let init_pipe = pipe(gpu, "viterbi-init", INIT_WGSL, &init_layout)?;
         let step_pipe = pipe(gpu, "viterbi-step", STEP_WGSL, &step_layout)?;
         let gather_pipe = pipe(gpu, "viterbi-gather", GATHER_WGSL, &gather_layout)?;
+        let trace_pipe = pipe(gpu, "viterbi-trace", TRACE_WGSL, &trace_layout)?;
+        let trace_uni = gpu.uniform("dp-trace-uni", 32);
 
-        let (seg, linear) = dp_plan(n_frames, s, rb);
         let ncheck = if linear {
             (n_frames - 1) / seg + 1
         } else {
@@ -408,9 +498,12 @@ impl GpuDp {
             init_pipe,
             step_pipe,
             gather_pipe,
+            trace_pipe,
             init_layout,
             step_layout,
             gather_layout,
+            trace_layout,
+            trace_uni,
             front: 0,
             frames: 0,
             n_frames,
@@ -593,13 +686,15 @@ impl GpuDp {
         anyhow::ensure!(n_kept >= 1, "empty viterbi window");
         anyhow::ensure!(
             n_kept <= BACK_CAP,
-            "window has {n_kept} frames; gpu viterbi caps a window at {BACK_CAP}"
+            "viterbi submit has {n_kept} frames; the per-submit cap is {BACK_CAP}"
         );
         let slot_i = self.windows % PIPE_DEPTH;
         anyhow::ensure!(
             self.slots[slot_i].flight.is_none(),
             "viterbi slot {slot_i} is still mapped"
         );
+        let prof = dp_prof::enabled();
+        let t_rec = prof.then(std::time::Instant::now);
         let stride = u32::try_from(vocab).context("vocab")?;
         let mut kinds = Vec::with_capacity(n_kept);
         let mut cfgs = Vec::with_capacity(n_kept);
@@ -696,12 +791,17 @@ impl GpuDp {
         let mut front = self.front;
         let step_groups = self.s.div_ceil(16).div_ceil(256).max(1);
         let init_groups = self.s.div_ceil(256).max(1);
+        // One compute pass for the window's frames; dispatches inside a pass
+        // are ordered with full memory visibility, so the alpha ping-pong is
+        // exact without a pass boundary per frame. Checkpoint copies are
+        // encoder-level commands and split the pass where they fall — at most
+        // one per window for any real segment length.
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("viterbi-frames"),
+            timestamp_writes: None,
+        });
         for (i, &is_step) in kinds.iter().enumerate() {
             let off = (i * uni) as u32;
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("viterbi-frame"),
-                timestamp_writes: None,
-            });
             if is_step {
                 pass.set_pipeline(&self.step_pipe);
                 let bg = if front == 0 { &bg01 } else { &bg10 };
@@ -714,14 +814,25 @@ impl GpuDp {
                 pass.dispatch_workgroups(init_groups, 1, 1);
                 front = 0;
             }
-            drop(pass);
-            if self.linear {
-                let global = self.frames + i;
-                if global % self.seg == 0 {
-                    let row = self.s as u64 * 8;
-                    let k = (global / self.seg) as u64;
-                    enc.copy_buffer_to_buffer(&self.alpha[front], 0, &self.ckpt, k * row, row);
-                }
+            let global = self.frames + i;
+            if self.linear && global % self.seg == 0 && i + 1 < n_kept {
+                drop(pass);
+                let row = self.s as u64 * 8;
+                let k = (global / self.seg) as u64;
+                enc.copy_buffer_to_buffer(&self.alpha[front], 0, &self.ckpt, k * row, row);
+                pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("viterbi-frames"),
+                    timestamp_writes: None,
+                });
+            }
+        }
+        drop(pass);
+        if self.linear {
+            let last_global = self.frames + n_kept - 1;
+            if last_global % self.seg == 0 {
+                let row = self.s as u64 * 8;
+                let k = (last_global / self.seg) as u64;
+                enc.copy_buffer_to_buffer(&self.alpha[front], 0, &self.ckpt, k * row, row);
             }
         }
         if back_bytes > 0 {
@@ -735,6 +846,10 @@ impl GpuDp {
         }
         let index = gpu.queue.submit([enc.finish()]);
         drop((bg_init, bg01, bg10));
+        if let Some(t) = t_rec {
+            dp_prof::add(&dp_prof::RECORD_US, t.elapsed());
+        }
+        let t_sub = prof.then(std::time::Instant::now);
         // Validation is reported on a non-blocking poll. Waiting here would
         // drain the encoder this DP was queued behind.
         gpu.device
@@ -774,6 +889,9 @@ impl GpuDp {
         self.front = front;
         self.frames += n_kept;
         self.windows += 1;
+        if let Some(t) = t_sub {
+            dp_prof::add(&dp_prof::SUBMIT_US, t.elapsed());
+        }
         Ok(())
     }
 
@@ -785,24 +903,8 @@ impl GpuDp {
         self.seg
     }
 
-    pub(crate) fn row_bytes(&self) -> usize {
-        self.rb
-    }
-
     pub(crate) fn state_count(&self) -> usize {
         self.s as usize
-    }
-
-    pub(crate) fn back_stride(&self) -> u64 {
-        self.rb_u32 as u64 * 4
-    }
-
-    pub(crate) fn device_back(&self) -> &wgpu::Buffer {
-        &self.back
-    }
-
-    pub(crate) fn map_back(&self, slot: usize) -> &wgpu::Buffer {
-        &self.slots[slot].back
     }
 
     pub(crate) fn checkpoint(&self, k: usize) -> Result<&[f64]> {
@@ -828,8 +930,13 @@ impl GpuDp {
         Ok(())
     }
 
-    /// Record `n` step frames whose logits are packed at rows `0..n`. The
+    /// Record `n` step frames whose logits are packed at rows `0..n`, writing
+    /// choice rows `back_row0..back_row0+n` of the device back buffer. The
     /// caller submits the encoder. Bind groups must stay alive until then.
+    ///
+    /// All frames share one compute pass: dispatches within a pass are ordered
+    /// with full memory visibility (WebGPU), and the per-frame pass boundaries
+    /// this replaced cost CPU recording time on every window of the file.
     pub(crate) fn record_steps(
         &mut self,
         gpu: &Gpu,
@@ -837,6 +944,7 @@ impl GpuDp {
         logits: &wgpu::Buffer,
         vocab: usize,
         n: usize,
+        back_row0: usize,
     ) -> Result<StepBinds> {
         anyhow::ensure!(n >= 1 && n <= BACK_CAP, "replay chunk {n}");
         let stride = u32::try_from(vocab).context("vocab")?;
@@ -848,7 +956,7 @@ impl GpuDp {
                 stride,
                 row: u32::try_from(local).context("replay row")?,
                 mode: 0,
-                back_row: u32::try_from(local).context("replay back row")?,
+                back_row: u32::try_from(back_row0 + local).context("replay back row")?,
                 rb_u32: self.rb_u32,
                 pad0: 0,
                 pad1: 0,
@@ -890,53 +998,72 @@ impl GpuDp {
         });
         let mut front = self.front;
         let groups = self.s.div_ceil(16).div_ceil(256).max(1);
-        for local in 0..n {
-            let off = (local * uni) as u32;
+        {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("viterbi-replay-frame"),
+                label: Some("viterbi-replay-frames"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.step_pipe);
-            let bg = if front == 0 { &g0 } else { &g1 };
-            pass.set_bind_group(0, bg, &[off]);
-            pass.dispatch_workgroups(groups, 1, 1);
-            front ^= 1;
+            for local in 0..n {
+                let off = (local * uni) as u32;
+                let bg = if front == 0 { &g0 } else { &g1 };
+                pass.set_bind_group(0, bg, &[off]);
+                pass.dispatch_workgroups(groups, 1, 1);
+                front ^= 1;
+            }
         }
         self.front = front;
         Ok(StepBinds { _g0: g0, _g1: g1 })
     }
 
-    /// Map one replay chunk's choices into `dst` (compact rows, no device padding).
-    pub(crate) fn read_mapped_back(
-        &self,
-        gpu: &Gpu,
-        slot: usize,
-        index: wgpu::SubmissionIndex,
-        rx: &Receiver<Result<(), wgpu::BufferAsyncError>>,
-        n_rows: usize,
-        dst: &mut [u8],
-    ) -> Result<()> {
-        gpu.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(index),
-                timeout: None,
-            })
-            .map_err(|e| anyhow::anyhow!("poll for viterbi traceback: {e}"))?;
-        recv_map(rx, gpu)?;
-        let stride = self.rb_u32 as usize * 4;
-        let take = n_rows * stride;
-        anyhow::ensure!(dst.len() == n_rows * self.rb, "replay row width");
+    /// Record the segment's device-side traceback: one thread walks the
+    /// choice rows this segment's replay just wrote, backwards from
+    /// `states[hi]`, leaving `states[lo-1..hi-1]` on the device. Submitted,
+    /// not waited on — segments chain through `states_buf` itself and the
+    /// whole state path is read back once at the end of the traceback.
+    pub(crate) fn trace_segment(&mut self, gpu: &Gpu, lo: usize, hi: usize) -> Result<()> {
+        let cfg = TraceCfg {
+            lo: u32::try_from(lo).context("trace lo")?,
+            hi: u32::try_from(hi).context("trace hi")?,
+            t_len: u32::try_from(self.n_frames).context("trace t_len")?,
+            rb_u32: self.rb_u32,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+            pad3: 0,
+        };
+        gpu.queue.write_buffer(&self.trace_uni, 0, bytemuck::bytes_of(&cfg));
+        let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("viterbi-trace"),
+            layout: &self.trace_layout,
+            entries: &[
+                buf_entry(0, &self.back),
+                buf_entry(1, &self.states_buf),
+                buf_entry(2, &self.trace_uni),
+            ],
+        });
+        let guard = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("viterbi-trace"),
+        });
         {
-            let slice = self.slots[slot].back.slice(..map_end(take));
-            let mapped = slice.get_mapped_range()?;
-            anyhow::ensure!(mapped.len() >= take, "replay readback short");
-            for row in 0..n_rows {
-                let src = row * stride;
-                let at = row * self.rb;
-                dst[at..at + self.rb].copy_from_slice(&mapped[src..src + self.rb]);
-            }
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("viterbi-trace"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.trace_pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
         }
-        self.slots[slot].back.unmap();
+        gpu.queue.submit([enc.finish()]);
+        drop(bg);
+        gpu.device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|e| anyhow::anyhow!("poll for viterbi trace: {e}"))?;
+        if let Some(e) = pollster::block_on(guard.pop()) {
+            let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+            bail!("gpu viterbi trace: {e}");
+        }
         Ok(())
     }
 
@@ -1298,6 +1425,71 @@ impl Drop for BackStore {
 }
 
 static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Env-gated (`CTC_DP_PROF=1`) phase counters for the GPU DP. The counters
+/// answer one question — where does the DP's wall time go — and cost one
+/// relaxed atomic load per call when profiling is off.
+pub(crate) mod dp_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static ON: AtomicU64 = AtomicU64::new(2); // 2 = unchecked, 1 = on, 0 = off
+
+    pub(crate) static RECORD_US: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SUBMIT_US: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TRACE_US: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static SCORES_US: AtomicU64 = AtomicU64::new(0);
+
+    fn on() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            1 => true,
+            0 => false,
+            _ => {
+                let flag = std::env::var("CTC_DP_PROF").ok().as_deref() == Some("1");
+                ON.store(if flag { 1 } else { 0 }, Ordering::Relaxed);
+                flag
+            }
+        }
+    }
+
+    /// Profiling gate, read once per call. Pair with [`add`]: `let t =
+    /// enabled().then(Instant::now); … add(&CELL, t.unwrap().elapsed())` —
+    /// no closures, so the timed region keeps its natural variable scopes.
+    pub(crate) fn enabled() -> bool {
+        on()
+    }
+
+    pub(crate) fn add(cell: &AtomicU64, d: Duration) {
+        if on() {
+            cell.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Time `f` into `cell` when profiling is on; run `f` bare otherwise.
+    pub(crate) fn time<R>(cell: &AtomicU64, f: impl FnOnce() -> R) -> R {
+        if !on() {
+            return f();
+        }
+        let t = std::time::Instant::now();
+        let r = f();
+        cell.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        r
+    }
+
+    pub(crate) fn dump(label: &str) {
+        if !on() {
+            return;
+        }
+        let us = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        eprintln!(
+            "[dp-prof] {label}: record+submit {:.3}s, poll+map {:.3}s, traceback {:.3}s, scores {:.3}s",
+            us(&RECORD_US),
+            us(&SUBMIT_US),
+            us(&TRACE_US),
+            us(&SCORES_US),
+        );
+    }
+}
 
 fn fill_ninf(gpu: &Gpu, buf: &wgpu::Buffer, n: usize) {
     let bits = f64::NEG_INFINITY.to_le_bytes();
