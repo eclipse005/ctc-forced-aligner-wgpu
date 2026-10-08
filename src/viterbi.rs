@@ -14,6 +14,8 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::progress::{DpProgress, ProgressState, Stage};
+
 /// One aligned token and its time span.
 #[derive(Debug, Clone)]
 pub struct TokenAlignment {
@@ -676,7 +678,7 @@ pub(crate) fn ctc_forced_align(
 ) -> anyhow::Result<AlignmentResult> {
     let labels = build_expanded_labels(token_ids, blank_id);
     let em = FullRows { log_probs, vocab, labels: &labels, blank_id };
-    align(&em, num_frames, &labels, blank_id, usize::MAX, token_ids, frame_rate, pieces, return_path)
+    align(&em, num_frames, &labels, blank_id, usize::MAX, token_ids, frame_rate, pieces, return_path, None, None, 0)
 }
 
 /// Force-align against a pre-gathered (T, S) score matrix with
@@ -710,7 +712,7 @@ pub(crate) fn ctc_forced_align_gathered(
         .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
         .collect();
     let em = GatheredRows { gathered, num_states };
-    align(&em, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate, pieces, false)
+    align(&em, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate, pieces, false, None, None, 0)
 }
 
 /// Same DP over [`GatheredChunks`]: the per-window blocks the aligner
@@ -734,7 +736,7 @@ pub(crate) fn ctc_forced_align_gathered_chunks(
     let labels: Vec<usize> = (0..num_states)
         .map(|st| if st % 2 == 0 { usize::MAX } else { token_ids[(st - 1) / 2] })
         .collect();
-    align(&chunks, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate, pieces, false)
+    align(&chunks, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate, pieces, false, None, None, 0)
 }
 
 
@@ -1245,23 +1247,90 @@ fn viterbi_budget() -> usize {
     }
 }
 
-fn segment_len(t_len: usize, s: usize, rb: usize) -> usize {
-    segment_len_with(viterbi_budget(), t_len, s, rb)
+/// `(segment length, recompute)`. `reserved` is false when the full table
+/// fits the budget on paper but `try_reserve_exact` did not get the memory.
+/// That run takes the linear plan, same as a budget that never fitted.
+fn plan_with_reserve(
+    t_len: usize,
+    s: usize,
+    rb: usize,
+    budget: usize,
+    reserved: bool,
+) -> (usize, bool) {
+    let t_len = t_len.max(1);
+    let nback = t_len.saturating_sub(1).saturating_mul(rb);
+    if reserved && nback.saturating_add(s.saturating_mul(8)) <= budget {
+        (t_len, false)
+    } else {
+        (segment_len_with(budget, t_len, s, rb).max(1), true)
+    }
 }
 
 /// `(segment length, recompute)`. The whole choice table stays only when it
 /// fits the fixed budget. Longer files keep an alpha checkpoint per segment
 /// and rebuild one segment of choices while tracing back, so peak DP memory
-/// does not grow with the audio.
+/// does not grow with the audio. Assumes the single-pass reserve succeeds;
+/// a failed reserve is [`plan_with_reserve`] with `reserved` false.
 pub(crate) fn dp_plan(t_len: usize, s: usize, rb: usize) -> (usize, bool) {
+    plan_with_reserve(t_len, s, rb, viterbi_budget(), true)
+}
+
+/// One traceback tick per rebuilt segment, or one tick for the single pass.
+pub(crate) fn trace_steps(t_len: usize, seg: usize, linear: bool) -> usize {
+    if linear {
+        t_len.saturating_sub(1) / seg.max(1) + 1
+    } else {
+        1
+    }
+}
+
+/// The traceback plan, with the single-pass buffer already reserved.
+///
+/// Streaming commits this before the first tick and hands it to the worker,
+/// so a reserve that fails is in the denominator instead of being discovered
+/// after encode has already counted against a one-step traceback.
+pub(crate) struct TraceCommit {
+    seg: usize,
+    linear: bool,
+    back: Vec<u8>,
+}
+
+impl TraceCommit {
+    pub(crate) fn steps(&self, t_len: usize) -> usize {
+        trace_steps(t_len, self.seg, self.linear)
+    }
+}
+
+pub(crate) fn commit_trace(t_len: usize, states: usize) -> TraceCommit {
     let t_len = t_len.max(1);
+    let rb = row_bytes(states);
     let budget = viterbi_budget();
     let nback = t_len.saturating_sub(1).saturating_mul(rb);
-    if nback.saturating_add(s.saturating_mul(8)) <= budget {
-        (t_len, false)
-    } else {
-        (segment_len_with(budget, t_len, s, rb).max(1), true)
+    let mut back = Vec::new();
+    let reserved = nback.saturating_add(states.saturating_mul(8)) <= budget
+        && back.try_reserve_exact(nback).is_ok();
+    if reserved {
+        // SAFETY: u8 has no destructor and no invalid bit patterns. Every row
+        // the traceback reads is written whole by the forward pass first.
+        unsafe { back.set_len(nback) };
     }
+    let (seg, linear) = plan_with_reserve(t_len, states, rb, budget, reserved);
+    if linear {
+        back = Vec::new();
+    }
+    TraceCommit { seg, linear, back }
+}
+
+/// How many frames the single-pass forward hands the kernel at a time. Long
+/// enough that the call's own cost is noise, short enough that a file-sized
+/// DP keeps the progress bar moving instead of parking it until the end.
+const DP_BATCH_FRAMES: usize = 256;
+
+/// Traceback ticks for this shape from [`dp_plan`]. A reserve that fails is
+/// not visible here; the DP adds those segments before it ticks them.
+pub(crate) fn traceback_steps(t_len: usize, states: usize) -> usize {
+    let (seg, linear) = dp_plan(t_len, states, row_bytes(states));
+    trace_steps(t_len, seg, linear)
 }
 
 fn segment_len_with(budget: usize, t_len: usize, s: usize, rb: usize) -> usize {
@@ -1307,10 +1376,13 @@ fn align(
     frame_rate: f64,
     pieces: Option<&[String]>,
     return_path: bool,
+    commit: Option<TraceCommit>,
+    progress: Option<&ProgressState<'_>>,
+    dp_units: usize,
 ) -> anyhow::Result<AlignmentResult> {
     align_with(
         em, t_len, labels, blank_id, star_id, token_ids, frame_rate, pieces, return_path, None,
-        None,
+        None, commit, progress, dp_units,
     )
 }
 
@@ -1323,6 +1395,9 @@ pub(crate) fn ctc_forced_align_gathered_with_word_ids(
     pieces: Option<&[String]>,
     word_ids: &[usize],
     keep_path: bool,
+    commit: Option<TraceCommit>,
+    progress: Option<&ProgressState<'_>>,
+    dp_units: usize,
 ) -> anyhow::Result<AlignmentResult> {
     let num_states = chunks.num_states;
     anyhow::ensure!(
@@ -1339,7 +1414,7 @@ pub(crate) fn ctc_forced_align_gathered_with_word_ids(
         // to the constant (on device, or row-major on the CPU tower), so the
         // DP needs no star bitmap of its own
         align(&chunks, num_frames, &labels, usize::MAX, usize::MAX, token_ids, frame_rate,
-              pieces, keep_path)
+              pieces, keep_path, commit, progress, dp_units)
     })
 }
 
@@ -1353,10 +1428,14 @@ pub(crate) fn ctc_forced_align_emissions_with_word_ids(
     frame_rate: f64,
     pieces: Option<&[String]>,
     word_ids: &[usize],
+    commit: Option<TraceCommit>,
+    progress: Option<&ProgressState<'_>>,
+    dp_units: usize,
 ) -> anyhow::Result<AlignmentResult> {
     let expanded = build_expanded_labels(token_ids, 0);
     with_word_ids(word_ids, || {
-        align(em, t_len, &expanded, 0, star_id, token_ids, frame_rate, pieces, false)
+        align(em, t_len, &expanded, 0, star_id, token_ids, frame_rate, pieces, false, commit,
+              progress, dp_units)
     })
 }
 
@@ -1399,6 +1478,9 @@ fn align_with(
     return_path: bool,
     force_seg: Option<usize>,
     force_band: Option<bool>,
+    commit: Option<TraceCommit>,
+    progress: Option<&ProgressState<'_>>,
+    dp_units: usize,
 ) -> anyhow::Result<AlignmentResult> {
     let l = token_ids.len();
     let s = labels.len();
@@ -1448,46 +1530,71 @@ fn align_with(
     let mut checkpoints: Vec<f64> = Vec::new();
     let mut back: Vec<u8> = Vec::new();
     let nback = (t_len - 1).checked_mul(rb).context("backpointer size")?;
-    let (seg, linear) = match force_seg {
-        Some(forced) => {
-            let seg = forced.max(1);
-            let linear = seg < t_len;
-            if linear {
-                checkpoints.reserve((t_len / seg + 2) * s);
-                checkpoints.extend_from_slice(&dp.prev); // alpha at frame 0
-            } else {
-                back.try_reserve_exact(nback).context("backpointer alloc")?;
-                // SAFETY: u8 has no destructor and no invalid bit patterns,
-                // and every row the traceback reads is written whole by the
-                // run below — `put_back_byte` stores bytes without reading
-                // them first.
-                unsafe { back.set_len(nback) };
-            }
-            (seg, linear)
+    // A commit already reserved (or already fell back). A forced segment is
+    // the tests' dial and does not consult either.
+    let commit = if force_seg.is_some() { None } else { commit };
+    let had_commit = commit.is_some();
+    let (seg, linear) = if let Some(forced) = force_seg {
+        let seg = forced.max(1);
+        let linear = seg < t_len;
+        if linear {
+            checkpoints.reserve((t_len / seg + 2) * s);
+            checkpoints.extend_from_slice(&dp.prev); // alpha at frame 0
+        } else {
+            back.try_reserve_exact(nback).context("backpointer alloc")?;
+            // SAFETY: u8 has no destructor and no invalid bit patterns, and
+            // every row the traceback reads is written whole by the run below.
+            unsafe { back.set_len(nback) };
         }
-        None => {
-            let budget = match std::env::var("CTC_VITERBI_BUDGET_MB").ok().as_deref()
-                .map(str::parse::<usize>)
-            {
-                Some(Ok(mb)) => mb << 20,
-                _ => DEFAULT_BUDGET,
-            };
-            if nback.saturating_add(s * 8) <= budget && back.try_reserve_exact(nback).is_ok() {
-                // SAFETY: as above — the traceback writes every row whole
-                // before reading it.
-                unsafe { back.set_len(nback) };
-                (t_len, false)
-            } else {
-                let seg = segment_len(t_len, s, rb).max(1);
-                checkpoints.reserve((t_len / seg + 2) * s);
-                checkpoints.extend_from_slice(&dp.prev); // alpha at frame 0
-                (seg, true)
-            }
+        (seg, linear)
+    } else if let Some(committed) = commit {
+        let seg = committed.seg.max(1);
+        if committed.linear {
+            checkpoints.reserve((t_len / seg + 2) * s);
+            checkpoints.extend_from_slice(&dp.prev);
+            (seg, true)
+        } else {
+            anyhow::ensure!(
+                committed.back.len() == nback,
+                "traceback commit is {} bytes, this table is {nback}",
+                committed.back.len()
+            );
+            back = committed.back;
+            (seg, false)
         }
+    } else {
+        let budget = viterbi_budget();
+        let reserved = nback.saturating_add(s.saturating_mul(8)) <= budget
+            && back.try_reserve_exact(nback).is_ok();
+        let (seg, linear) = plan_with_reserve(t_len, s, rb, budget, reserved);
+        if linear {
+            back = Vec::new();
+            checkpoints.reserve((t_len / seg + 2) * s);
+            checkpoints.extend_from_slice(&dp.prev);
+        } else {
+            // SAFETY: as above — the traceback writes every row whole before reading it.
+            unsafe { back.set_len(nback) };
+        }
+        (seg, linear)
     };
-    // Frames 1..t_len in one call: the alpha-only run (linear space) throws
-    // the choices away and keeps only the checkpoints, the single pass keeps
-    // them all.
+    // The published traceback assumed the reserve would succeed whenever the
+    // budget said it fit. A failed reserve walks more segments; add them
+    // before any tick from this function. A caller that already committed
+    // published this plan itself.
+    if !had_commit {
+        if let Some(p) = progress {
+            let extra = trace_steps(t_len, seg, linear).saturating_sub(traceback_steps(t_len, s));
+            p.grow_total(extra);
+        }
+    }
+    // The DP's own progress, frames in and the run's units out. `dp_units`
+    // is 0 where the DP rides inside the encoder's window (the fused GPU
+    // path): those frames belong to the window tick already, and counting
+    // them twice would run the bar ahead of the wall clock and strand it.
+    let mut dp_progress = progress.map(|p| DpProgress::new(p, dp_units, t_len));
+
+    // Frames 1..t_len: the alpha-only run (linear space) throws the choices
+    // away and keeps only the checkpoints, the single pass keeps them all.
     if linear {
         for t in 1..t_len {
             dp.run(t, t + 1, None);
@@ -1496,9 +1603,28 @@ fn align_with(
             if t % seg == 0 {
                 checkpoints.extend_from_slice(&dp.prev);
             }
+            // throttled inside `step`: a frame's worth of arithmetic either
+            // crosses a unit boundary (and fires) or does not
+            if let Some(p) = dp_progress.as_mut() {
+                p.step(1);
+            }
         }
     } else {
-        dp.run(1, t_len, Some(&mut back[..]));
+        // In batches, so a long single pass moves the bar while it runs
+        // instead of jumping at the end. `run` takes the rows it would have
+        // taken in one call: the backpointer slice for frames `[t, end)`.
+        let mut t = 1;
+        while t < t_len {
+            let end = (t + DP_BATCH_FRAMES).min(t_len);
+            dp.run(t, end, Some(&mut back[(t - 1) * rb..(end - 1) * rb]));
+            if let Some(p) = dp_progress.as_mut() {
+                p.step(end - t);
+            }
+            t = end;
+        }
+    }
+    if let Some(p) = dp_progress.as_mut() {
+        p.finish();
     }
 
     let score = dp.prev.clone();
@@ -1522,6 +1648,9 @@ fn align_with(
             cur = cur.saturating_sub(get_back(&back[(t - 1) * rb..t * rb], cur));
             states[t - 1] = cur as i32;
         }
+        if let Some(p) = progress {
+            p.fire(Stage::Traceback, 1);
+        }
     } else {
         // Segment k replays frames k·seg+1 ..= (k+1)·seg from the alpha at
         // frame k·seg, producing rows k·seg+1 ..= (k+1)·seg — row r comes
@@ -1539,6 +1668,11 @@ fn align_with(
                 cur = cur.saturating_sub(get_back(&seg_back[(t - lo) * rb..(t - lo + 1) * rb], cur));
                 states[t - 1] = cur as i32;
             }
+            // one segment rebuilt and walked back: a checkpoint's worth of
+            // the run's work, and the count `traceback_steps` promised
+            if let Some(p) = progress {
+                p.fire(Stage::Traceback, 1);
+            }
             if b == 0 {
                 break;
             }
@@ -1548,6 +1682,9 @@ fn align_with(
 
     let mut frame_scores = vec![0.0f64; t_len];
     em.score_path(&states, &mut frame_scores);
+    if let Some(p) = progress {
+        p.fire(Stage::Scores, 1);
+    }
     // `word_ids` is not a parameter here: [`align_with_word_ids`] puts it in the
     // `WORD_IDS` side channel for the duration of this call, and `collapse`
     // reads it from there. This call site therefore has nothing to pass.
@@ -1752,6 +1889,29 @@ mod tests {
     /// The GPU row stores 16 choices in one little-endian u32: byte i holds
     /// states 4i..4i+3, two bits each, low pair first. That is the byte
     /// `get_back` already indexes with `st >> 2`.
+    #[test]
+    fn a_failed_reserve_is_a_linear_plan_with_more_than_one_step() {
+        let t_len = 10_000usize;
+        let s = 64usize;
+        let rb = row_bytes(s);
+        let nback = (t_len - 1) * rb;
+        let budget = nback + s * 8;
+        let (seg, linear) = plan_with_reserve(t_len, s, rb, budget, false);
+        assert!(linear);
+        assert!(seg < t_len);
+        let steps = trace_steps(t_len, seg, linear);
+        assert!(steps > 1);
+        assert_eq!(trace_steps(t_len, t_len, false), 1);
+    }
+
+    #[test]
+    fn a_table_that_fits_commits_one_traceback_step() {
+        let c = commit_trace(8, 5);
+        assert!(!c.linear);
+        assert_eq!(c.steps(8), 1);
+        assert_eq!(c.back.len(), 7 * row_bytes(5));
+    }
+
     #[test]
     fn gpu_backpointer_word_matches_get_back() {
         let choices = [0u8, 1, 2, 0, 1, 1, 0, 2, 2, 0, 1, 2, 0, 2, 1, 0];
@@ -1972,6 +2132,9 @@ mod tests {
             true,
             Some(t), // single pass
             Some(true),
+            None,
+            None,
+            0,
         )
         .unwrap();
         for seg in [1usize, 2, 3, 7, 16, 31, 48, 64, 96, 97] {
@@ -1987,6 +2150,9 @@ mod tests {
                 true,
                 Some(seg),
                 Some(true),
+                None,
+                None,
+                0,
             )
             .unwrap();
             assert_eq!(
@@ -2045,12 +2211,12 @@ mod tests {
                 let em = GatheredRows { gathered: &gathered, num_states: s };
                 let full = align_with(
                     &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
-                    Some(seg), Some(false),
+                    Some(seg), Some(false), None, None, 0,
                 )
                 .unwrap();
                 let banded = align_with(
                     &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
-                    Some(seg), Some(true),
+                    Some(seg), Some(true), None, None, 0,
                 )
                 .unwrap();
                 assert_eq!(
@@ -2078,12 +2244,12 @@ mod tests {
                 };
                 let full = align_with(
                     &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
-                    Some(t_len), Some(false),
+                    Some(t_len), Some(false), None, None, 0,
                 )
                 .unwrap();
                 let banded = align_with(
                     &em, t_len, &labels, blank, usize::MAX, &token_ids, 50.0, Some(&pieces), true,
-                    Some(t_len), Some(true),
+                    Some(t_len), Some(true), None, None, 0,
                 )
                 .unwrap();
                 assert_eq!(banded.frame_path, full.frame_path, "full rows: path");

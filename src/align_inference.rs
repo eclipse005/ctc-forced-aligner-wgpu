@@ -13,29 +13,52 @@ use crate::audio::{load_audio, znorm, TARGET_SR};
 use crate::timeline::{anchor_marks, place_unmeasured};
 use crate::gpu::{Backend, DeviceSelector};
 use crate::spans::{build_segments, build_words, WordSpan};
+pub use crate::progress::{AlignProgress, Progress, Stage};
+use crate::progress::ProgressState;
 use crate::viterbi::{
-    build_expanded_labels, ctc_forced_align_emissions_with_word_ids,
-    ctc_forced_align_gathered_with_word_ids, finish_from_states,
+    build_expanded_labels, commit_trace, ctc_forced_align_emissions_with_word_ids,
+    ctc_forced_align_gathered_with_word_ids, finish_from_states, traceback_steps,
     AlignmentResult, Emissions, GatheredChunks, TokenAlignment,
 };
 use crate::vocab::Vocab;
 use crate::wav2vec2::{LmHeadCpu, Model};
 use crate::wav2vec2_gpu::GpuModel;
 
-/// Progress sink for a windowed run: `(windows done, windows total)`.
+/// How many encode windows a run has, in the unit the progress denominator
+/// counts.
 ///
-/// 报的是**窗口**不是秒：窗口数开跑前就算得出来（`div_ceil`），秒数只能估。
-/// 一小时音频按 30 s 窗口是 120 刻度，够画一条不跳的条。
-///
-/// 回调在**调用方那个线程**上、同步触发（编码那一侧），所以不需要跨线程通道；
-/// 想喂 UI 就在回调里 `send`。
-pub type AlignProgress<'a> = &'a mut dyn FnMut(usize, usize);
+/// One pass over the whole file — `--window 0`, or a window longer than the
+/// audio — is one window, so an unchunked run still has a denominator to
+/// report against instead of going silent for its whole length.
+fn window_count(waveform_len: usize, window_sec: Option<f64>) -> usize {
+    match window_sec {
+        Some(wsec) if wsec > 0.0 => {
+            let win = (wsec * TARGET_SR as f64) as usize;
+            if win > 0 && waveform_len >= win {
+                waveform_len.div_ceil(win)
+            } else {
+                1
+            }
+        }
+        _ => 1,
+    }
+}
 
-/// 火一次进度。`None`（没接回调）是一个分支，不是每窗口一次的重活。
-#[inline]
-fn report(progress: &mut Option<AlignProgress<'_>>, done: usize, total: usize) {
-    if let Some(p) = progress.as_deref_mut() {
-        p(done, total);
+/// Encoder windows, a separate Viterbi pass (`0` when that pass is inside
+/// the encoder window), traceback steps, then the score replay and the timeline.
+fn total_units(n_windows: usize, dp_windows: usize, traceback: usize) -> usize {
+    n_windows + dp_windows + traceback + 2
+}
+
+/// Frames in a trellis, whichever of the storage forms it came back in. The
+/// unchunked and short-file paths publish their denominator only once the
+/// forward has run, because the encoder's own arithmetic — not
+/// `len / subsampling` — is what decides the frame count, and this is where
+/// that answer exists.
+fn trellis_frame_count(trellis: &Trellis) -> usize {
+    match trellis {
+        Trellis::Gathered(g) => g.total_frames(),
+        Trellis::Lazy(b) => b.total_frames(),
     }
 }
 
@@ -354,10 +377,22 @@ impl Aligner {
     /// Python unchunked path); `Some(w)` uses w-second windows with
     /// `context_sec` of context on each side (matches `log_probs_chunked`).
     ///
-    /// `on_progress` is an optional [`AlignProgress`] sink — `(windows done,
-    /// windows total)`, fired once per encoded window on **this** thread, so a
-    /// UI just `send`s inside it. `None` costs nothing: `Option<&mut dyn FnMut>`
-    /// is one word, and the only added work is the branch in `report`.
+    /// `on_progress` is an optional [`AlignProgress`] sink. It fires with a
+    /// [`Progress`] every time a checkpoint is **finished**, counted against
+    /// the whole run — the encoder's windows, the Viterbi, the traceback, the
+    /// score replay, the timeline — and reaches 100 only when the last of
+    /// those is done. `done` never goes backwards. `pct()` can drop once, and
+    /// only when a backpointer reserve fails after encode ticks were already
+    /// delivered. A window is counted when its encoder rows and DP choices
+    /// are back in RAM, not when its work is queued. See [`crate::progress`].
+    ///
+    /// The sink is `Fn + Send + Sync` rather than `FnMut`. It may run on the
+    /// encoder thread or the DP worker, and it must return without waiting
+    /// for the caller — a channel send is safe, a `block_on` back onto the
+    /// thread inside `align` deadlocks, because the callback holds the
+    /// progress lock. It must not call back into this run's progress. `None`
+    /// skips the callback. The counter still moves, so a debug build can
+    /// check that the phases added up.
     ///
     /// It is a parameter and not a second `align_with_progress` because
     /// "report progress" is not a different algorithm — it is the same run with
@@ -370,7 +405,7 @@ impl Aligner {
         text: &str,
         window_sec: Option<f64>,
         context_sec: f64,
-        mut on_progress: Option<AlignProgress<'_>>,
+        on_progress: Option<AlignProgress<'_>>,
     ) -> Result<AlignOutput> {
         self.align_impl(
             audio_path,
@@ -378,7 +413,7 @@ impl Aligner {
             window_sec,
             context_sec,
             false,
-            &mut on_progress,
+            on_progress,
         )
     }
 
@@ -394,7 +429,7 @@ impl Aligner {
         text: &str,
         window_sec: Option<f64>,
         context_sec: f64,
-        mut on_progress: Option<AlignProgress<'_>>,
+        on_progress: Option<AlignProgress<'_>>,
     ) -> Result<AlignOutput> {
         self.align_impl(
             audio_path,
@@ -402,7 +437,7 @@ impl Aligner {
             window_sec,
             context_sec,
             true,
-            &mut on_progress,
+            on_progress,
         )
     }
 
@@ -413,7 +448,7 @@ impl Aligner {
         window_sec: Option<f64>,
         context_sec: f64,
         keep_path: bool,
-        progress: &mut Option<AlignProgress<'_>>,
+        on_progress: Option<AlignProgress<'_>>,
     ) -> Result<AlignOutput> {
         // One file, one fresh scratch: see `GpuModel::reset_scratch`. Within
         // this file the windows keep sharing the recorded graph.
@@ -474,15 +509,20 @@ impl Aligner {
             }
             _ => None,
         };
+        // One counter for the whole run. Each path publishes its denominator
+        // before its first tick. A reserve that fails later grows that
+        // denominator before the extra traceback ticks.
+        let progress = ProgressState::new(on_progress);
+        let n_windows = window_count(waveform.len(), window_sec);
         let t_enc = std::time::Instant::now();
         let (mut res, encode_s, align_s) = match stream {
             Some((win, kind)) => self.align_streaming(
                 waveform, win, context_sec, kind, &expanded, &star_state_idx, &ids, &pieces,
-                &word_ids, progress,
+                &word_ids, &progress,
             )?,
             None => {
                 let trellis = self.log_probs_trellis(
-                    &waveform, window_sec, context_sec, &expanded, &star_state_idx, progress,
+                    &waveform, window_sec, context_sec, &expanded, &star_state_idx, &progress,
                 )?;
                 // The DP never reads the waveform — everything it consumes is
                 // in the trellis — so free it before the traceback allocates
@@ -496,10 +536,15 @@ impl Aligner {
                     self.backend_name()
                 ));
                 let t_al = std::time::Instant::now();
+                // The Viterbi is not fused with the encoder on this path: it
+                // walks the whole trellis after it, so it owns a window's worth
+                // of units for its own forward pass on top of the encode's.
+                let dp_units = n_windows;
                 let res = match trellis {
                     Trellis::Gathered(gathered) => {
                         ctc_forced_align_gathered_with_word_ids(
-                            &gathered, &ids, self.frame_rate, Some(&pieces), &word_ids, keep_path)?
+                            &gathered, &ids, self.frame_rate, Some(&pieces), &word_ids, keep_path,
+                            None, Some(&progress), dp_units)?
                     }
                     Trellis::Lazy(blocks) => {
                         let gather = match &self.tower {
@@ -524,7 +569,7 @@ impl Aligner {
                         em.validate()?;
                         ctc_forced_align_emissions_with_word_ids(
                             &em, frames, &ids, self.vocab.star_id, self.frame_rate,
-                            Some(&pieces), &word_ids)?
+                            Some(&pieces), &word_ids, None, Some(&progress), dp_units)?
                     }
                 };
                 (res, encode_s, t_al.elapsed().as_secs_f64())
@@ -567,6 +612,20 @@ impl Aligner {
         // `segments` is cut from the very same units.
         let words = build_words(&res.tokens);
         let segments = build_segments(&res.tokens, &words);
+        // The run's last word. Everything the caller asked for now exists, so this
+        // tick reports the whole run. The assertion first: every phase has
+        // reported by here, so a count short of the promised denominator means
+        // one of them under-counted and the bar would have stranded below
+        // 100%. A wrong denominator is exactly the bug the counter exists to
+        // make impossible to ship quietly.
+        debug_assert_eq!(
+            progress.done() + 1,
+            progress.total(),
+            "the phases reported {}/{} checkpoints: the bar would stop short of 100%",
+            progress.done(),
+            progress.total(),
+        );
+        progress.fire(Stage::Finish, 1);
 
         Ok(AlignOutput {
             audio: audio_path.display().to_string(),
@@ -605,7 +664,7 @@ impl Aligner {
         context_sec: f64,
         expanded: &[usize],
         star_state_idx: &[usize],
-        progress: &mut Option<AlignProgress<'_>>,
+        progress: &ProgressState<'_>,
     ) -> Result<Trellis> {
         // The DP reads one f32 per (frame, expanded state). On the GPU the lm
         // head stays on device: the block is the gathered matrix when it fits,
@@ -622,7 +681,7 @@ impl Aligner {
                 let mut input = waveform.to_vec();
                 znorm(&mut input);
                 let mut scratch = crate::wav2vec2::Scratch::default();
-                Ok(match form {
+                let trellis = match form {
                     Form::Gathered => {
                         let g =
                             self.forward_gathered(&input, expanded, &star_state_idx, &mut scratch, None)?;
@@ -645,7 +704,15 @@ impl Aligner {
                             vec![(0usize, 0usize, rows)],
                         ))
                     }
-                })
+                };
+                // One forward over the whole file, so one window of it. The
+                // denominator is published here rather than guessed at the top:
+                // the trellis that just came back is where the run's real frame
+                // count — and therefore its real traceback — comes from.
+                let produced = trellis_frame_count(&trellis);
+                progress.set_total(total_units(1, 1, traceback_steps(produced, states)));
+                progress.fire(Stage::Encode, 1);
+                Ok(trellis)
             }
             Some(win) => self.log_probs_chunked(
                 waveform, win, context_sec, expanded, star_state_idx, form, progress,
@@ -811,7 +878,7 @@ impl Aligner {
         expanded: &[usize],
         star_state_idx: &[usize],
         form: Form,
-        progress: &mut Option<AlignProgress<'_>>,
+        progress: &ProgressState<'_>,
     ) -> Result<Trellis> {
         let ctx = (ctx_sec * TARGET_SR as f64) as usize;
         let states = expanded.len();
@@ -819,7 +886,7 @@ impl Aligner {
             let mut input = waveform.to_vec();
             znorm(&mut input);
             let mut scratch = crate::wav2vec2::Scratch::default();
-            return Ok(match form {
+            let trellis = match form {
                 Form::Lazy(kind) => {
                     let g = self.forward_lazy(&input, kind, &mut scratch)?;
                     let rows = g.len() / kind.width();
@@ -847,7 +914,12 @@ impl Aligner {
                         num_states: states,
                     })
                 }
-            });
+            };
+            // Shorter than one window: a single forward, so one window of it.
+            let produced = trellis_frame_count(&trellis);
+            progress.set_total(total_units(1, 1, traceback_steps(produced, states)));
+            progress.fire(Stage::Encode, 1);
+            return Ok(trellis);
         }
         let ctx_frames = ctx / self.subsampling;
         let win_frames = win / self.subsampling;
@@ -863,6 +935,14 @@ impl Aligner {
 
         // rows kept per window: the middle win_frames, clamped for a short one
         let kept_of = |rows: usize| (ctx_frames + win_frames).min(rows) - ctx_frames.min(rows);
+        // The run's denominator, published before the first window: this path's
+        // Viterbi walks the whole trellis after the encode (it is not fused into
+        // it), so it owns its own window's worth of units on top, and its
+        // traceback one per segment it will rebuild.
+        let kept_last = win_frames.saturating_sub(ext_frames);
+        let produced = (n_chunks - 1) * win_frames + kept_last;
+        progress.set_total(total_units(n_chunks, n_chunks, traceback_steps(produced, states)));
+
         let mut blocks: Vec<Vec<f32>> = Vec::new();
         let mut scratch = crate::wav2vec2::Scratch::default();
         // one scratch for the whole file: no per-chunk buffer churn
@@ -905,7 +985,7 @@ impl Aligner {
                                 kept_of(rows),
                             );
                         }
-                        report(progress, blocks.len(), n_chunks);
+                        progress.fire(Stage::Encode, 1);
                         start += win;
                     }
                 }
@@ -940,7 +1020,7 @@ impl Aligner {
                                     blocks[c].capacity() * 4 >> 20
                                 );
                             }
-                            report(progress, blocks.len(), n_chunks);
+                            progress.fire(Stage::Encode, 1);
                         }
                     }
                     Tower::Cpu(_) => {
@@ -961,7 +1041,7 @@ impl Aligner {
                                 blocks[c].capacity() * 4 >> 20
                             );
                         }
-                        report(progress, blocks.len(), n_chunks);
+                        progress.fire(Stage::Encode, 1);
                     }
                 }
                 start += win;
@@ -973,7 +1053,7 @@ impl Aligner {
                     Tower::Gpu(gpu) => blocks.push(gpu.collect(p)?),
                     Tower::Cpu(_) => anyhow::bail!("pending result without the GPU tower"),
                 }
-                report(progress, blocks.len(), n_chunks);
+                progress.fire(Stage::Encode, 1);
             }
         }
 
@@ -1037,7 +1117,7 @@ impl Aligner {
         kind: BlockKind,
         expanded: &[usize],
         star_state_idx: &[usize],
-        progress: &mut Option<AlignProgress<'_>>,
+        progress: &ProgressState<'_>,
         mut sink: impl FnMut(usize, Vec<f32>) -> Result<()>,
     ) -> Result<()> {
         let n = waveform.len();
@@ -1094,7 +1174,7 @@ impl Aligner {
                 }
                 sink(collected, g)?;
                 collected += 1;
-                report(progress, collected, n_chunks);
+                progress.fire(Stage::Encode, 1);
             }
             start += win;
         }
@@ -1102,7 +1182,7 @@ impl Aligner {
             let g = gpu.collect(p)?;
             sink(collected, g)?;
             collected += 1;
-            report(progress, collected, n_chunks);
+            progress.fire(Stage::Encode, 1);
         }
         debug_assert_eq!(collected, n_chunks, "the loop's window arithmetic drifted");
         Ok(())
@@ -1134,7 +1214,7 @@ impl Aligner {
         ids: &[usize],
         pieces: &[String],
         word_ids: &[usize],
-        progress: &mut Option<AlignProgress<'_>>,
+        progress: &ProgressState<'_>,
     ) -> Result<(AlignmentResult, f64, f64)> {
         if self.use_gpu_viterbi(&kind) {
             return self.align_streaming_on_gpu(
@@ -1156,6 +1236,13 @@ impl Aligner {
         // cross-check below verifies against the actual rows it produced)
         let kept_last = win_frames.saturating_sub(ext_frames);
         let frames = (n_chunks - 1) * win_frames + kept_last;
+        // The forward pass has its own units: it runs beside the encoder and
+        // can still be going after the last window is in RAM. `commit` is the
+        // plan the worker will run, so a reserve that fails is already in the
+        // denominator instead of being discovered mid-run.
+        let commit = commit_trace(frames, states);
+        let traceback = commit.steps(frames);
+        progress.set_total(total_units(n_chunks, n_chunks, traceback));
         let spans: Vec<(usize, usize, usize)> = (0..n_chunks)
             .map(|i| (i, ctx_frames, if i + 1 == n_chunks { kept_last } else { win_frames }))
             .collect();
@@ -1196,7 +1283,7 @@ impl Aligner {
                         em.validate()?;
                         ctc_forced_align_emissions_with_word_ids(
                             &em, frames, ids, self.vocab.star_id, self.frame_rate, Some(pieces),
-                            word_ids,
+                            word_ids, Some(commit), Some(progress), n_chunks,
                         )
                     }));
                     let res = match out {
@@ -1262,6 +1349,9 @@ impl Aligner {
         let encode_s = loop_end.map_or(0.0, |t| t.duration_since(t_all).as_secs_f64());
         let res = rx.recv().context("viterbi worker died without a result")?;
         let wall_s = t_all.elapsed().as_secs_f64();
+        // The worker ticks the forward pass, each rebuilt segment, and the
+        // scores, and only if its own DP returns. A dead worker therefore
+        // does not show those phases as finished.
         match enc_err {
             Some(e) => Err(e),
             // the wall clock is the span from encode start to DP end; report
@@ -1305,7 +1395,7 @@ impl Aligner {
         ids: &[usize],
         pieces: &[String],
         word_ids: &[usize],
-        progress: &mut Option<AlignProgress<'_>>,
+        progress: &ProgressState<'_>,
     ) -> Result<(AlignmentResult, f64, f64)> {
         let model = match &self.tower {
             Tower::Gpu(g) => g,
@@ -1344,9 +1434,18 @@ impl Aligner {
         // Pipeline compile on the first file is device work; count it in encode.
         let t_all = std::time::Instant::now();
         let mut dp = model.new_dp(ids, self.vocab.star_id, self.blank_id, frames)?;
+        // The DP now knows its own plan, so the run's denominator is exact
+        // before a single window moves: the windows, the traceback's segments
+        // (a whole extra DP pass on the linear plan), the score replay.
+        progress.set_total(total_units(n_chunks, 0, dp.traceback_segments()));
         let padded_len = n + 2 * ctx + extension;
         let mut start = 0usize;
         let mut i = 0usize;
+        // One encoder window can submit more than once (the DP cap is 2048
+        // frames) or not at all (a tail window that keeps no rows). A window
+        // counts when every submit it issued is back in RAM.
+        let mut owed: Vec<usize> = Vec::with_capacity(n_chunks);
+        let mut reported = 0usize;
         while start + win + 2 * ctx <= padded_len {
             let chunk = window_chunk(waveform.as_slice(), start, win, ctx);
             let n_kept = if i + 1 == n_chunks { kept_last } else { win_frames };
@@ -1357,7 +1456,8 @@ impl Aligner {
                 kept_of(rows)
             );
             i += 1;
-            report(progress, i, n_chunks);
+            owed.push(dp.submitted());
+            report_windows(progress, dp.collected(), &owed, &mut reported);
             start += win;
         }
         anyhow::ensure!(i == n_chunks, "the loop's window arithmetic drifted");
@@ -1368,6 +1468,12 @@ impl Aligner {
         );
         drop(waveform);
         model.gpu_dp_finish(&mut dp)?;
+        report_windows(progress, dp.collected(), &owed, &mut reported);
+        debug_assert_eq!(
+            reported,
+            n_chunks,
+            "every encoder window should be counted once its submits are in RAM"
+        );
         let encode_s = t_all.elapsed().as_secs_f64();
         dp.check_store()?;
         let t_tail = std::time::Instant::now();
@@ -1382,16 +1488,42 @@ impl Aligner {
                 }
             },
         )?;
+        // The linear traceback's only wait is the state readback at the end
+        // of `gpu_dp_traceback`. A segment is not finished when it is queued.
+        progress.fire(Stage::Traceback, dp.traceback_segments());
         let scores = crate::viterbi_gpu::dp_prof::time(
             &crate::viterbi_gpu::dp_prof::SCORES_US,
             || model.gpu_dp_scores(&dp, &states),
         )?;
+        progress.fire(Stage::Scores, 1);
         let res = finish_from_states(
             &states, total, &scores, ids, self.frame_rate, Some(pieces), word_ids,
         );
         let align_s = t_tail.elapsed().as_secs_f64();
         crate::viterbi_gpu::dp_prof::dump("gpu dp");
         Ok((res, encode_s, align_s))
+    }
+}
+
+/// Largest index into cumulative submit counts that `collected` has reached.
+fn windows_ready(collected: usize, owed: &[usize], reported: usize) -> usize {
+    let mut n = reported;
+    while n < owed.len() && collected >= owed[n] {
+        n += 1;
+    }
+    n
+}
+
+fn report_windows(
+    progress: &ProgressState<'_>,
+    collected: usize,
+    owed: &[usize],
+    reported: &mut usize,
+) {
+    let ready = windows_ready(collected, owed, *reported);
+    if ready > *reported {
+        progress.fire(Stage::Encode, ready - *reported);
+        *reported = ready;
     }
 }
 
@@ -2257,26 +2389,81 @@ mod tests {
 
     #[test]
     fn the_progress_sink_passes_the_ticks_through_untouched() {
-        // 回调收到的必须就是循环数出来的那两个数：`done` 是**已经编完的窗口数**
-        // （不是下一个的下标），`total` 在整个 run 里不变。一个画成 12/42 的进度
-        // 条要求这两件事都是真的。
-        let mut seen: Vec<(usize, usize)> = Vec::new();
-        {
-            let mut sink = |done: usize, total: usize| seen.push((done, total));
-            let mut slot = Some(&mut sink as AlignProgress<'_>);
-            for done in 1..=3 {
-                report(&mut slot, done, 3);
-            }
-        }
-        assert_eq!(seen, vec![(1, 3), (2, 3), (3, 3)]);
+        // 回调收到的必须就是整条 run 的 `(done, total)`：`done` 单调递增，
+        // `total` 在整条 run 里不变。一个画成 12/42 的进度条要求这两件事
+        // 都是真的。
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tap = seen.clone();
+        let sink = move |p: Progress| tap.lock().unwrap().push((p.done, p.total));
+        let state = ProgressState::new(Some(&sink));
+        state.set_total(5);
+        state.fire(Stage::Encode, 3);
+        state.fire(Stage::Traceback, 1);
+        state.fire(Stage::Finish, 1);
+        assert_eq!(*seen.lock().unwrap(), vec![(3, 5), (4, 5), (5, 5)]);
     }
 
     #[test]
     fn no_sink_is_a_no_op_not_a_crash() {
-        // `align()` 走的正是这个分支：一小时的 run 也要照跑不误。
-        let mut slot: Option<AlignProgress<'_>> = None;
-        report(&mut slot, 1, 120);
-        report(&mut slot, 120, 120);
+        // `align(..., None)` still has to satisfy the end-of-run check.
+        let state = ProgressState::new(None);
+        state.set_total(4);
+        state.fire(Stage::Encode, 2);
+        state.fire(Stage::Traceback, 1);
+        assert_eq!(state.done() + 1, state.total());
+        state.fire(Stage::Finish, 1);
+        assert_eq!(state.done(), state.total());
+    }
+
+    /// A window counts when its submits are collected, not once per submit.
+    /// A tail that keeps no rows shares the previous cumulative and still counts.
+    #[test]
+    fn a_window_counts_when_its_submits_are_collected() {
+        // Two submits, then one, then a zero-submit tail.
+        let owed = [2usize, 3, 3];
+        assert_eq!(windows_ready(0, &owed, 0), 0);
+        assert_eq!(windows_ready(1, &owed, 0), 0);
+        assert_eq!(windows_ready(2, &owed, 0), 1);
+        assert_eq!(windows_ready(3, &owed, 1), 3);
+        assert_eq!(windows_ready(0, &[0], 0), 1);
+    }
+
+    /// 一个整条 run 的分母必须够用：所有阶段加起来正好是它，`Finish` 落在
+    /// 100%。分母少算会让条提前到顶，多算会让条停在 99%。
+    #[test]
+    fn the_denominator_covers_every_phase_and_lands_on_one_hundred() {
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tap = got.clone();
+        let sink = move |p: Progress| tap.lock().unwrap().push(p.pct());
+        let state = ProgressState::new(Some(&sink));
+        // 31 windows, a DP that walks the file again, one rebuilt segment.
+        state.set_total(total_units(31, 31, 1));
+        for _ in 0..31 {
+            state.fire(Stage::Encode, 1);
+        }
+        let mut dp = crate::progress::DpProgress::new(&state, 31, 31 * 750);
+        dp.step(31 * 750);
+        dp.finish();
+        state.fire(Stage::Traceback, 1);
+        state.fire(Stage::Scores, 1);
+        state.fire(Stage::Finish, 1);
+
+        let seen = got.lock().unwrap().clone();
+        assert_eq!(seen.last().copied(), Some(100), "the run must end at 100: {seen:?}");
+        assert!(
+            seen.windows(2).all(|w| w[1] >= w[0]),
+            "the bar went backwards: {seen:?}"
+        );
+    }
+
+    /// `--window 0` 整文件一次前向：不能一个刻度都不发，那是一整段静默。
+    #[test]
+    fn an_unchunked_run_still_has_a_denominator() {
+        assert_eq!(window_count(16000 * 900, None), 1);
+        assert_eq!(window_count(16000 * 900, Some(0.0)), 1);
+        // A window longer than the audio is one forward, not zero windows.
+        assert_eq!(window_count(16000 * 10, Some(30.0)), 1);
+        assert_eq!(window_count(16000 * 900, Some(30.0)), 30);
     }
 
     /// The whole point of putting a timestamp on text: the text must come out
@@ -2501,9 +2688,9 @@ mod tests {
         // one target per word is what the synthetic paths mean
         let word_ids: Vec<usize> = (0..token_ids.len()).collect();
         let want = ctc_forced_align_gathered_with_word_ids(
-            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false, None, None, 0).unwrap();
         let got =
-            ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, usize::MAX, 50.0, Some(&pieces), &word_ids).unwrap();
+            ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, usize::MAX, 50.0, Some(&pieces), &word_ids, None, None, 0).unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());
         for (g, w) in got.tokens.iter().zip(&want.tokens) {
@@ -2648,9 +2835,9 @@ mod tests {
         // and the two forms have to agree on the whole alignment
         let word_ids: Vec<usize> = (0..token_ids.len()).collect();
         let want = ctc_forced_align_gathered_with_word_ids(
-            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false, None, None, 0).unwrap();
         let got = ctc_forced_align_emissions_with_word_ids(
-            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids).unwrap();
+            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids, None, None, 0).unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());
         for (g, w) in got.tokens.iter().zip(&want.tokens) {
@@ -2739,8 +2926,8 @@ mod tests {
         // one target per word is what the synthetic paths mean
         let word_ids: Vec<usize> = (0..token_ids.len()).collect();
         let want = ctc_forced_align_gathered_with_word_ids(
-            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
-        let got = ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, usize::MAX, 50.0, Some(&pieces), &word_ids)
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false, None, None, 0).unwrap();
+        let got = ctc_forced_align_emissions_with_word_ids(&em, total_kept, &token_ids, usize::MAX, 50.0, Some(&pieces), &word_ids, None, None, 0)
             .unwrap();
 
         assert_eq!(got.tokens.len(), want.tokens.len());
@@ -2846,9 +3033,9 @@ mod tests {
 
         let word_ids: Vec<usize> = (0..l).collect();
         let want = ctc_forced_align_gathered_with_word_ids(
-            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false).unwrap();
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false, None, None, 0).unwrap();
         let got = ctc_forced_align_emissions_with_word_ids(
-            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids).unwrap();
+            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids, None, None, 0).unwrap();
 
         for (g, w) in got.tokens.iter().zip(&want.tokens) {
             assert_eq!(
@@ -2954,11 +3141,11 @@ mod tests {
 
         let word_ids: Vec<usize> = (0..token_ids.len()).collect();
         let want = ctc_forced_align_gathered_with_word_ids(
-            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false,
+            &gc, &token_ids, 50.0, Some(&pieces), &word_ids, false, None, None, 0,
         )
         .unwrap();
         let got = ctc_forced_align_emissions_with_word_ids(
-            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids,
+            &em, total_kept, &token_ids, star, 50.0, Some(&pieces), &word_ids, None, None, 0,
         )
         .unwrap();
 

@@ -696,9 +696,9 @@ impl GpuModel {
 
     /// Rebuild choices from the alpha checkpoints, walking the file backwards.
     ///
-    /// Segments share the alpha buffers, so they run in order, but the next
-    /// segment is submitted before the previous one is mapped. The device
-    /// therefore does not go idle at each segment boundary.
+    /// The next segment is submitted before the previous one is mapped, so the
+    /// device does not go idle at each boundary. The state readback after the
+    /// loop is when this phase has finished.
     pub(crate) fn gpu_dp_traceback(
         &self,
         dp: &mut crate::viterbi_gpu::GpuDp,
@@ -731,8 +731,6 @@ impl GpuModel {
             bytemuck::bytes_of(&seed),
         );
         let mut b = ((t_len - 1) / seg) * seg;
-        let segments = b / seg + 1;
-        let mut queued = 0usize;
         loop {
             let k = b / seg;
             let lo = b + 1;
@@ -750,10 +748,6 @@ impl GpuModel {
                 // the replay chunks, and the next segment's trace reads the
                 // state this one leaves in states[lo-1] — no host round trip.
                 dp.trace_segment(&self.gpu, lo, hi)?;
-            }
-            queued += 1;
-            if queued == 1 || queued == segments || queued % (segments / 10).max(1) == 0 {
-                eprintln!("[align] traceback queued {queued}/{segments}");
             }
             if b == 0 {
                 break;

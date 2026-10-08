@@ -17,12 +17,13 @@ static GLOBAL: ctc_forced_aligner_wgpu::alloc_stats::Stats =
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Context, Result};
 use ctc_forced_aligner_wgpu::align_inference::{AlignOutput, Aligner};
 use ctc_forced_aligner_wgpu::render::{ass, srt};
 use ctc_forced_aligner_wgpu::views;
-use ctc_forced_aligner_wgpu::Backend;
+use ctc_forced_aligner_wgpu::{Backend, Progress};
 
 const USAGE: &str = "\
 usage: align --audio <wav> (--text <text|file>) [options]
@@ -42,8 +43,11 @@ usage: align --audio <wav> (--text <text|file>) [options]
   --list-devices           list wgpu adapters and exit
 
 Progress goes to stderr, never to stdout: one rewriting line on a terminal, or a
-line every 10% when stderr is redirected to a file. stdout stays byte-exactly
-what --format asked for.
+line every 10% when stderr is redirected to a file. The line reads
+\"pct%  done/total  stage\" over the WHOLE run, so it reaches 100% only when
+the alignment is finished — the windows count as they come back from the
+device, not as they are queued. stdout stays byte-exactly what --format asked
+for.
 ";
 
 fn main() -> Result<()> {
@@ -113,15 +117,17 @@ fn main() -> Result<()> {
 
     let t0 = std::time::Instant::now();
     let backend = Backend::parse(&device)?;
+    // The weights are a fixed few seconds and they happen before `align` can
+    // hand out a sink, so without this line the first thing a user sees is a
+    // bar appearing at 10% — which reads as "it had already done 10%".
+    eprintln!("[align] loading model from {}", model_dir.display());
     let aligner = Aligner::load_with(&model_dir, backend)
         .with_context(|| format!("load model from {}", model_dir.display()))?;
     let load_s = t0.elapsed().as_secs_f64();
 
     let out = {
-        let mut ticker = Ticker::new();
-        aligner.align(&audio, &text, window, context, Some(&mut |done, total| {
-            ticker.tick(done, total)
-        }))?
+        let ticker = Ticker::new();
+        aligner.align(&audio, &text, window, context, Some(&|p| ticker.tick(p)))?
     };
     let rtfx = out.duration / (out.encode_s + out.align_s).max(1e-9);
 
@@ -180,13 +186,14 @@ fn main() -> Result<()> {
 ///
 /// * **终端**里一行到底，用 `\r` 覆盖 —— 这是人盯着看的那种。
 /// * **重定向到文件/管道**时按 10% 打点成独立行 —— `\r` 写进日志就是一串控制符，
-///   而每窗口打一行在日志里是 120 行几乎一样的字。两个都不想要。
+///   而每个刻度打一行在日志里是一长串几乎一样的字。两个都不想要。
 ///
-/// 没有窗口可数的运行（`--window 0`）一个刻度都不发，所以这里也不会画一条永远
-/// 停在 0% 的线出来。
+/// 打的是 `pct%  done/total  stage`：`pct` 是整条 run 的百分比（不是某个阶段的），
+/// `stage` 说明这一刻在干什么 —— `viterbi` 那一段在 CPU 路径上是编码全部结束之后
+/// 才开始的，没有阶段标签的话那段时间看上去像卡死了。
 struct Ticker {
     tty: bool,
-    last_pct: u8,
+    last_pct: AtomicU8,
 }
 
 /// 非终端时每隔多少个百分点打一行。
@@ -198,13 +205,13 @@ impl Ticker {
     }
 
     fn with_tty(tty: bool) -> Self {
-        Self { tty, last_pct: 0 }
+        Self { tty, last_pct: AtomicU8::new(0) }
     }
 
     /// 这一格要不要写；返回要写的百分比。终端恒为 `Some`（每次都重写一行），
     /// 非终端才按 [`TICK_STEP`] 打点。与打印分开，是为了能在没有终端的单测里
     /// 断言「该打几次、什么时候打」——`\r` 分支在管道里永远走不到。
-    fn due(&mut self, done: usize, total: usize) -> Option<u8> {
+    fn due(&self, done: usize, total: usize) -> Option<u8> {
         if total == 0 {
             return None;
         }
@@ -212,25 +219,31 @@ impl Ticker {
         if self.tty {
             return Some(pct);
         }
-        if pct == 100 || pct >= self.last_pct + TICK_STEP {
-            self.last_pct = pct;
+        if pct == 100 || pct >= self.last_pct.load(Ordering::Relaxed) + TICK_STEP {
+            self.last_pct.store(pct, Ordering::Relaxed);
             return Some(pct);
         }
         None
     }
 
-    fn tick(&mut self, done: usize, total: usize) {
-        let Some(pct) = self.due(done, total) else {
+    fn tick(&self, p: Progress) {
+        let Some(pct) = self.due(p.done, p.total) else {
             return;
         };
+        // 行尾多两个空格：百分比 9→100 变宽，不补的话上一次会露在后面。
+        let line = format!(
+            "[align] {pct:>3}%  {}/{}  {}   ",
+            p.done.min(p.total),
+            p.total,
+            p.stage.label()
+        );
         if self.tty {
-            // 行尾多两个空格：百分比 9→100 变宽，不补的话上一次会露在后面。
-            eprint!("\r[align] {pct:>3}%  window {done}/{total}   ");
+            eprint!("\r{line}");
             if pct == 100 {
                 eprintln!();
             }
         } else {
-            eprintln!("[align] {pct:>3}%  window {done}/{total}");
+            eprintln!("[align] {pct:>3}%  {}/{}  {}", p.done.min(p.total), p.total, p.stage.label());
         }
     }
 }
@@ -259,22 +272,23 @@ fn default_model_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{TICK_STEP, Ticker};
+    use ctc_forced_aligner_wgpu::{Progress, Stage};
 
     /// 一次运行里实际会打出的每一格的百分比（非终端）。
     fn ticks(total: usize) -> Vec<u8> {
-        let mut t = Ticker::with_tty(false);
+        let t = Ticker::with_tty(false);
         (1..=total).filter_map(|done| t.due(done, total)).collect()
     }
 
-    /// `--window 0`（整文件一次前向）没有窗口可数：一个刻度都不发，
-    /// 而不是画一条永远停在 0% 的线。
+    /// 引擎报上来的 done 偶尔会越界（换了分母、旧值还在飞），夹住而不是画出
+    /// 一个 140% 的条。
     #[test]
-    fn no_windows_means_no_progress_at_all() {
-        assert_eq!(Ticker::with_tty(false).due(0, 0), None);
-        assert_eq!(Ticker::with_tty(true).due(0, 0), None);
+    fn a_done_past_the_total_clamps_instead_of_overshooting() {
+        let t = Ticker::with_tty(false);
+        assert_eq!(t.due(9, 3), Some(100));
     }
 
-    /// 日志里应该是十来行，不是 42 行几乎一样的字。
+    /// 日志里应该是十来行，不是每个刻度一行几乎一样的字。
     #[test]
     fn a_redirected_run_reports_every_ten_percent() {
         let got = ticks(42);
@@ -291,27 +305,42 @@ mod tests {
         );
     }
 
-    /// 窗口少的时候（短音频）不该只剩首尾两行——10% 的步长比整段还粗。
-    #[test]
-    fn a_short_run_reports_every_window() {
-        assert_eq!(ticks(3), vec![33, 66, 100]);
-    }
-
     /// 终端里每一格都要重写，所以每一格都给 Some。
     #[test]
-    fn a_terminal_rewrites_on_every_window() {
-        let mut t = Ticker::with_tty(true);
+    fn a_terminal_rewrites_on_every_checkpoint() {
+        let t = Ticker::with_tty(true);
         let got: Vec<Option<u8>> = (1..=42).map(|d| t.due(d, 42)).collect();
-        assert_eq!(got.len(), 42, "the tty branch must never skip a window");
+        assert_eq!(got.len(), 42, "the tty branch must never skip a tick");
         assert!(got.iter().all(|p| p.is_some()));
         assert_eq!(*got.last().unwrap(), Some(100));
     }
 
-    /// 引擎报上来的 done 偶尔会越界（换了分母、旧值还在飞），夹住而不是画出
-    /// 一个 140% 的条。
+    /// 一条只有几个刻度的 run（比如 `--window 0`）不该只剩首尾两行——10% 的步长
+    /// 比整段还粗。这种 run 的 `done` 也会很小，引擎照实报，这里照实打。
     #[test]
-    fn a_done_past_the_total_clamps_instead_of_overshooting() {
-        let mut t = Ticker::with_tty(false);
-        assert_eq!(t.due(9, 3), Some(100));
+    fn a_short_run_reports_every_checkpoint() {
+        assert_eq!(ticks(3), vec![33, 66, 100]);
+    }
+
+    /// 没有分母不是画一条永远停在 0% 的线，而是一个刻度都不发。
+    #[test]
+    fn no_denominator_is_no_progress_at_all() {
+        assert_eq!(Ticker::with_tty(false).due(0, 0), None);
+        assert_eq!(Ticker::with_tty(true).due(0, 0), None);
+    }
+
+    /// `Progress::pct()` 与 Ticker 自己算的是同一个数：库给百分比、CLI 也只
+    /// 认百分比，两边不能各算一套。
+    #[test]
+    fn the_ticker_and_the_library_agree_on_the_percentage() {
+        let t = Ticker::with_tty(true);
+        for (done, total) in [(0, 42usize), (1, 42), (7, 42), (31, 31), (5, 9), (9, 3)] {
+            let p = Progress { stage: Stage::Encode, done, total };
+            assert_eq!(
+                t.due(p.done, p.total),
+                Some(p.pct()),
+                "disagreed at {done}/{total}"
+            );
+        }
     }
 }

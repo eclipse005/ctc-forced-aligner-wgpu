@@ -111,7 +111,7 @@ for t in &out.tokens {
 
 API 就这些：`Aligner` 加载与运行、`AlignOutput` 读结果、`TokenAlignment` 一个时间单元、`DeviceSelector` 选设备、`list_targets` 列设备。字幕是 `views::build_cues` 经 `render::srt` 或 `render::ass` 渲染。**其余一律 `pub(crate)`**——模型、Viterbi、边界规则、词句切分，全都不是对 crate 之外的承诺。
 
-`align` 的窗口与上下文长度以秒为单位（窗口传 `None` 表示整文件一次前向）。最后一个参数是可选的 `AlignProgress` 回调——`&mut dyn FnMut(done, total)`，每编完一个窗口在**调用方线程**上触发一次；分母是**窗口数**不是秒，因为窗口数开跑前就数得出来，秒只能估。传 `None` 的代价是每窗口一个分支。`TokenAlignment` 携带 `piece`、`start`、`end`、`start_frame`、`end_frame`、`word_id` 以及逐帧均值 `score`。`align_with_path` 额外返回逐帧状态路径——与参考实现对拍时比对的就是它。完整 API 见 `cargo doc`。
+`align` 的窗口与上下文长度以秒为单位（窗口传 `None` 表示整文件一次前向）。最后一个参数是可选的 `AlignProgress` 回调——`&(dyn Fn(Progress) + Send + Sync)`——每完成一个检查点触发一次，计数覆盖**整条 run**：编码的窗口、Viterbi、回溯、分数回放、时间线。`Progress` 带 `stage` / `done` / `total` / `pct()`，只要一个数字的读 `pct()`，要带阶段标签的读 `stage`。单位是**一个窗口**：开跑前就数得出来，所以分母永远不是猜的。窗口在编码行和 DP 的选择都**落回内存**之后才计数，而不是提交之后——否则还挂在设备上的那几个窗口正好是进度条已经算过的那几个，条会停在 100% 而活还没干完。传 `None` 则不调用回调。`TokenAlignment` 携带 `piece`、`start`、`end`、`start_frame`、`end_frame`、`word_id` 以及逐帧均值 `score`。`align_with_path` 额外返回逐帧状态路径——与参考实现对拍时比对的就是它。完整 API 见 `cargo doc`。
 
 ### 代码怎么分层
 

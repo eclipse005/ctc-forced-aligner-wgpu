@@ -76,6 +76,7 @@ pub mod alloc_stats;
 pub mod audio;
 pub mod config;
 pub mod gpu;
+pub mod progress;
 pub mod render;
 pub mod resample_sinc;
 pub mod shaders;
@@ -103,7 +104,8 @@ mod golden;
 #[cfg(test)]
 mod testutil;
 
-pub use align_inference::{AlignOutput, AlignProgress, Aligner};
+pub use align_inference::{AlignOutput, Aligner};
 pub use gpu::{list_targets, Backend, DeviceSelector};
+pub use progress::{AlignProgress, Progress, Stage};
 pub use spans::{WordSpan, build_words};
 pub use viterbi::TokenAlignment;

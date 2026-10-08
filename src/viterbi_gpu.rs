@@ -546,6 +546,30 @@ impl GpuDp {
             .with_context(|| format!("hidden archive has {} rows, need {frame}+{n}", self.hidden_host.len() / self.hidden.max(1)))
     }
 
+    /// DP submits whose rows are back in RAM. One encoder window may be more
+    /// than one submit when it exceeds the per-submit frame cap.
+    pub(crate) fn collected(&self) -> usize {
+        self.collected
+    }
+
+    /// DP submits issued so far.
+    pub(crate) fn submitted(&self) -> usize {
+        self.windows
+    }
+
+    /// How many traceback steps this file's plan has: one per segment it
+    /// rebuilds on the linear-space plan, one for the single pass. The run's
+    /// progress denominator needs this before the traceback starts, so it
+    /// reads `n_frames` — the plan's own answer — and not `frames`, which is
+    /// the running count of frames *submitted* and is still zero here.
+    pub(crate) fn traceback_segments(&self) -> usize {
+        if self.linear {
+            (self.n_frames.saturating_sub(1)) / self.seg.max(1) + 1
+        } else {
+            1
+        }
+    }
+
     pub(crate) fn check_store(&self) -> Result<()> {
         anyhow::ensure!(
             self.hidden_host.len() == self.frames * self.hidden,
@@ -1147,21 +1171,6 @@ impl GpuDp {
             self.backs.push(&packed)?;
         }
         self.collected += 1;
-        if self.collected == 1 || self.collected % 16 == 0 {
-            let hid = (self.hidden_host.len() * 4) as f64 / (1024.0 * 1024.0);
-            if self.linear {
-                eprintln!(
-                    "[align] dp windows {}, hidden {hid:.0} MB, choices not stored",
-                    self.collected
-                );
-            } else {
-                let (ram, disk) = self.backs.megabytes();
-                eprintln!(
-                    "[align] dp windows {}, backpointers {ram:.0} MB ram + {disk:.0} MB spilled, hidden {hid:.0} MB",
-                    self.collected
-                );
-            }
-        }
         Ok(())
     }
 
