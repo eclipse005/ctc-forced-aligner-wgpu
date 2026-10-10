@@ -473,4 +473,47 @@ mod tests {
         assert_eq!(text, ["用", "Whisper", "和", "GPT"]);
         assert_eq!(rendered(&words), "用 Whisper 和 GPT");
     }
+
+    /// Korean is whitespace-delimited (eojeol), like Latin: Hangul syllables in
+    /// one source word stay one unit. Splitting them the way Han is split turned
+    /// `이번` into `이` `번`.
+    #[test]
+    fn korean_eojeol_stay_whole_like_latin_words() {
+        // transcript: "자 이번 참가자는"
+        let t = tokens(&[&["자"], &["이", "번"], &["참", "가", "자", "는"]]);
+        let words = build_words(&t);
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["자", "이번", "참가자는"]);
+        assert!(!words[0].space_before);
+        assert!(words[1].space_before);
+        assert!(words[2].space_before);
+        assert_eq!(rendered(&words), "자 이번 참가자는");
+    }
+
+    /// Chinese stays character-level even when the transcript has spaces
+    /// between words (or none).
+    #[test]
+    fn chinese_stays_character_level() {
+        let t = tokens(&[&["你", "好"], &["世", "界"]]);
+        let words = build_words(&t);
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["你", "好", "世", "界"]);
+        assert!(!words[0].space_before);
+        assert!(!words[1].space_before, "no gap inside 你好");
+        assert!(words[2].space_before, "transcript space before 世界");
+        assert!(!words[3].space_before);
+        assert_eq!(rendered(&words), "你好 世界");
+    }
+
+    /// English words stay whole units (regression guard alongside Hangul).
+    #[test]
+    fn english_words_stay_whole() {
+        let t = tokens(&[&["h", "e", "l", "l", "o"], &["w", "o", "r", "l", "d"]]);
+        let words = build_words(&t);
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["hello", "world"]);
+        assert!(!words[0].space_before);
+        assert!(words[1].space_before);
+        assert_eq!(rendered(&words), "hello world");
+    }
 }

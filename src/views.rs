@@ -668,10 +668,10 @@ mod tests {
 
     #[test]
     fn stars_never_reach_the_cue_text() {
-        // The `segment` placement the port picks for Hangul/Chinese puts a star
-        // in front of every word. It is the only word-boundary signal left
-        // (the tokenizer drops the transcript's spaces), so it has to become
-        // the boundary AND stay out of the rendered text.
+        // The `segment` placement the port picks for Chinese puts a star in
+        // front of every word. It is the only word-boundary signal left (the
+        // tokenizer drops the transcript's spaces), so it has to become the
+        // boundary AND stay out of the rendered text.
         let tokens = words_from(&[&["<star>", "你", "好"], &["<star>", "世", "界"]]);
         let words = cue_tokens(&tokens);
         assert!(words.iter().all(|w| w.splittable));
