@@ -8,20 +8,19 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Scripts written without spaces between words, which is what makes the
-/// reference place `<star>` between segments rather than at the edges.
+/// Scripts written without spaces between words: Chinese (Han) and Japanese
+/// (Kana). Those stay character-level units. Hangul is *not* included — Korean
+/// is whitespace-delimited like Latin (eojeol), so a transcript space keeps
+/// `이번` as one unit rather than splitting it into `이` `번`.
 ///
 /// Deliberately narrower than "not ASCII": a transcript mixing Latin and Han
-/// ("hello 你好") still needs the segment rule, and Thai / Kana / Hangul are
-/// spaced inconsistently enough that treating them as word-delimited would put
-/// a star where the reference has none.
+/// ("hello 你好") still needs the unspaced-script rule for the Han run.
 pub(crate) fn is_cjk(c: char) -> bool {
     let n = c as u32;
     (0x3040..=0x30FF).contains(&n)      // kana
         || (0x3400..=0x4DBF).contains(&n)  // CJK ext A
         || (0x4E00..=0x9FFF).contains(&n)  // CJK
         || (0xF900..=0xFAFF).contains(&n)  // compatibility
-        || (0xAC00..=0xD7AF).contains(&n)  // hangul syllables
         || (0x20000..=0x2A6DF).contains(&n) // CJK ext B
 }
 
