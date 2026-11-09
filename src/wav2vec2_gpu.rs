@@ -461,13 +461,17 @@ impl GpuModel {
         };
         // One GEMM schedule for the whole model, picked once at load; the
         // swept result and why the alternatives lost live on `GemmVariant`.
-        let variant = shaders::pick_gemm_variant();
+        // The adapter's workgroup-storage limit is an input to both the
+        // choice and the shader generation, so a tile that cannot compile on
+        // this backend is refused before any pipeline is created.
+        let max_storage = gpu.device.limits().max_compute_workgroup_storage_size;
+        let variant = shaders::pick_gemm_variant(max_storage);
         let (gemm_mt, gemm_nt) = shaders::gemm_tile(variant);
         let pipes = Pipe {
-            gemm: mk_gemm(&shaders::gemm_variant(variant), "gemm")?,
-            conv_gemm: mk_gemm(&shaders::conv_gemm_variant(variant), "conv_gemm")?,
+            gemm: mk_gemm(&shaders::gemm_variant(variant, max_storage), "gemm")?,
+            conv_gemm: mk_gemm(&shaders::conv_gemm_variant(variant, max_storage), "conv_gemm")?,
             conv0: mk(&shaders::conv0(), "conv0")?,
-            pos_conv: mk_gemm(&shaders::pos_conv(), "pos_conv")?,
+            pos_conv: mk_gemm(&shaders::pos_conv(max_storage), "pos_conv")?,
             ln: mk(&shaders::layernorm(), "ln")?,
             ln_sd: mk(&shaders::layernorm_sd(), "ln_sd")?,
             add: mk(&shaders::add(), "add")?,

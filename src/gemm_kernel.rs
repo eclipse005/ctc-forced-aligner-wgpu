@@ -8,6 +8,12 @@
 //!
 //! Accumulators stay named `vec4` locals. An `array<f32, N>` accumulator
 //! spills out of registers on this backend.
+//!
+//! Workgroup storage is not a constant here: every generator takes the
+//! adapter's `max_compute_workgroup_storage_size` and validates its tile
+//! against it while emitting the shader. DX12/GL report 32768 B where Vulkan
+//! reports 49152 B, so a tile that fits one backend must not be assumed to
+//! fit another.
 
 use std::fmt::Write;
 
@@ -23,16 +29,16 @@ pub const POS_MT: u32 = 128;
 pub const POS_NT: u32 = 64;
 pub const POS_KS: u32 = 32;
 
-pub fn gemm_bias() -> String {
-    gemm_bias_tiled(MT, NT, KS, UNROLL_K)
+pub fn gemm_bias(max_storage: u32) -> String {
+    gemm_bias_tiled(MT, NT, KS, UNROLL_K, max_storage)
 }
 
-pub fn gemm_bias_tiled(mt: u32, nt: u32, ks: u32, unroll: bool) -> String {
-    emit(mt, nt, ks, unroll, Kind::Gemm, false)
+pub fn gemm_bias_tiled(mt: u32, nt: u32, ks: u32, unroll: bool, max_storage: u32) -> String {
+    emit(mt, nt, ks, unroll, Kind::Gemm, false, max_storage)
 }
 
-pub fn conv_gemm() -> String {
-    emit(MT, NT, KS, UNROLL_K, Kind::Conv, false)
+pub fn conv_gemm(max_storage: u32) -> String {
+    emit(MT, NT, KS, UNROLL_K, Kind::Conv, false, max_storage)
 }
 
 /// The encoder GEMM shader, per the buffering policy picked for this device.
@@ -61,52 +67,84 @@ pub enum GemmVariant {
     N128s,
 }
 
-pub fn pick_gemm_variant() -> GemmVariant {
-    if let Ok(v) = std::env::var("CTC_GEMM") {
-        return match v.as_str() {
+impl GemmVariant {
+    pub const ALL: [GemmVariant; 5] = [
+        GemmVariant::Base,
+        GemmVariant::Db16,
+        GemmVariant::M64,
+        GemmVariant::M64s,
+        GemmVariant::N128s,
+    ];
+
+    /// (mt, nt, ks, banks): one source of truth for a variant's geometry.
+    /// The dispatch grid, both shader generators and the storage budget all
+    /// read from here, so they cannot drift apart.
+    fn shape(self) -> (u32, u32, u32, u32) {
+        match self {
+            GemmVariant::Base => (MT, NT, KS, 1),
+            GemmVariant::Db16 => (MT, NT, 16, 2),
+            GemmVariant::M64 => (64, NT, KS, 2),
+            GemmVariant::M64s => (64, NT, KS, 1),
+            GemmVariant::N128s => (64, 128, KS, 1),
+        }
+    }
+
+    /// Workgroup storage the variant needs, both banks included.
+    pub fn shared_bytes(self) -> u32 {
+        let (mt, nt, ks, banks) = self.shape();
+        banks * tile(mt, nt, ks).bytes
+    }
+}
+
+/// Pick the tile for this adapter. `max_storage` is the device's
+/// `max_compute_workgroup_storage_size`; a variant that does not fit is
+/// refused here, at selection time, instead of producing an invalid compute
+/// pipeline that only surfaces as a bind-group error during the forward.
+pub fn pick_gemm_variant(max_storage: u32) -> GemmVariant {
+    let variant = match std::env::var("CTC_GEMM") {
+        Ok(v) => match v.as_str() {
             "base" => GemmVariant::Base,
             "db16" => GemmVariant::Db16,
             "m64" => GemmVariant::M64,
             "m64s" => GemmVariant::M64s,
             "n128s" => GemmVariant::N128s,
             other => panic!("unknown CTC_GEMM variant {other}"),
-        };
-    }
-    GemmVariant::Base
+        },
+        Err(_) => GemmVariant::Base,
+    };
+    let need = variant.shared_bytes();
+    assert!(
+        need <= max_storage,
+        "CTC_GEMM={variant:?} needs {need} B of workgroup storage, adapter allows \
+         {max_storage} B; variants that fit here: {:?}",
+        GemmVariant::ALL
+            .iter()
+            .copied()
+            .filter(|v| v.shared_bytes() <= max_storage)
+            .collect::<Vec<_>>()
+    );
+    variant
 }
 
-pub fn gemm_variant(variant: GemmVariant) -> String {
-    match variant {
-        GemmVariant::Base => emit(MT, NT, KS, UNROLL_K, Kind::Gemm, false),
-        GemmVariant::Db16 => emit(MT, NT, 16, UNROLL_K, Kind::Gemm, true),
-        GemmVariant::M64 => emit(64, NT, KS, UNROLL_K, Kind::Gemm, true),
-        GemmVariant::M64s => emit(64, NT, KS, UNROLL_K, Kind::Gemm, false),
-        GemmVariant::N128s => emit(64, 128, KS, UNROLL_K, Kind::Gemm, false),
-    }
+pub fn gemm_variant(variant: GemmVariant, max_storage: u32) -> String {
+    let (mt, nt, ks, banks) = variant.shape();
+    emit(mt, nt, ks, UNROLL_K, Kind::Gemm, banks == 2, max_storage)
 }
 
-pub fn conv_gemm_variant(variant: GemmVariant) -> String {
-    match variant {
-        GemmVariant::Base => emit(MT, NT, KS, UNROLL_K, Kind::Conv, false),
-        GemmVariant::Db16 => emit(MT, NT, 16, UNROLL_K, Kind::Conv, true),
-        GemmVariant::M64 => emit(64, NT, KS, UNROLL_K, Kind::Conv, true),
-        GemmVariant::M64s => emit(64, NT, KS, UNROLL_K, Kind::Conv, false),
-        GemmVariant::N128s => emit(64, 128, KS, UNROLL_K, Kind::Conv, false),
-    }
+pub fn conv_gemm_variant(variant: GemmVariant, max_storage: u32) -> String {
+    let (mt, nt, ks, banks) = variant.shape();
+    emit(mt, nt, ks, UNROLL_K, Kind::Conv, banks == 2, max_storage)
 }
 
 /// The (mt, nt) tile a variant was built with; dispatch grids tile with the
 /// same numbers or part of the output is never covered.
 pub fn gemm_tile(variant: GemmVariant) -> (u32, u32) {
-    match variant {
-        GemmVariant::Base | GemmVariant::Db16 => (MT, NT),
-        GemmVariant::M64 | GemmVariant::M64s => (64, NT),
-        GemmVariant::N128s => (64, 128),
-    }
+    let (mt, nt, _, _) = variant.shape();
+    (mt, nt)
 }
 
-pub fn pos_conv() -> String {
-    emit_pos(POS_MT, POS_NT, POS_KS)
+pub fn pos_conv(max_storage: u32) -> String {
+    emit_pos(POS_MT, POS_NT, POS_KS, max_storage)
 }
 
 pub fn gemm_shared_bytes(mt: u32, nt: u32, ks: u32) -> u32 {
@@ -138,7 +176,8 @@ fn tile(mt: u32, nt: u32, ks: u32) -> Tile {
     let sa_stride = payload + (1 + 8 - (payload % 8)) % 8;
     let sb_stride = nt / 4;
     let bytes = (mt * sa_stride + ks * sb_stride) * 16;
-    assert!(bytes <= 48 * 1024, "shared memory {bytes} exceeds 48 KiB");
+    // Pure geometry. Whether `bytes` is legal depends on the adapter, so the
+    // check lives in `emit`/`emit_pos` where the device budget is known.
     Tile { mt, nt, ks, tm, tn_vec, sa_stride, sb_stride, bytes }
 }
 
@@ -148,8 +187,13 @@ enum Kind {
     Conv,
 }
 
-fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind, dbuf: bool) -> String {
+fn emit(mt: u32, nt: u32, ks: u32, unroll: bool, kind: Kind, dbuf: bool, max_storage: u32) -> String {
     let t = tile(mt, nt, ks);
+    let shared = if dbuf { 2 * t.bytes } else { t.bytes };
+    assert!(
+        shared <= max_storage,
+        "{mt}x{nt}x{ks} GEMM needs {shared} B of workgroup storage, adapter allows {max_storage} B"
+    );
     let mut s = String::with_capacity(48 * 1024);
     match kind {
         Kind::Gemm => s.push_str(
@@ -209,17 +253,7 @@ fn gelu4(v: vec4<f32>) -> vec4<f32> {
 "#,
         ),
     }
-    let banks: &[(u32, u32)] = if dbuf {
-        assert!(
-            2 * t.bytes <= 48 * 1024,
-            "double-buffered shared memory {} exceeds 48 KiB",
-            2 * t.bytes
-        );
-        &[(0, 0), (1, 1)]
-    } else {
-        assert!(t.bytes <= 48 * 1024, "shared memory {bytes} exceeds 48 KiB", bytes = t.bytes);
-        &[(0, 0)]
-    };
+    let banks: &[(u32, u32)] = if dbuf { &[(0, 0), (1, 1)] } else { &[(0, 0)] };
     for (ai, _) in banks {
         let _ = writeln!(s, "var<workgroup> sa{ai}: array<vec4<f32>, {}u>;", t.mt * t.sa_stride);
     }
@@ -609,8 +643,13 @@ fn emit_store_rows(
 /// Weights are `(group, K, N)` with `K = tap * in_pg + ci` and `N` contiguous,
 /// so B loads along the output channel. `in_pg` and `K` are multiples of the
 /// tile, which keeps every K step inside one tap.
-fn emit_pos(mt: u32, nt: u32, ks: u32) -> String {
+fn emit_pos(mt: u32, nt: u32, ks: u32, max_storage: u32) -> String {
     let t = tile(mt, nt, ks);
+    assert!(
+        t.bytes <= max_storage,
+        "{mt}x{nt}x{ks} pos conv needs {} B of workgroup storage, adapter allows {max_storage} B",
+        t.bytes
+    );
     let kv = ks / 4;
     let a_vecs = mt * kv;
     let b_vecs = ks * t.sb_stride;
@@ -782,19 +821,26 @@ fn store_masked(s: &mut String, dst: &str) {
 mod tests {
     use super::*;
 
+    /// WebGPU's general ceiling, used only to prove the geometry helpers are
+    /// sane. Real runs pass the adapter's own limit instead.
+    const TEST_STORAGE: u32 = 48 * 1024;
+
     #[test]
     fn tiles_build() {
         for (m, n, k) in [(64, 64, 32), (128, 64, 32), (128, 128, 32), (256, 64, 32), (64, 128, 32), (64, 64, 64)] {
-            let src = gemm_bias_tiled(m, n, k, true);
+            let src = gemm_bias_tiled(m, n, k, true, TEST_STORAGE);
             assert!(src.contains("workgroupBarrier"), "{m}x{n}x{k}");
             assert!(gemm_shared_bytes(m, n, k) <= 48 * 1024);
         }
-        assert!(conv_gemm().contains("workgroupBarrier"));
-        assert!(gemm_bias().contains("d.scale"));
+        assert!(conv_gemm(TEST_STORAGE).contains("workgroupBarrier"));
+        assert!(gemm_bias(TEST_STORAGE).contains("d.scale"));
         // the double-buffered variants share the arithmetic but carry two
         // banks: their source must stay balanced and inside the budget
         for variant in [GemmVariant::Db16, GemmVariant::M64] {
-            for src in [gemm_variant(variant), conv_gemm_variant(variant)] {
+            for src in [
+                gemm_variant(variant, TEST_STORAGE),
+                conv_gemm_variant(variant, TEST_STORAGE),
+            ] {
                 assert!(src.contains("sa0") && src.contains("sa1"), "{variant:?}");
                 assert!(src.contains("workgroupBarrier"), "{variant:?}");
                 let mut depth = 0i32;
@@ -811,10 +857,15 @@ mod tests {
         }
         assert_eq!(2 * gemm_shared_bytes(MT, NT, 16), 45_056, "db16 banks");
         assert_eq!(2 * gemm_shared_bytes(64, NT, KS), 34_816, "m64 banks");
-        let pos = pos_conv();
+        let pos = pos_conv(TEST_STORAGE);
         assert!(pos.contains("gelu(") && pos.contains("wid.y"));
         assert!(gemm_shared_bytes(POS_MT, POS_NT, POS_KS) <= 48 * 1024);
-        for src in [gemm_bias(), conv_gemm(), pos, gemm_bias_tiled(128, 128, 32, false)] {
+        for src in [
+            gemm_bias(TEST_STORAGE),
+            conv_gemm(TEST_STORAGE),
+            pos,
+            gemm_bias_tiled(128, 128, 32, false, TEST_STORAGE),
+        ] {
             let mut depth = 0i32;
             for c in src.chars() {
                 match c {
@@ -826,5 +877,39 @@ mod tests {
             }
             assert_eq!(depth, 0);
         }
+    }
+
+    #[test]
+    fn adapter_budget_is_enforced_where_the_kernel_is_made() {
+        // DX12/GL report 32768 B on this machine; Vulkan reports 49152 B.
+        const DX12: u32 = 32 * 1024;
+        assert!(GemmVariant::Base.shared_bytes() <= DX12);
+        assert_eq!(GemmVariant::Db16.shared_bytes(), 45_056);
+        assert_eq!(GemmVariant::M64.shared_bytes(), 34_816);
+        let fits: Vec<_> = GemmVariant::ALL
+            .iter()
+            .copied()
+            .filter(|v| v.shared_bytes() <= DX12)
+            .collect();
+        assert_eq!(
+            fits,
+            vec![GemmVariant::Base, GemmVariant::M64s, GemmVariant::N128s]
+        );
+
+        // An oversized tile must be refused while generating the shader, with
+        // the real numbers in the message — not emitted and rejected later by
+        // the driver as an unrelated bind-group error.
+        let err = std::panic::catch_unwind(|| gemm_variant(GemmVariant::Db16, DX12))
+            .expect_err("db16 must not compile on a 32 KiB adapter");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("32768") && msg.contains("45056"), "{msg}");
+        assert!(gemm_variant(GemmVariant::Base, DX12).contains("workgroupBarrier"));
+
+        // The positional conv takes the same budget.
+        assert!(std::panic::catch_unwind(|| pos_conv(1024)).is_err());
     }
 }
