@@ -74,6 +74,9 @@
 pub mod align_inference;
 pub mod alloc_stats;
 pub mod audio;
+/// Accelerate `cblas_sgemm` for the CPU encoder GEMMs; aarch64 macOS only.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+mod cblas;
 pub mod config;
 pub mod gpu;
 pub mod progress;

@@ -3,6 +3,10 @@
 //! gelu / softmax / log_softmax route to the AVX2 kernels in [`crate::simd`]
 //! when the CPU has them, and fall back to the scalar fast math otherwise.
 
+
+/// Only the non-Apple-Silicon path still calls the `gemm` crate from this
+/// module; the two Linear GEMMs route to Accelerate under aarch64 macOS.
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 
@@ -235,28 +239,50 @@ fn linear_gemm(y: &mut [f32], x: &[f32], rows: usize, w: &[f32], b: &[f32], out:
     for row in y[..rows * out].chunks_exact_mut(out) {
         row.copy_from_slice(b);
     }
-    unsafe {
-        gemm::<f32>(
-            rows,
-            out,
-            in_,
-            y.as_mut_ptr(),
-            1,
-            out as isize,
-            true, // read dst (the prefilled bias)
-            x.as_ptr(),
-            1,
-            in_ as isize,
-            w.as_ptr(),
-            in_ as isize,
-            1,
-            1.0,
-            1.0,
-            false,
-            false,
-            false,
-            Parallelism::Rayon(0),
-        );
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        unsafe {
+            crate::cblas::sgemm_rm(
+                rows,
+                out,
+                in_,
+                1.0,
+                x.as_ptr(),
+                in_,
+                true,
+                w.as_ptr(),
+                in_,
+                1.0,
+                y.as_mut_ptr(),
+                out,
+            );
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        unsafe {
+            gemm::<f32>(
+                rows,
+                out,
+                in_,
+                y.as_mut_ptr(),
+                1,
+                out as isize,
+                true, // read dst (the prefilled bias)
+                x.as_ptr(),
+                1,
+                in_ as isize,
+                w.as_ptr(),
+                in_ as isize,
+                1,
+                1.0,
+                1.0,
+                false,
+                false,
+                false,
+                Parallelism::Rayon(0),
+            );
+        }
     }
 }
 
@@ -270,28 +296,50 @@ impl Linear {
     /// without being read, which skips both the bias prefill and the GEMM's
     /// read of the prefilled destination.
     pub fn apply_into_nobias(&self, x: &[f32], rows: usize, y: &mut [f32]) {
-        unsafe {
-            gemm::<f32>(
-                rows,
-                self.out,
-                self.in_,
-                y.as_mut_ptr(),
-                1,
-                self.out as isize,
-                false,
-                x.as_ptr(),
-                1,
-                self.in_ as isize,
-                self.w.as_ptr(),
-                self.in_ as isize,
-                1,
-                1.0,
-                1.0,
-                false,
-                false,
-                false,
-                Parallelism::Rayon(0),
-            );
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            unsafe {
+                crate::cblas::sgemm_rm(
+                    rows,
+                    self.out,
+                    self.in_,
+                    1.0,
+                    x.as_ptr(),
+                    self.in_,
+                    true,
+                    self.w.as_ptr(),
+                    self.in_,
+                    0.0, // no bias to accumulate into: store, don't add
+                    y.as_mut_ptr(),
+                    self.out,
+                );
+            }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            unsafe {
+                gemm::<f32>(
+                    rows,
+                    self.out,
+                    self.in_,
+                    y.as_mut_ptr(),
+                    1,
+                    self.out as isize,
+                    false,
+                    x.as_ptr(),
+                    1,
+                    self.in_ as isize,
+                    self.w.as_ptr(),
+                    self.in_ as isize,
+                    1,
+                    1.0,
+                    1.0,
+                    false,
+                    false,
+                    false,
+                    Parallelism::Rayon(0),
+                );
+            }
         }
     }
 

@@ -422,6 +422,24 @@ impl Model {
                     // lhs: Q rows q0.. (element (j, d) = buf[(q0+j)·3h + off + d])
                     // rhs: contiguous K^T rows [off .. off+64)
                     prof!(SCORES_GEMM, {
+                        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                        unsafe {
+                            crate::cblas::sgemm_rm(
+                                qb,
+                                t,
+                                head_dim,
+                                0.125, // the gemm crate's `beta`: scales Q·K^T by 1/8
+                                qkv_buf.as_ptr().add(q0 * 3 * hidden + off),
+                                3 * hidden,
+                                false,
+                                kt_buf.as_ptr().add(off * t),
+                                t,
+                                0.0, // read_dst = false: store, don't accumulate
+                                sptr,
+                                t,
+                            );
+                        }
+                        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
                         unsafe {
                             gemm::<f32>(
                                 qb,
@@ -459,6 +477,24 @@ impl Model {
                     // attn rows (qb, 64) = scores (qb, t) @ v_h (t, 64)
                     // rhs: V (element (i, d) = buf[i·3h + 2h + off + d], rs=3h, cs=1)
                     prof!(PV_GEMM, {
+                        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                        unsafe {
+                            crate::cblas::sgemm_rm(
+                                qb,
+                                head_dim,
+                                t,
+                                1.0,
+                                scores.as_ptr(),
+                                t,
+                                false,
+                                qkv_buf.as_ptr().add(2 * hidden + off),
+                                3 * hidden,
+                                0.0, // read_dst = false: store, don't accumulate
+                                attn_buf.as_mut_ptr().add(q0 * hidden + off),
+                                hidden,
+                            );
+                        }
+                        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
                         unsafe {
                             gemm::<f32>(
                                 qb,
@@ -653,6 +689,10 @@ impl Model {
             }
             // A (t_out, kd) row-major; B (kd, out) with a `kd` column step,
             // which is exactly the checkpoint's [out, in, k] layout.
+            //
+            // Not routed to Accelerate: the per-tap branch below needs a
+            // column stride BLAS cannot express, and keeping both conv paths
+            // on the same kernel keeps their rounding identical.
             unsafe {
                 gemm::<f32>(
                     t_out,
@@ -684,6 +724,11 @@ impl Model {
                 // rather than accumulated into.  Later taps must accumulate,
                 // which costs one extra read pass over `y` — still fewer than
                 // prefilling the bias up front.
+                // Not routed to Accelerate: `cl.weight` here carries a `k`
+                // column step between `ci` lanes (the checkpoint interleaves
+                // the taps), and `cblas_sgemm` has no stride for B's K axis.
+                // Packing a contiguous copy per tap would cost more than the
+                // GEMM saves at these sizes.
                 unsafe {
                     gemm::<f32>(
                         t_out,
