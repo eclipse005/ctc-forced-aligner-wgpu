@@ -21,6 +21,15 @@ pub(super) fn gelu(x: &mut [f32]) {
             unsafe { crate::simd::avx2::gelu_inplace(chunk) };
         });
     }
+    
+    // ARM NEON path: 4 lanes per iteration, optimized for Apple Silicon
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        return x.par_chunks_mut(1 << 14).for_each(|chunk| {
+            unsafe { crate::simd::neon::gelu_inplace(chunk) };
+        });
+    }
+    
     x.par_chunks_mut(1 << 14).for_each(|chunk| {
         for v in chunk.iter_mut() {
             // exact gelu: 0.5*x*(1+erf(x/sqrt(2)))
@@ -42,6 +51,11 @@ pub(super) fn gelu_bias(x: &mut [f32], bias: &[f32]) {
         #[cfg(target_arch = "x86_64")]
         if crate::simd::avx2::have_avx2_fma() {
             unsafe { crate::simd::avx2::gelu_inplace(row) };
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if crate::simd::neon::have_neon() {
+            unsafe { crate::simd::neon::gelu_inplace(row) };
             return;
         }
         for v in row.iter_mut() {
@@ -101,6 +115,10 @@ pub(super) fn softmax_row_sum(row: &mut [f32]) -> f32 {
     if crate::simd::avx2::have_avx2_fma() {
         unsafe { return crate::simd::avx2::softmax_exp_sum_inplace(row) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        unsafe { return crate::simd::neon::softmax_exp_sum_inplace(row) };
+    }
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for sc in row.iter_mut() {
@@ -136,6 +154,11 @@ pub(super) fn log_softmax_row(row: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2::have_avx2_fma() {
         unsafe { crate::simd::avx2::log_softmax_inplace(row) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        unsafe { crate::simd::neon::log_softmax_inplace(row) };
         return;
     }
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -177,6 +200,11 @@ pub(super) fn log_softmax_gather_row_c(
     if crate::simd::avx2::have_avx2_fma() {
         // SAFETY: the runtime avx2+fma check.
         return unsafe { crate::simd::avx2::log_softmax_gather_inplace(x, bias, cols, out) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        // SAFETY: NEON is always available on aarch64
+        return unsafe { crate::simd::neon::log_softmax_gather_inplace(x, bias, cols, out) };
     }
     let mut max = f32::NEG_INFINITY;
     for (v, b) in x.iter().zip(bias) {
