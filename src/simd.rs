@@ -64,6 +64,196 @@ pub(crate) fn fast_erf(x: f32) -> f32 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+pub mod neon {
+    use super::{E1, E2, E3, E4, E5, E6, E7, LOG2_E};
+    use std::arch::aarch64::*;
+
+    /// exp(x) per lane using NEON SIMD (4 lanes). Accurate for x <= 0.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn exp4(x: float32x4_t) -> float32x4_t {
+        let log2e = vdupq_n_f32(LOG2_E);
+        let y = vmulq_f32(x, log2e);
+        let k = vrndnq_f32(y); // round to nearest
+        let f = vsubq_f32(y, k);
+        
+        let mut p = vdupq_n_f32(E7);
+        p = vfmaq_f32(vdupq_n_f32(E6), p, f);
+        p = vfmaq_f32(vdupq_n_f32(E5), p, f);
+        p = vfmaq_f32(vdupq_n_f32(E4), p, f);
+        p = vfmaq_f32(vdupq_n_f32(E3), p, f);
+        p = vfmaq_f32(vdupq_n_f32(E2), p, f);
+        p = vfmaq_f32(vdupq_n_f32(E1), p, f);
+        p = vfmaq_f32(vdupq_n_f32(1.0), p, f);
+        
+        // 2^k via exponent bits; k < -126 underflows to zero
+        let ki = vcvtq_s32_f32(k);
+        let ki_plus_127 = vaddq_s32(ki, vdupq_n_s32(127));
+        let scale = vreinterpretq_f32_s32(vshlq_n_s32(ki_plus_127, 23));
+        let r = vmulq_f32(scale, p);
+        
+        // Handle underflow
+        let under = vcltq_f32(k, vdupq_n_f32(-126.0));
+        vbslq_f32(under, vdupq_n_f32(0.0), r)
+    }
+
+    /// erf(x) per lane using NEON (4 lanes)
+    #[target_feature(enable = "neon")]
+    pub unsafe fn erf4(x: float32x4_t) -> float32x4_t {
+        let ax = vabsq_f32(x);
+        
+        let one = vdupq_n_f32(1.0);
+        let t_denom = vfmaq_f32(one, vdupq_n_f32(0.327_591_1), ax);
+        let t = vdivq_f32(one, t_denom);
+        
+        let mut poly = vdupq_n_f32(1.061_405_429);
+        poly = vfmaq_f32(vdupq_n_f32(-1.453_152_027), poly, t);
+        poly = vfmaq_f32(vdupq_n_f32(1.421_413_741), poly, t);
+        poly = vfmaq_f32(vdupq_n_f32(-0.284_496_736), poly, t);
+        poly = vfmaq_f32(vdupq_n_f32(0.254_829_592), poly, t);
+        poly = vmulq_f32(poly, t);
+        
+        let neg_ax2 = vnegq_f32(vmulq_f32(ax, ax));
+        let e = exp4(neg_ax2);
+        let r = vsubq_f32(one, vmulq_f32(poly, e));
+        
+        // copysign: magnitude from r, sign from x
+        let sign_mask = vreinterpretq_u32_f32(x);
+        let sign_bit = vandq_u32(sign_mask, vdupq_n_u32(0x8000_0000));
+        let mag = vreinterpretq_u32_f32(vabsq_f32(r));
+        vreinterpretq_f32_u32(vorrq_u32(mag, sign_bit))
+    }
+
+    /// gelu in place using NEON: 0.5*x*(1+erf(x/sqrt(2))), 4 lanes at a time
+    #[target_feature(enable = "neon")]
+    pub unsafe fn gelu_inplace(x: &mut [f32]) {
+        let half = vdupq_n_f32(0.5);
+        let one = vdupq_n_f32(1.0);
+        let frac_1_sqrt2 = vdupq_n_f32(std::f32::consts::FRAC_1_SQRT_2);
+        
+        let mut chunks = x.chunks_exact_mut(4);
+        for chunk in chunks.by_ref() {
+            let v = vld1q_f32(chunk.as_ptr());
+            let e = erf4(vmulq_f32(v, frac_1_sqrt2));
+            let g = vmulq_f32(vmulq_f32(half, v), vaddq_f32(one, e));
+            vst1q_f32(chunk.as_mut_ptr(), g);
+        }
+        for v in chunks.into_remainder() {
+            *v = 0.5 * *v * (1.0 + super::fast_erf(*v / std::f32::consts::SQRT_2));
+        }
+    }
+
+    #[inline]
+    unsafe fn reduce_sum(acc: float32x4_t) -> f32 {
+        vaddvq_f32(acc)
+    }
+
+    /// Softmax pass 1: scale by exp(x - max) in place and return row sum
+    #[target_feature(enable = "neon")]
+    pub unsafe fn softmax_exp_sum_inplace(row: &mut [f32]) -> f32 {
+        let mut max = f32::NEG_INFINITY;
+        for v in row.iter() {
+            max = max.max(*v);
+        }
+        
+        let maxv = vdupq_n_f32(max);
+        let mut acc = vdupq_n_f32(0.0);
+        let mut chunks = row.chunks_exact_mut(4);
+        for chunk in chunks.by_ref() {
+            let e = exp4(vsubq_f32(vld1q_f32(chunk.as_ptr()), maxv));
+            acc = vaddq_f32(acc, e);
+            vst1q_f32(chunk.as_mut_ptr(), e);
+        }
+        
+        let mut tail_sum = 0.0f32;
+        for v in chunks.into_remainder() {
+            let e = super::fast_exp(*v - max);
+            *v = e;
+            tail_sum += e;
+        }
+        reduce_sum(acc) + tail_sum
+    }
+
+    /// log_softmax one row in place using NEON
+    #[target_feature(enable = "neon")]
+    pub unsafe fn log_softmax_inplace(row: &mut [f32]) {
+        let mut max = f32::NEG_INFINITY;
+        for v in row.iter() {
+            max = max.max(*v);
+        }
+        
+        let maxv = vdupq_n_f32(max);
+        let mut acc = vdupq_n_f32(0.0);
+        let mut chunks = row.chunks_exact_mut(4);
+        for chunk in chunks.by_ref() {
+            let e = exp4(vsubq_f32(vld1q_f32(chunk.as_ptr()), maxv));
+            acc = vaddq_f32(acc, e);
+        }
+        
+        let mut tail_sum = 0.0f32;
+        for v in chunks.into_remainder() {
+            tail_sum += super::fast_exp(*v - max);
+        }
+        
+        let lsum = (reduce_sum(acc) + tail_sum).ln();
+        let c = vdupq_n_f32(max + lsum);
+        let mut chunks = row.chunks_exact_mut(4);
+        for chunk in chunks.by_ref() {
+            vst1q_f32(
+                chunk.as_mut_ptr(),
+                vsubq_f32(vld1q_f32(chunk.as_ptr()), c),
+            );
+        }
+        for v in chunks.into_remainder() {
+            *v -= max + lsum;
+        }
+    }
+
+    /// Fused lm-head epilogue for one row using NEON
+    #[target_feature(enable = "neon")]
+    pub unsafe fn log_softmax_gather_inplace(
+        x: &[f32],
+        bias: &[f32],
+        cols: &[i32],
+        out: &mut [f32],
+    ) -> f32 {
+        let mut max = f32::NEG_INFINITY;
+        for (v, b) in x.iter().zip(bias) {
+            max = max.max(*v + *b);
+        }
+        
+        let maxv = vdupq_n_f32(max);
+        let mut acc = vdupq_n_f32(0.0);
+        let mut chunks = x.chunks_exact(4);
+        let mut bchunks = bias.chunks_exact(4);
+        for (c, bc) in chunks.by_ref().zip(bchunks.by_ref()) {
+            let xv = vld1q_f32(c.as_ptr());
+            let bv = vld1q_f32(bc.as_ptr());
+            let e = exp4(vsubq_f32(vaddq_f32(xv, bv), maxv));
+            acc = vaddq_f32(acc, e);
+        }
+        
+        let mut tail_sum = 0.0f32;
+        for (v, b) in chunks.remainder().iter().zip(bchunks.remainder().iter()) {
+            tail_sum += super::fast_exp(*v + *b - max);
+        }
+        
+        let c = max + (reduce_sum(acc) + tail_sum).ln();
+        
+        // Scalar gather (NEON doesn't have efficient gather like AVX2)
+        for j in 0..cols.len() {
+            let st = cols[j] as usize;
+            out[j] = x[st] + bias[st] - c;
+        }
+        c
+    }
+
+    pub fn have_neon() -> bool {
+        // On aarch64, NEON is always available
+        true
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub mod avx2 {
     use super::{E1, E2, E3, E4, E5, E6, E7, LOG2_E};

@@ -3,6 +3,10 @@
 //! gelu / softmax / log_softmax route to the AVX2 kernels in [`crate::simd`]
 //! when the CPU has them, and fall back to the scalar fast math otherwise.
 
+
+/// Only the non-Apple-Silicon path still calls the `gemm` crate from this
+/// module; the two Linear GEMMs route to Accelerate under aarch64 macOS.
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 
@@ -21,6 +25,15 @@ pub(super) fn gelu(x: &mut [f32]) {
             unsafe { crate::simd::avx2::gelu_inplace(chunk) };
         });
     }
+    
+    // ARM NEON path: 4 lanes per iteration, optimized for Apple Silicon
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        return x.par_chunks_mut(1 << 14).for_each(|chunk| {
+            unsafe { crate::simd::neon::gelu_inplace(chunk) };
+        });
+    }
+    
     x.par_chunks_mut(1 << 14).for_each(|chunk| {
         for v in chunk.iter_mut() {
             // exact gelu: 0.5*x*(1+erf(x/sqrt(2)))
@@ -42,6 +55,11 @@ pub(super) fn gelu_bias(x: &mut [f32], bias: &[f32]) {
         #[cfg(target_arch = "x86_64")]
         if crate::simd::avx2::have_avx2_fma() {
             unsafe { crate::simd::avx2::gelu_inplace(row) };
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if crate::simd::neon::have_neon() {
+            unsafe { crate::simd::neon::gelu_inplace(row) };
             return;
         }
         for v in row.iter_mut() {
@@ -101,6 +119,10 @@ pub(super) fn softmax_row_sum(row: &mut [f32]) -> f32 {
     if crate::simd::avx2::have_avx2_fma() {
         unsafe { return crate::simd::avx2::softmax_exp_sum_inplace(row) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        unsafe { return crate::simd::neon::softmax_exp_sum_inplace(row) };
+    }
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for sc in row.iter_mut() {
@@ -136,6 +158,11 @@ pub(super) fn log_softmax_row(row: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2::have_avx2_fma() {
         unsafe { crate::simd::avx2::log_softmax_inplace(row) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        unsafe { crate::simd::neon::log_softmax_inplace(row) };
         return;
     }
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -178,6 +205,11 @@ pub(super) fn log_softmax_gather_row_c(
         // SAFETY: the runtime avx2+fma check.
         return unsafe { crate::simd::avx2::log_softmax_gather_inplace(x, bias, cols, out) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::neon::have_neon() {
+        // SAFETY: NEON is always available on aarch64
+        return unsafe { crate::simd::neon::log_softmax_gather_inplace(x, bias, cols, out) };
+    }
     let mut max = f32::NEG_INFINITY;
     for (v, b) in x.iter().zip(bias) {
         max = max.max(*v + *b);
@@ -207,28 +239,50 @@ fn linear_gemm(y: &mut [f32], x: &[f32], rows: usize, w: &[f32], b: &[f32], out:
     for row in y[..rows * out].chunks_exact_mut(out) {
         row.copy_from_slice(b);
     }
-    unsafe {
-        gemm::<f32>(
-            rows,
-            out,
-            in_,
-            y.as_mut_ptr(),
-            1,
-            out as isize,
-            true, // read dst (the prefilled bias)
-            x.as_ptr(),
-            1,
-            in_ as isize,
-            w.as_ptr(),
-            in_ as isize,
-            1,
-            1.0,
-            1.0,
-            false,
-            false,
-            false,
-            Parallelism::Rayon(0),
-        );
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        unsafe {
+            crate::cblas::sgemm_rm(
+                rows,
+                out,
+                in_,
+                1.0,
+                x.as_ptr(),
+                in_,
+                true,
+                w.as_ptr(),
+                in_,
+                1.0,
+                y.as_mut_ptr(),
+                out,
+            );
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        unsafe {
+            gemm::<f32>(
+                rows,
+                out,
+                in_,
+                y.as_mut_ptr(),
+                1,
+                out as isize,
+                true, // read dst (the prefilled bias)
+                x.as_ptr(),
+                1,
+                in_ as isize,
+                w.as_ptr(),
+                in_ as isize,
+                1,
+                1.0,
+                1.0,
+                false,
+                false,
+                false,
+                Parallelism::Rayon(0),
+            );
+        }
     }
 }
 
@@ -242,28 +296,50 @@ impl Linear {
     /// without being read, which skips both the bias prefill and the GEMM's
     /// read of the prefilled destination.
     pub fn apply_into_nobias(&self, x: &[f32], rows: usize, y: &mut [f32]) {
-        unsafe {
-            gemm::<f32>(
-                rows,
-                self.out,
-                self.in_,
-                y.as_mut_ptr(),
-                1,
-                self.out as isize,
-                false,
-                x.as_ptr(),
-                1,
-                self.in_ as isize,
-                self.w.as_ptr(),
-                self.in_ as isize,
-                1,
-                1.0,
-                1.0,
-                false,
-                false,
-                false,
-                Parallelism::Rayon(0),
-            );
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            unsafe {
+                crate::cblas::sgemm_rm(
+                    rows,
+                    self.out,
+                    self.in_,
+                    1.0,
+                    x.as_ptr(),
+                    self.in_,
+                    true,
+                    self.w.as_ptr(),
+                    self.in_,
+                    0.0, // no bias to accumulate into: store, don't add
+                    y.as_mut_ptr(),
+                    self.out,
+                );
+            }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        {
+            unsafe {
+                gemm::<f32>(
+                    rows,
+                    self.out,
+                    self.in_,
+                    y.as_mut_ptr(),
+                    1,
+                    self.out as isize,
+                    false,
+                    x.as_ptr(),
+                    1,
+                    self.in_ as isize,
+                    self.w.as_ptr(),
+                    self.in_ as isize,
+                    1,
+                    1.0,
+                    1.0,
+                    false,
+                    false,
+                    false,
+                    Parallelism::Rayon(0),
+                );
+            }
         }
     }
 

@@ -48,3 +48,18 @@ harness = false
 debug = false
 codegen-units = 1
 lto = "thin"
+opt-level = 3
+# Enable more aggressive optimizations for Apple Silicon
+strip = true
+panic = "abort"
+
+# Profile for maximum performance on Apple Silicon
+[profile.release-fast]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+
+# Development profile with better performance
+[profile.dev]
+opt-level = 1

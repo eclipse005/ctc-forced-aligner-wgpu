@@ -4,3 +4,11 @@
 # targets so cross-compiling to other architectures still works.
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-feature=+avx2,+fma"]
+
+# Apple Silicon (ARM64) optimization: enable NEON SIMD and other ARM features
+# for optimal performance on M-series chips
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))']
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "opt-level=3",
+]
