@@ -7,13 +7,27 @@
 
 use anyhow::{bail, Context, Result};
 
+use crate::shaders::SubgroupMode;
+
 /// A wgpu device plus the queue, adapter info and negotiated limits.
 pub(crate) struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub(crate) info: wgpu::AdapterInfo,
+    /// The features the device was actually opened with. The adapter's set is
+    /// a superset: `request_device` may drop one it cannot honour, so every
+    /// capability check reads this.
     pub features: wgpu::Features,
+    /// The limits the device was actually opened with, likewise negotiated
+    /// rather than merely advertised.
+    pub limits: wgpu::Limits,
     pub pipeline_cache: Option<wgpu::PipelineCache>,
+    /// Where [`Gpu::save_pipeline_cache`] writes, when caching is supported.
+    pipeline_cache_path: Option<std::path::PathBuf>,
+    /// Bytes last loaded from / written to the cache file. Comparing against
+    /// them keeps a warm start from rewriting a multi-megabyte file it would
+    /// only reproduce byte for byte.
+    pipeline_cache_bytes: std::sync::Mutex<Vec<u8>>,
     /// Dedicated Vulkan transfer family, alongside the compute queue on family 0.
     /// `None` when the device has no copy-only queue or the open fell back.
     pub xfer_family: Option<u32>,
@@ -29,7 +43,10 @@ static XFER_Q_PRIO: f32 = 1.0;
 pub enum DeviceSelector {
     #[default]
     Auto,
-    Runtime { api: wgpu::Backend, index: usize },
+    Runtime {
+        api: wgpu::Backend,
+        index: usize,
+    },
     Cpu,
     Index(usize),
     Name(String),
@@ -124,12 +141,34 @@ impl Backend {
     }
 }
 
+/// Most preferred API first. macOS ranks Metal above Vulkan (MoltenVK is a
+/// translation layer on top of the same GPU); every other platform ranks
+/// Vulkan first. [`api_rank`] is derived from this array, so the two cannot
+/// disagree.
+#[cfg(target_os = "macos")]
+const API_RANK_ORDER: [wgpu::Backend; 4] = [
+    wgpu::Backend::Metal,
+    wgpu::Backend::Vulkan,
+    wgpu::Backend::Dx12,
+    wgpu::Backend::Gl,
+];
+
+#[cfg(not(target_os = "macos"))]
 const API_RANK_ORDER: [wgpu::Backend; 4] = [
     wgpu::Backend::Vulkan,
     wgpu::Backend::Metal,
     wgpu::Backend::Dx12,
     wgpu::Backend::Gl,
 ];
+
+/// The one API ordering: index in [`API_RANK_ORDER`], or 4 for anything not
+/// listed there. Lower is preferred.
+fn api_rank(backend: wgpu::Backend) -> u8 {
+    API_RANK_ORDER
+        .iter()
+        .position(|b| *b == backend)
+        .map_or(4, |i| i as u8)
+}
 
 fn instance_for(backends: wgpu::Backends) -> wgpu::Instance {
     if backends == wgpu::Backends::all() {
@@ -146,9 +185,11 @@ async fn adapters_for(selector: &DeviceSelector) -> Vec<wgpu::Adapter> {
             let b = wgpu::Backends::from(*api);
             instance_for(b).enumerate_adapters(b).await
         }
-        DeviceSelector::Index(_) | DeviceSelector::Name(_) => instance_for(wgpu::Backends::all())
-            .enumerate_adapters(wgpu::Backends::all())
-            .await,
+        DeviceSelector::Index(_) | DeviceSelector::Name(_) => {
+            instance_for(wgpu::Backends::all())
+                .enumerate_adapters(wgpu::Backends::all())
+                .await
+        }
         DeviceSelector::Auto => {
             let mut all = Vec::new();
             for api in API_RANK_ORDER {
@@ -201,15 +242,7 @@ fn device_class(kind: wgpu::DeviceType) -> u8 {
 }
 
 fn rank(info: &wgpu::AdapterInfo) -> (u8, u8) {
-    let class = device_class(info.device_type);
-    let api = match info.backend {
-        wgpu::Backend::Vulkan => 0,
-        wgpu::Backend::Metal => 1,
-        wgpu::Backend::Dx12 => 2,
-        wgpu::Backend::Gl => 3,
-        _ => 4,
-    };
-    (class, api)
+    (device_class(info.device_type), api_rank(info.backend))
 }
 
 fn list_names(adapters: &[wgpu::Adapter]) -> String {
@@ -218,7 +251,10 @@ fn list_names(adapters: &[wgpu::Adapter]) -> String {
         .enumerate()
         .map(|(i, a)| {
             let info = a.get_info();
-            format!("#{i} {} ({:?}, {:?})", info.name, info.backend, info.device_type)
+            format!(
+                "#{i} {} ({:?}, {:?})",
+                info.name, info.backend, info.device_type
+            )
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -251,6 +287,17 @@ impl DeviceInfo {
     }
 }
 
+/// How `--list-devices` orders what it found, and the same key `Auto` ranks
+/// adapters by: device class first (the old code sorted the *debug string* of
+/// the class, which put `Cpu` ahead of `DiscreteGpu`), then API, then name.
+fn target_sort_key(d: &DeviceInfo) -> (u8, u8, String) {
+    (
+        device_class(d.device_type),
+        api_rank(d.backend),
+        d.name.clone(),
+    )
+}
+
 pub async fn list_targets() -> Vec<String> {
     let instance = wgpu::Instance::default();
     let adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
@@ -270,7 +317,7 @@ pub async fn list_targets() -> Vec<String> {
             }
         })
         .collect();
-    infos.sort_by_key(|d| (format!("{:?}", d.device_type), d.name.clone()));
+    infos.sort_by_key(target_sort_key);
     infos.iter().map(DeviceInfo::describe).collect()
 }
 
@@ -337,6 +384,7 @@ impl Gpu {
                     & (wgpu::Features::TIMESTAMP_QUERY
                         | wgpu::Features::PIPELINE_CACHE
                         | wgpu::Features::SUBGROUP
+                        | wgpu::Features::SHADER_F16
                         | wgpu::Features::SHADER_F64),
                 required_limits: limits.clone(),
                 ..Default::default()
@@ -344,7 +392,10 @@ impl Gpu {
             // A copy-only queue lets the logits download run while the next
             // encoder occupies the compute queue. Failure here is not fatal:
             // the same adapter opens again without the extra queue.
-            #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(unused_mut))]
+            #[cfg_attr(
+                not(any(target_os = "linux", target_os = "windows")),
+                allow(unused_mut)
+            )]
             let mut xfer_family = None;
             // On Vulkan-capable platforms try for a dedicated transfer queue;
             // elsewhere (macOS) no adapter can report `Backend::Vulkan`, so
@@ -357,10 +408,7 @@ impl Gpu {
                         Ok((device, queue))
                     }
                     Err(e) => {
-                        eprintln!(
-                            "ctc-aligner: no transfer queue on {} ({e:#})",
-                            info.name
-                        );
+                        eprintln!("ctc-aligner: no transfer queue on {} ({e:#})", info.name);
                         adapter.request_device(&desc).await
                     }
                 }
@@ -371,7 +419,7 @@ impl Gpu {
             let requested = adapter.request_device(&desc).await;
             match requested {
                 Ok((device, queue)) => {
-                    opened = Some((info, features, limits, device, queue, xfer_family));
+                    opened = Some((info, device, queue, xfer_family));
                     break;
                 }
                 Err(e) => {
@@ -385,7 +433,7 @@ impl Gpu {
                 }
             }
         }
-        let Some((info, features, _limits, device, queue, xfer_family)) = opened else {
+        let Some((info, device, queue, xfer_family)) = opened else {
             if matches!(selector, DeviceSelector::Auto) {
                 return Err(NoGpuError.into());
             }
@@ -396,8 +444,14 @@ impl Gpu {
             eprintln!("[wgpu uncaptured error] {e:?}");
         }));
 
+        // Negotiated, not advertised: `request_device` is free to hand back
+        // fewer features or tighter limits than the adapter offered, and a
+        // capability query that reads the adapter's set can then name a path
+        // the device refuses.
+        let features = device.features();
+        let limits = device.limits();
         let cache_supported = features.contains(wgpu::Features::PIPELINE_CACHE);
-        let (pipeline_cache, _path) = match pipeline_cache_path(&info) {
+        let (pipeline_cache, cache_path, seed) = match pipeline_cache_path(&info) {
             Some(path) if cache_supported => {
                 let seed = std::fs::read(&path).ok();
                 let cache = unsafe {
@@ -407,9 +461,11 @@ impl Gpu {
                         fallback: true,
                     })
                 };
-                (Some(cache), Some(path))
+                // the seed is what is already on disk: writing it back after
+                // a load that compiled nothing new would be a no-op
+                (Some(cache), Some(path), seed.unwrap_or_default())
             }
-            _ => (None, None),
+            _ => (None, None, Vec::new()),
         };
 
         Ok(Self {
@@ -417,19 +473,82 @@ impl Gpu {
             queue,
             info,
             features,
+            limits,
             pipeline_cache,
+            pipeline_cache_path: cache_path,
+            pipeline_cache_bytes: std::sync::Mutex::new(seed),
             xfer_family,
         })
     }
 
     pub fn describe(&self) -> String {
+        let sg = match self.subgroup_mode() {
+            SubgroupMode::None => "sg none".to_string(),
+            mode => format!(
+                "sg {}..{} ({mode:?})",
+                self.info.subgroup_min_size, self.info.subgroup_max_size
+            ),
+        };
         format!(
-            "{} ({:?}, {:?}) | {} {}",
+            "{} ({:?}, {:?}) | {} {} | wg {} B, {sg}, f16={}, f64={}",
             self.info.name,
             self.info.backend,
             self.info.device_type,
             self.info.driver,
             self.info.driver_info,
+            self.limits.max_compute_workgroup_storage_size,
+            self.has_f16(),
+            self.has_f64(),
+        )
+    }
+
+    /// The limits the device was opened with.
+    pub fn limits(&self) -> &wgpu::Limits {
+        &self.limits
+    }
+
+    pub fn has_f16(&self) -> bool {
+        self.features.contains(wgpu::Features::SHADER_F16)
+    }
+
+    pub fn has_f64(&self) -> bool {
+        self.features.contains(wgpu::Features::SHADER_F64)
+    }
+
+    pub fn has_subgroups(&self) -> bool {
+        self.features.contains(wgpu::Features::SUBGROUP)
+    }
+
+    /// The subgroup shape the reduction kernels may assume. The range comes
+    /// from the adapter info: wgpu 30 exposes `subgroup_min_size` /
+    /// `subgroup_max_size` there, not on [`wgpu::Limits`].
+    ///
+    /// `CTC_SUBGROUPS=0|off|false` forces [`SubgroupMode::None`], so the
+    /// shared-memory tree can be benchmarked against the subgroup path.
+    pub fn subgroup_mode(&self) -> SubgroupMode {
+        if env_flag_off(std::env::var("CTC_SUBGROUPS").ok().as_deref()) {
+            return SubgroupMode::None;
+        }
+        SubgroupMode::from_limits(
+            self.has_subgroups(),
+            self.info.subgroup_min_size,
+            self.info.subgroup_max_size,
+        )
+    }
+
+    /// Whether a kernel may carry `enable f16;` and `f16` shared memory.
+    ///
+    /// `CTC_F16_KERNEL=0|false|off` forces it off; `1|true|on|auto`, unset or
+    /// empty follow the device. It never returns `true` on a device without
+    /// [`wgpu::Features::SHADER_F16`], because the shader would not compile.
+    ///
+    /// Unused until the f16 GEMM path lands; the probe it answers is part of
+    /// the device state every caller already reports.
+    #[allow(dead_code)]
+    pub fn use_f16_kernel(&self) -> bool {
+        resolve_f16_kernel(
+            self.has_f16(),
+            std::env::var("CTC_F16_KERNEL").ok().as_deref(),
         )
     }
 
@@ -513,18 +632,22 @@ impl Gpu {
             }
             self.queue.submit([enc.finish()]);
         }
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .context("poll for readback")?;
-        for (staging, take) in &pieces {
+        // Arm every map first: the copies are already on the queue, so one
+        // wait retires them all and resolves every callback. Polling per
+        // piece turned a 70 MB readback into five round trips.
+        let mut waits = Vec::with_capacity(pieces.len());
+        for (staging, _) in &pieces {
             let slice = staging.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| {
                 let _ = tx.send(r);
             });
-            self.device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .context("poll for readback")?;
+            waits.push(rx);
+        }
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("poll for readback")?;
+        for ((staging, take), rx) in pieces.iter().zip(waits) {
             match rx.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -533,6 +656,7 @@ impl Gpu {
                 }
                 Err(e) => anyhow::bail!("map callback dropped: {e}"),
             }
+            let slice = staging.slice(..);
             let mapped = slice.get_mapped_range()?;
             sink(&mapped[..*take as usize]);
             drop(mapped);
@@ -574,26 +698,52 @@ impl Gpu {
         zero_init: bool,
     ) -> Result<wgpu::ComputePipeline> {
         let guard = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
-        let pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
-            layout,
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[],
-                zero_initialize_workgroup_memory: zero_init,
-            },
-            cache: self.pipeline_cache.as_ref(),
-        });
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
+        let pipe = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &[],
+                    zero_initialize_workgroup_memory: zero_init,
+                },
+                cache: self.pipeline_cache.as_ref(),
+            });
         let err = pollster::block_on(guard.pop());
         if let Some(e) = err {
             bail!("pipeline {label} failed validation: {e}");
         }
         Ok(pipe)
+    }
+
+    /// Persist the pipeline cache, atomically and only when it changed.
+    ///
+    /// The model calls this after its 11 pipelines exist and the DP after its
+    /// 4, so the next cold start compiles nothing. Failure is not the caller's
+    /// problem: `let _ =` keeps an unwritable cache directory from failing a
+    /// model load.
+    pub fn save_pipeline_cache(&self) -> Result<()> {
+        let (Some(cache), Some(path)) = (&self.pipeline_cache, &self.pipeline_cache_path) else {
+            return Ok(());
+        };
+        let Some(data) = cache.get_data() else {
+            return Ok(());
+        };
+        let mut last = self
+            .pipeline_cache_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        persist_cache_bytes(path, &data, &mut last)
+            .with_context(|| format!("save pipeline cache {}", path.display()))?;
+        Ok(())
     }
 }
 
@@ -632,14 +782,14 @@ fn open_vulkan_transfer(
     desc: &wgpu::DeviceDescriptor<'_>,
 ) -> Result<(wgpu::Device, wgpu::Queue, Option<u32>)> {
     let family = {
-        let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
-            .context("vulkan hal adapter")?;
+        let hal =
+            unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }.context("vulkan hal adapter")?;
         transfer_family(&hal)?
     };
     // The hal guard borrows `adapter`. Drop it before `create_device_from_hal`.
     let hal_open = {
-        let hal = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
-            .context("vulkan hal adapter")?;
+        let hal =
+            unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }.context("vulkan hal adapter")?;
         unsafe {
             hal.open_with_callback(
                 desc.required_features,
@@ -656,12 +806,23 @@ fn open_vulkan_transfer(
         }
         .map_err(|e| anyhow::anyhow!("vulkan device with transfer queue: {e:?}"))?
     };
-    let (device, queue) = unsafe {
-        adapter.create_device_from_hal::<wgpu::hal::api::Vulkan>(hal_open, desc)
-    }
-    .map_err(|e| anyhow::anyhow!("wrap vulkan device: {e:?}"))?;
+    let (device, queue) =
+        unsafe { adapter.create_device_from_hal::<wgpu::hal::api::Vulkan>(hal_open, desc) }
+            .map_err(|e| anyhow::anyhow!("wrap vulkan device: {e:?}"))?;
     eprintln!("ctc-aligner: transfer queue family {family}");
     Ok((device, queue, Some(family)))
+}
+
+/// Replace every character a Windows filename cannot hold, and whitespace,
+/// with `_`: the cache key ends up as a file name.
+fn sanitize_cache_component(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_whitespace() => '_',
+            c => c,
+        })
+        .collect()
 }
 
 fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
@@ -676,9 +837,140 @@ fn pipeline_cache_path(info: &wgpu::AdapterInfo) -> Option<std::path::PathBuf> {
         info.vendor,
         info.device,
         info.backend,
-        info.driver_info.replace(['\\', '/', ':', ' '], "_")
+        sanitize_cache_component(&info.driver_info)
     );
-    Some(root.join("ctc-forced-aligner-wgpu").join(format!("{key}.pipeline_cache")))
+    Some(
+        root.join("ctc-forced-aligner-wgpu")
+            .join(format!("{key}.pipeline_cache")),
+    )
+}
+
+/// `true` for the values that switch an optional path off (`0`, `off`,
+/// `false`, any case). Anything else, including unset, leaves it on.
+fn env_flag_off(v: Option<&str>) -> bool {
+    let Some(v) = v else { return false };
+    let v = v.trim();
+    v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false")
+}
+
+/// Whether the f16 kernels may run, from the device and the `CTC_F16_KERNEL`
+/// value (`None` when unset).
+///
+/// `has_f16` is a hard gate: no environment value can make an `enable f16;`
+/// module compile on a device that never advertised
+/// [`wgpu::Features::SHADER_F16`]. `CTC_F16_KERNEL=0|false|off` opts out on a
+/// device that has it.
+pub fn resolve_f16_kernel(has_f16: bool, env_val: Option<&str>) -> bool {
+    has_f16 && !env_flag_off(env_val)
+}
+
+/// Write `data` to `path` unless it is empty or byte-identical to `last`;
+/// `last` is updated only after the rename lands. Returns whether the file
+/// changed.
+fn persist_cache_bytes(
+    path: &std::path::Path,
+    data: &[u8],
+    last: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    if data.is_empty() || *last == data {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // A unique sibling: the pid keeps two processes warming the same cache
+    // from writing the same temporary file, and the rename that follows is
+    // last-writer-wins.
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    if let Err(e) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    last.clear();
+    last.extend_from_slice(data);
+    Ok(true)
+}
+
+/// A top-level WGSL directive: `enable ...;`, `requires ...;` or
+/// `diagnostic(...);`. WGSL requires these before any other declaration.
+fn directive_line(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let is = t.starts_with("enable ")
+        || t.starts_with("requires ")
+        || (t.starts_with("diagnostic(") && t.ends_with(';'));
+    is.then_some(t)
+}
+
+/// `true` for `enable subgroups;`, which Naga accepts the feature for but
+/// rejects as a directive: subgroup built-ins never need an `enable`.
+fn enables_subgroups(directive: &str) -> bool {
+    let mut words = directive.trim_end_matches(';').split_whitespace();
+    matches!(words.next(), Some("enable")) && matches!(words.next(), Some("subgroups"))
+}
+
+/// Collect one directive line, unless it is `enable subgroups;` or a repeat.
+/// Returns whether `line` was a directive at all.
+fn take_directive<'a>(directives: &mut Vec<&'a str>, line: &'a str) -> bool {
+    let Some(d) = directive_line(line) else {
+        return false;
+    };
+    if !enables_subgroups(d) && !directives.contains(&d) {
+        directives.push(d);
+    }
+    true
+}
+
+/// Put a shader together with its directives at the top, where WGSL wants
+/// them, whatever order the pieces arrived in.
+///
+/// A prelude may carry `enable f16;` (or `requires` / `diagnostic`) in front
+/// of the declarations it needs; a body may carry its own leading directives.
+/// Both are collected, de-duplicated in first-seen order, and emitted before
+/// the rest of the prelude and the rest of the body. `enable subgroups;` is
+/// dropped on the way: Naga rejects it outright.
+pub fn assemble_wgsl(prelude: &str, body: &str) -> String {
+    let mut directives: Vec<&str> = Vec::new();
+    let mut prelude_rest = String::new();
+    for line in prelude.lines() {
+        if !take_directive(&mut directives, line) {
+            prelude_rest.push_str(line);
+            prelude_rest.push('\n');
+        }
+    }
+    // The body's own leading directives, ignoring blank lines between them.
+    let mut start = 0usize;
+    let mut blanks = 0usize;
+    for line in body.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            blanks += line.len();
+            continue;
+        }
+        if !take_directive(&mut directives, line) {
+            break;
+        }
+        start += blanks + line.len();
+        blanks = 0;
+    }
+    if directives.is_empty() && prelude.is_empty() && start == 0 {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(prelude.len() + body.len() + 32);
+    for d in &directives {
+        out.push_str(d);
+        out.push('\n');
+    }
+    out.push_str(&prelude_rest);
+    if !prelude_rest.is_empty() && !prelude_rest.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&body[start..]);
+    out
 }
 
 /// Load-time upload session with bounded outstanding staging (256 MiB), so a
@@ -692,7 +984,10 @@ pub(crate) struct BulkUpload<'a> {
 
 impl Gpu {
     pub fn uploader(&self) -> BulkUpload<'_> {
-        BulkUpload { gpu: self, pending: 0 }
+        BulkUpload {
+            gpu: self,
+            pending: 0,
+        }
     }
 }
 
@@ -706,7 +1001,10 @@ impl<'a> BulkUpload<'a> {
     }
 
     pub fn upload_at(&mut self, buf: &wgpu::Buffer, offset: u64, data: &[u8]) -> Result<()> {
-        anyhow::ensure!(offset % 4 == 0, "upload offset {offset} is not 4-byte aligned");
+        anyhow::ensure!(
+            offset.is_multiple_of(4),
+            "upload offset {offset} is not 4-byte aligned"
+        );
         let budget = (STAGING_BUDGET as usize).max(1);
         let mut off = offset;
         for piece in data.chunks(budget) {
@@ -737,7 +1035,10 @@ impl<'a> BulkUpload<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{device_class, Backend, DeviceSelector};
+    use super::{
+        api_rank, assemble_wgsl, device_class, persist_cache_bytes, resolve_f16_kernel,
+        target_sort_key, Backend, DeviceInfo, DeviceSelector, API_RANK_ORDER,
+    };
 
     #[test]
     fn auto_orders_discrete_before_integrated() {
@@ -751,8 +1052,14 @@ mod tests {
     fn one_device_only() {
         assert!(DeviceSelector::parse("dual").is_err());
         assert!(DeviceSelector::parse("gpu").is_err());
-        assert!(matches!(DeviceSelector::parse("auto").unwrap(), DeviceSelector::Auto));
-        assert!(matches!(DeviceSelector::parse("cpu").unwrap(), DeviceSelector::Cpu));
+        assert!(matches!(
+            DeviceSelector::parse("auto").unwrap(),
+            DeviceSelector::Auto
+        ));
+        assert!(matches!(
+            DeviceSelector::parse("cpu").unwrap(),
+            DeviceSelector::Cpu
+        ));
         assert!(matches!(
             DeviceSelector::parse("vulkan:0").unwrap(),
             DeviceSelector::Runtime { index: 0, .. }
@@ -764,7 +1071,10 @@ mod tests {
         assert_eq!(Backend::parse("").unwrap(), Backend::Auto);
         assert_eq!(Backend::parse("auto").unwrap(), Backend::Auto);
         assert_eq!(Backend::parse("cpu").unwrap(), Backend::Cpu);
-        assert_eq!(Backend::parse("GPU").unwrap(), Backend::Gpu(DeviceSelector::Auto));
+        assert_eq!(
+            Backend::parse("GPU").unwrap(),
+            Backend::Gpu(DeviceSelector::Auto)
+        );
         assert!(matches!(
             Backend::parse("vulkan:1").unwrap(),
             Backend::Gpu(DeviceSelector::Runtime { index: 1, .. })
@@ -775,5 +1085,176 @@ mod tests {
             Backend::from_selector(DeviceSelector::Name("p104".into())),
             Backend::Gpu(DeviceSelector::Name("p104".into()))
         );
+    }
+
+    #[test]
+    fn api_rank_is_the_order_table() {
+        use wgpu::Backend as B;
+        // the table is the ranking: listed backends rank 0..3 in its order
+        for (i, b) in API_RANK_ORDER.iter().enumerate() {
+            assert_eq!(api_rank(*b), i as u8, "{b:?}");
+        }
+        // anything unlisted ranks last
+        assert_eq!(api_rank(B::BrowserWebGpu), 4);
+        assert_eq!(api_rank(B::Noop), 4);
+        // the platform's native API is preferred over its translation layer
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(API_RANK_ORDER[0], B::Metal);
+            assert!(api_rank(B::Metal) < api_rank(B::Vulkan));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(API_RANK_ORDER[0], B::Vulkan);
+            assert!(api_rank(B::Vulkan) < api_rank(B::Metal));
+        }
+    }
+
+    fn dev(name: &str, backend: wgpu::Backend, device_type: wgpu::DeviceType) -> DeviceInfo {
+        DeviceInfo {
+            name: name.to_string(),
+            backend,
+            device_type,
+            driver: String::new(),
+            driver_info: String::new(),
+            max_binding_bytes: 0,
+            max_workgroup_storage: 0,
+        }
+    }
+
+    #[test]
+    fn list_targets_sorts_class_then_api_then_name() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, VirtualGpu};
+        let mut found = vec![
+            dev("llvmpipe", wgpu::Backend::Vulkan, Cpu),
+            dev("igpu", wgpu::Backend::Vulkan, IntegratedGpu),
+            dev("vgpu", wgpu::Backend::Vulkan, VirtualGpu),
+            dev("card-b", wgpu::Backend::Vulkan, DiscreteGpu),
+            dev("card-a", wgpu::Backend::Vulkan, DiscreteGpu),
+            dev("vivante", wgpu::Backend::Gl, DiscreteGpu),
+        ];
+        found.sort_by_key(target_sort_key);
+        let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
+        // the old key sorted the debug string of the class, which put the CPU
+        // adapter first; class ordering is numeric now
+        assert_eq!(
+            names,
+            vec!["card-a", "card-b", "vivante", "igpu", "vgpu", "llvmpipe"]
+        );
+        assert!(target_sort_key(&found[0]).0 < target_sort_key(&found[5]).0);
+        // API breaks ties inside one class, name breaks the rest
+        let mut gpus = vec![
+            dev("b", wgpu::Backend::Dx12, DiscreteGpu),
+            dev("a", wgpu::Backend::Dx12, DiscreteGpu),
+        ];
+        gpus.sort_by_key(target_sort_key);
+        assert_eq!(gpus[0].name, "a");
+    }
+
+    #[test]
+    fn assemble_wgsl_puts_directives_first() {
+        let body = "\nstruct Dims { m: u32 }\n\n@compute @workgroup_size(1) fn main() {}\n";
+        let out = assemble_wgsl("enable f16;\nvar<workgroup> s: array<f32, 4u>;\n", body);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "enable f16;");
+        assert_eq!(lines[1], "var<workgroup> s: array<f32, 4u>;");
+        assert!(out.contains("struct Dims"));
+        assert!(out.contains("fn main()"));
+
+        // directives from both halves are collected, de-duplicated, and none
+        // of them survives where the body had it
+        let out = assemble_wgsl(
+            "enable f16;\nenable f16;\n",
+            "enable f16;\nstruct A { x: u32 }\n",
+        );
+        assert_eq!(out.matches("enable f16;").count(), 1, "{out}");
+        assert!(out.starts_with("enable f16;\n"), "{out}");
+        assert!(out.contains("struct A"));
+
+        // `enable subgroups;` is never emitted
+        let out = assemble_wgsl(
+            "enable subgroups;\nstruct P { x: u32 }\n",
+            "struct Cfg { n: u32 }\n",
+        );
+        assert!(!out.contains("subgroups"), "{out}");
+        assert!(out.starts_with("struct P"), "{out}");
+    }
+
+    #[test]
+    fn assemble_wgsl_leaves_a_plain_body_alone() {
+        let body = "\nstruct Cfg { n: u32 }\n";
+        assert_eq!(assemble_wgsl("", body), body);
+        // with no directives anywhere, a prelude is simply prepended
+        let out = assemble_wgsl("struct P { x: u32 }\n", "struct Cfg { n: u32 }\n");
+        assert!(out.starts_with("struct P"), "{out}");
+        assert!(out.contains("struct Cfg"), "{out}");
+    }
+
+    #[test]
+    fn f16_kernel_follows_the_device_and_the_env() {
+        assert!(!resolve_f16_kernel(false, None));
+        for v in ["0", "false", "off", "FALSE", "Off", " 0 "] {
+            assert!(!resolve_f16_kernel(true, Some(v)), "{v}");
+        }
+        for v in ["1", "true", "on", "auto", "", "TRUE", "Auto"] {
+            assert!(resolve_f16_kernel(true, Some(v)), "{v}");
+        }
+        assert!(resolve_f16_kernel(true, None));
+        // no environment value can compile an f16 module on a device that
+        // never advertised the feature
+        for v in ["1", "true", "on", "auto"] {
+            assert!(!resolve_f16_kernel(false, Some(v)), "{v}");
+        }
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ctc-aligner-test-{}-{nanos}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pipeline_cache_writes_atomically_and_only_when_it_changed() {
+        let dir = scratch_dir("cache");
+        let path = dir.join("nested").join("dev.pipeline_cache");
+        let mut last = Vec::new();
+
+        // nothing to save: no file, and no directory either
+        assert!(!persist_cache_bytes(&path, &[], &mut last).unwrap());
+        assert!(!dir.join("nested").exists());
+        assert!(last.is_empty());
+
+        // the first real save creates the parents and lands the bytes
+        assert!(persist_cache_bytes(&path, b"one", &mut last).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        assert_eq!(last, b"one");
+
+        // identical bytes: skipped, so the file keeps its timestamp
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!persist_cache_bytes(&path, b"one", &mut last).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+
+        // a change replaces the file in place, leaving no temp sibling
+        assert!(persist_cache_bytes(&path, b"two", &mut last).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(last, b"two");
+        let left: Vec<_> = std::fs::read_dir(dir.join("nested"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

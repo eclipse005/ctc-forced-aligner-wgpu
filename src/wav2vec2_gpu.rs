@@ -49,7 +49,21 @@ fn flat_grid(total: u32) -> (u32, u32) {
 /// of 4, so `view[base / 4]` addresses every tile exactly. Otherwise the
 /// shader falls back to four scalar loads (same values, same order).
 fn vec4_ok(off: u32, stride: u32, z: u32) -> u32 {
-    u32::from(off % 4 == 0 && stride % 4 == 0 && z % 4 == 0)
+    u32::from(off.is_multiple_of(4) && stride.is_multiple_of(4) && z.is_multiple_of(4))
+}
+
+/// The little-endian bytes of `data`: borrowed in place on the little-endian
+/// hosts this runs on, converted only where the byte order differs, so a
+/// multi-GiB weight upload costs no temporary heap.
+fn le_bytes(data: &[f32]) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(target_endian = "little")]
+    {
+        std::borrow::Cow::Borrowed(bytemuck::cast_slice(data))
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        std::borrow::Cow::Owned(data.iter().flat_map(|f| f.to_le_bytes()).collect())
+    }
 }
 
 /// `[out, in_pg, taps]` → `[group, tap * in_pg + ci, oc]`, oc contiguous.
@@ -57,17 +71,76 @@ fn transpose_pos(w: &[f32], out_c: usize, in_pg: usize, taps: usize) -> Vec<f32>
     debug_assert_eq!(w.len(), out_c * in_pg * taps);
     let k_total = in_pg * taps;
     let mut out = vec![0f32; w.len()];
-    out.par_chunks_mut(in_pg).enumerate().for_each(|(idx, dst)| {
-        let g = idx / k_total;
-        let kval = idx % k_total;
-        let tk = kval / in_pg;
-        let ci = kval % in_pg;
-        for oc in 0..in_pg {
-            let o = g * in_pg + oc;
-            dst[oc] = w[(o * in_pg + ci) * taps + tk];
-        }
-    });
+    out.par_chunks_mut(in_pg)
+        .enumerate()
+        .for_each(|(idx, dst)| {
+            let g = idx / k_total;
+            let kval = idx % k_total;
+            let tk = kval / in_pg;
+            let ci = kval % in_pg;
+            for oc in 0..in_pg {
+                let o = g * in_pg + oc;
+                dst[oc] = w[(o * in_pg + ci) * taps + tk];
+            }
+        });
     out
+}
+
+/// Encoder frame rate for the `--window` advice: the conv stack strides 320
+/// samples of 16 kHz audio per output frame.
+const FRAMES_PER_SEC: u64 = 50;
+
+/// The largest whole-second window whose `scores` and `logits` both fit the
+/// adapter's binding limit.
+///
+/// `scores` is `heads · t²` f32 and so falls with the square of the window,
+/// `logits` is `t · vocab` f32 and falls linearly; each gives its own ceiling
+/// and the smaller wins. Kept at 1 so the advice is always actionable.
+fn recommended_window_secs(
+    t: usize,
+    scores_bytes: u64,
+    logits_bytes: u64,
+    max_binding: u64,
+) -> u64 {
+    let t = t.max(1) as f64;
+    let max = max_binding as f64;
+    let linear = if logits_bytes == 0 {
+        t
+    } else {
+        t * (max / logits_bytes as f64).min(1.0)
+    };
+    let quadratic = if scores_bytes == 0 {
+        t
+    } else {
+        t * (max / scores_bytes as f64).min(1.0).sqrt()
+    };
+    let frames = linear.min(quadratic);
+    ((frames / FRAMES_PER_SEC as f64) as u64).max(1)
+}
+
+/// Refuse a window whose attention scores or logits cannot be bound before a
+/// single buffer is allocated.
+///
+/// A buffer bigger than `max_storage_buffer_binding_size` cannot be bound at
+/// all, so the failure would otherwise surface as a validation error from
+/// inside the first dispatch, with nothing pointing at the window length.
+fn check_binding_limits(
+    t: usize,
+    scores_bytes: u64,
+    logits_bytes: u64,
+    max_binding: u64,
+) -> Result<()> {
+    let window = recommended_window_secs(t, scores_bytes, logits_bytes, max_binding);
+    for (what, need) in [("attention scores", scores_bytes), ("logits", logits_bytes)] {
+        if need > max_binding {
+            anyhow::bail!(
+                "a {t}-frame window needs {need} B for the {what}, over this adapter's \
+                 max_storage_buffer_binding_size of {max_binding} B; use --window {window} \
+                 (seconds) or less"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -144,6 +217,26 @@ struct Job {
     gz: u32,
 }
 
+/// One encoder layer's prepared weights, in upload order.
+///
+/// The biases travel with their weights: unpacking a `(Vec<f32>, Vec<f32>)`
+/// tuple to keep only the bias is what made the loader read `k_proj`,
+/// `v_proj` and `final_layer_norm` twice per layer.
+struct LayerWeights {
+    qkv_wt: Vec<f32>,
+    qkv_b: Vec<f32>,
+    out_wt: Vec<f32>,
+    out_b: Vec<f32>,
+    ff1_wt: Vec<f32>,
+    ff1_b: Vec<f32>,
+    ff2_wt: Vec<f32>,
+    ff2_b: Vec<f32>,
+    ln1_w: Vec<f32>,
+    ln1_b: Vec<f32>,
+    ln2_w: Vec<f32>,
+    ln2_b: Vec<f32>,
+}
+
 struct Pipe {
     gemm: wgpu::ComputePipeline,
     conv_gemm: wgpu::ComputePipeline,
@@ -192,6 +285,9 @@ pub(crate) struct GpuModel {
     /// covers the same output with a different grid.
     gemm_mt: u32,
     gemm_nt: u32,
+    /// The positional conv's M tile, likewise read off the compiled kernel:
+    /// an adapter under 26 KiB of workgroup storage runs the 64-frame tile.
+    pos_mt: u32,
     /// Staging recycled across windows. Two sets: the one being copied and
     /// the one being collected. A window above 16 MB uses the transfer queue
     /// when the device has one. The hidden readback (~7 MB) stays on wgpu's
@@ -247,8 +343,14 @@ impl GpuModel {
         let tensors = crate::weights::load_tensors(model_dir)?;
 
         // ---- pos-conv weight norm, resolved exactly like the CPU twin
-        let g = get_f32(&tensors, "wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original0")?;
-        let v = get_f32(&tensors, "wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original1")?;
+        let g = get_f32(
+            &tensors,
+            "wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original0",
+        )?;
+        let v = get_f32(
+            &tensors,
+            "wav2vec2.encoder.pos_conv_embed.conv.parametrizations.weight.original1",
+        )?;
         let (out_c, in_pg, k) = (v.1[0], v.1[1], v.1[2]);
         let mut pos_w = v.0.clone();
         for kk in 0..k {
@@ -294,9 +396,12 @@ impl GpuModel {
         let conv_wt: Vec<Vec<f32>> = (1..7)
             .map(|i| {
                 let (out, cin, kk) = (512usize, 512usize, cfg.conv_kernel[i]);
-                let w = get_f32(&tensors, &format!("wav2vec2.feature_extractor.conv_layers.{i}.conv.weight"))
-                    .unwrap()
-                    .0;
+                let w = get_f32(
+                    &tensors,
+                    &format!("wav2vec2.feature_extractor.conv_layers.{i}.conv.weight"),
+                )
+                .unwrap()
+                .0;
                 let mut wt = vec![0.0f32; kk * cin * out];
                 wt.par_chunks_mut(out).enumerate().for_each(|(idx, row)| {
                     let t = idx / cin;
@@ -308,8 +413,16 @@ impl GpuModel {
                 wt
             })
             .collect();
-        let lm_wt = transpose(&get_f32(&tensors, "lm_head.weight")?.0, cfg.vocab_size, cfg.hidden_size);
-        let fp_wt = transpose(&get_f32(&tensors, "wav2vec2.feature_projection.projection.weight")?.0, cfg.hidden_size, 512);
+        let lm_wt = transpose(
+            &get_f32(&tensors, "lm_head.weight")?.0,
+            cfg.vocab_size,
+            cfg.hidden_size,
+        );
+        let fp_wt = transpose(
+            &get_f32(&tensors, "wav2vec2.feature_projection.projection.weight")?.0,
+            cfg.hidden_size,
+            512,
+        );
 
         let lin = |name: String| -> Result<(Vec<f32>, Vec<f32>)> {
             let w = get_f32(&tensors, &format!("{name}.weight"))?.0;
@@ -317,74 +430,72 @@ impl GpuModel {
             Ok((w, b))
         };
 
-        let layers: Vec<(Vec<f32>, [Vec<f32>; 10])> = (0..cfg.num_hidden_layers)
+        let layers: Vec<LayerWeights> = (0..cfg.num_hidden_layers)
             .into_par_iter()
             .map(|i| {
                 let base = |sub: &str| format!("wav2vec2.encoder.layers.{i}.{sub}");
                 let tr = |w: &[f32], out: usize, inp: usize| transpose(w, out, inp);
+                let hs = cfg.hidden_size;
+                // one read per tensor: the weight is 4 MiB a layer, so asking
+                // for it twice cost ~1.1 GB of pure copies over 24 layers
                 let (qw, qb) = lin(base("attention.q_proj")).unwrap();
-                let (kw, _kb) = lin(base("attention.k_proj")).unwrap();
-                let (vw, _vb) = lin(base("attention.v_proj")).unwrap();
-                let (kb, vb) = (
-                    lin(base("attention.k_proj")).unwrap().1,
-                    lin(base("attention.v_proj")).unwrap().1,
-                );
+                let (kw, kb) = lin(base("attention.k_proj")).unwrap();
+                let (vw, vb) = lin(base("attention.v_proj")).unwrap();
                 let (ow, ob) = lin(base("attention.out_proj")).unwrap();
                 let (f1w, f1b) = lin(base("feed_forward.intermediate_dense")).unwrap();
                 let (f2w, f2b) = lin(base("feed_forward.output_dense")).unwrap();
                 let (l1w, l1b) = lin(base("layer_norm")).unwrap();
-                let (l2w, _l2b) = lin(base("final_layer_norm")).unwrap();
+                let (l2w, l2b) = lin(base("final_layer_norm")).unwrap();
                 // fused (K, 3K): row k = [Wq[:,k] | Wk[:,k] | Wv[:,k]]
-                let qt = tr(&qw, cfg.hidden_size, cfg.hidden_size);
-                let kt = tr(&kw, cfg.hidden_size, cfg.hidden_size);
-                let vt = tr(&vw, cfg.hidden_size, cfg.hidden_size);
-                let hs = cfg.hidden_size;
+                let qt = tr(&qw, hs, hs);
+                let kt = tr(&kw, hs, hs);
+                let vt = tr(&vw, hs, hs);
                 let mut qkv = vec![0.0f32; hs * 3 * hs];
                 for r in 0..hs {
                     qkv[r * 3 * hs..r * 3 * hs + hs].copy_from_slice(&qt[r * hs..(r + 1) * hs]);
-                    qkv[r * 3 * hs + hs..r * 3 * hs + 2 * hs].copy_from_slice(&kt[r * hs..(r + 1) * hs]);
-                    qkv[r * 3 * hs + 2 * hs..r * 3 * hs + 3 * hs].copy_from_slice(&vt[r * hs..(r + 1) * hs]);
+                    qkv[r * 3 * hs + hs..r * 3 * hs + 2 * hs]
+                        .copy_from_slice(&kt[r * hs..(r + 1) * hs]);
+                    qkv[r * 3 * hs + 2 * hs..r * 3 * hs + 3 * hs]
+                        .copy_from_slice(&vt[r * hs..(r + 1) * hs]);
                 }
-                let mut qkvb = qb.clone();
+                let mut qkvb = qb;
                 qkvb.extend_from_slice(&kb);
                 qkvb.extend_from_slice(&vb);
-                (
-                    qkvb,
-                    [
-                        qkv,
-                        tr(&ow, cfg.hidden_size, cfg.hidden_size),
-                        ob,
-                        tr(&f1w, cfg.intermediate_size, cfg.hidden_size),
-                        f1b,
-                        tr(&f2w, cfg.hidden_size, cfg.intermediate_size),
-                        f2b,
-                        l1w,
-                        l1b,
-                        l2w,
-                    ],
-                )
-            })
-            .collect();
-        // ln2 biases were folded into the array order: rebuild them
-        let ln2bs: Vec<Vec<f32>> = (0..cfg.num_hidden_layers)
-            .map(|i| {
-                lin(format!("wav2vec2.encoder.layers.{i}.final_layer_norm")).unwrap().1
+                LayerWeights {
+                    qkv_wt: qkv,
+                    qkv_b: qkvb,
+                    out_wt: tr(&ow, hs, hs),
+                    out_b: ob,
+                    ff1_wt: tr(&f1w, cfg.intermediate_size, hs),
+                    ff1_b: f1b,
+                    ff2_wt: tr(&f2w, hs, cfg.intermediate_size),
+                    ff2_b: f2b,
+                    ln1_w: l1w,
+                    ln1_b: l1b,
+                    ln2_w: l2w,
+                    ln2_b: l2b,
+                }
             })
             .collect();
 
         // ---- upload
         let mut up = gpu.uploader();
         let put = |up: &mut BulkUpload, data: &[f32], label: &str| -> wgpu::Buffer {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for f in data {
-                bytes.extend_from_slice(&f.to_le_bytes());
-            }
+            let bytes = le_bytes(data);
             let buf = up.storage(label, bytes.len() as u64);
             up.upload(&buf, &bytes).unwrap();
             buf
         };
 
-        let conv0_w = put(&mut up, &get_f32(&tensors, "wav2vec2.feature_extractor.conv_layers.0.conv.weight")?.0, "conv0.w");
+        let conv0_w = put(
+            &mut up,
+            &get_f32(
+                &tensors,
+                "wav2vec2.feature_extractor.conv_layers.0.conv.weight",
+            )?
+            .0,
+            "conv0.w",
+        );
         let conv_wt_b: Vec<_> = conv_wt
             .iter()
             .enumerate()
@@ -394,22 +505,59 @@ impl GpuModel {
             .map(|i| {
                 put(
                     &mut up,
-                    &get_f32(&tensors, &format!("wav2vec2.feature_extractor.conv_layers.{i}.conv.bias")).unwrap().0,
+                    &get_f32(
+                        &tensors,
+                        &format!("wav2vec2.feature_extractor.conv_layers.{i}.conv.bias"),
+                    )
+                    .unwrap()
+                    .0,
                     &format!("conv{i}.b"),
                 )
             })
             .collect();
         let (mut conv_ln_w, mut conv_ln_b) = (Vec::new(), Vec::new());
         for i in 0..7 {
-            conv_ln_w.push(put(&mut up, &get_f32(&tensors, &format!("wav2vec2.feature_extractor.conv_layers.{i}.layer_norm.weight"))?.0, &format!("conv{i}.lnw")));
-            conv_ln_b.push(put(&mut up, &get_f32(&tensors, &format!("wav2vec2.feature_extractor.conv_layers.{i}.layer_norm.bias"))?.0, &format!("conv{i}.lnb")));
+            conv_ln_w.push(put(
+                &mut up,
+                &get_f32(
+                    &tensors,
+                    &format!("wav2vec2.feature_extractor.conv_layers.{i}.layer_norm.weight"),
+                )?
+                .0,
+                &format!("conv{i}.lnw"),
+            ));
+            conv_ln_b.push(put(
+                &mut up,
+                &get_f32(
+                    &tensors,
+                    &format!("wav2vec2.feature_extractor.conv_layers.{i}.layer_norm.bias"),
+                )?
+                .0,
+                &format!("conv{i}.lnb"),
+            ));
         }
-        let fp_ln_w = put(&mut up, &get_f32(&tensors, "wav2vec2.feature_projection.layer_norm.weight")?.0, "fp.lnw");
-        let fp_ln_b = put(&mut up, &get_f32(&tensors, "wav2vec2.feature_projection.layer_norm.bias")?.0, "fp.lnb");
+        let fp_ln_w = put(
+            &mut up,
+            &get_f32(&tensors, "wav2vec2.feature_projection.layer_norm.weight")?.0,
+            "fp.lnw",
+        );
+        let fp_ln_b = put(
+            &mut up,
+            &get_f32(&tensors, "wav2vec2.feature_projection.layer_norm.bias")?.0,
+            "fp.lnb",
+        );
         let fp_wt_b = put(&mut up, &fp_wt, "fp.wt");
-        let fp_b = put(&mut up, &get_f32(&tensors, "wav2vec2.feature_projection.projection.bias")?.0, "fp.b");
+        let fp_b = put(
+            &mut up,
+            &get_f32(&tensors, "wav2vec2.feature_projection.projection.bias")?.0,
+            "fp.b",
+        );
         let pos_w_b = put(&mut up, &pos_wt, "pos.w");
-        let pos_b_b = put(&mut up, &get_f32(&tensors, "wav2vec2.encoder.pos_conv_embed.conv.bias")?.0, "pos.b");
+        let pos_b_b = put(
+            &mut up,
+            &get_f32(&tensors, "wav2vec2.encoder.pos_conv_embed.conv.bias")?.0,
+            "pos.b",
+        );
 
         let mut qkv_wt_b = Vec::new();
         let mut qkv_b_b = Vec::new();
@@ -422,28 +570,34 @@ impl GpuModel {
         let mut ln1_w_b = Vec::new();
         let mut ln1_b_b = Vec::new();
         let mut ln2_w_b = Vec::new();
-        for (i, (qkvb, arr)) in layers.iter().enumerate() {
-            let base = |sub: &str| format!("wav2vec2.encoder.layers.{i}.{sub}");
-            qkv_wt_b.push(put(&mut up, &arr[0], &format!("l{i}.qkvt")));
-            qkv_b_b.push(put(&mut up, qkvb, &format!("l{i}.qkvb")));
-            out_wt_b.push(put(&mut up, &arr[1], &format!("l{i}.outwt")));
-            out_b_b.push(put(&mut up, &arr[2], &format!("l{i}.outb")));
-            ff1_wt_b.push(put(&mut up, &arr[3], &format!("l{i}.ff1wt")));
-            ff1_b_b.push(put(&mut up, &arr[4], &format!("l{i}.ff1b")));
-            ff2_wt_b.push(put(&mut up, &arr[5], &format!("l{i}.ff2wt")));
-            ff2_b_b.push(put(&mut up, &arr[6], &format!("l{i}.ff2b")));
-            ln1_w_b.push(put(&mut up, &arr[7], &format!("l{i}.ln1w")));
-            ln1_b_b.push(put(&mut up, &arr[8], &format!("l{i}.ln1b")));
-            let _ = base;
-            ln2_w_b.push(put(&mut up, &arr[9], &format!("l{i}.ln2w")));
+        for (i, l) in layers.iter().enumerate() {
+            qkv_wt_b.push(put(&mut up, &l.qkv_wt, &format!("l{i}.qkvt")));
+            qkv_b_b.push(put(&mut up, &l.qkv_b, &format!("l{i}.qkvb")));
+            out_wt_b.push(put(&mut up, &l.out_wt, &format!("l{i}.outwt")));
+            out_b_b.push(put(&mut up, &l.out_b, &format!("l{i}.outb")));
+            ff1_wt_b.push(put(&mut up, &l.ff1_wt, &format!("l{i}.ff1wt")));
+            ff1_b_b.push(put(&mut up, &l.ff1_b, &format!("l{i}.ff1b")));
+            ff2_wt_b.push(put(&mut up, &l.ff2_wt, &format!("l{i}.ff2wt")));
+            ff2_b_b.push(put(&mut up, &l.ff2_b, &format!("l{i}.ff2b")));
+            ln1_w_b.push(put(&mut up, &l.ln1_w, &format!("l{i}.ln1w")));
+            ln1_b_b.push(put(&mut up, &l.ln1_b, &format!("l{i}.ln1b")));
+            ln2_w_b.push(put(&mut up, &l.ln2_w, &format!("l{i}.ln2w")));
         }
-        let ln2_b_buf: Vec<_> = ln2bs
+        let ln2_b_buf: Vec<_> = layers
             .iter()
             .enumerate()
-            .map(|(i, b)| put(&mut up, b, &format!("l{i}.ln2b")))
+            .map(|(i, l)| put(&mut up, &l.ln2_b, &format!("l{i}.ln2b")))
             .collect();
-        let final_ln_w = put(&mut up, &get_f32(&tensors, "wav2vec2.encoder.layer_norm.weight")?.0, "final.lnw");
-        let final_ln_b = put(&mut up, &get_f32(&tensors, "wav2vec2.encoder.layer_norm.bias")?.0, "final.lnb");
+        let final_ln_w = put(
+            &mut up,
+            &get_f32(&tensors, "wav2vec2.encoder.layer_norm.weight")?.0,
+            "final.lnw",
+        );
+        let final_ln_b = put(
+            &mut up,
+            &get_f32(&tensors, "wav2vec2.encoder.layer_norm.bias")?.0,
+            "final.lnb",
+        );
         let lm_wt_b = put(&mut up, &lm_wt, "lm.wt");
         let lm_b_b = put(&mut up, &get_f32(&tensors, "lm_head.bias")?.0, "lm.b");
         let zeros = put(&mut up, &vec![0.0f32; 4096], "zeros");
@@ -464,14 +618,18 @@ impl GpuModel {
         // The adapter's workgroup-storage limit is an input to both the
         // choice and the shader generation, so a tile that cannot compile on
         // this backend is refused before any pipeline is created.
-        let max_storage = gpu.device.limits().max_compute_workgroup_storage_size;
+        let max_storage = gpu.limits().max_compute_workgroup_storage_size;
         let variant = shaders::pick_gemm_variant(max_storage);
         let (gemm_mt, gemm_nt) = shaders::gemm_tile(variant);
+        let (pos_src, pos_mt) = shaders::pos_conv(max_storage);
         let pipes = Pipe {
             gemm: mk_gemm(&shaders::gemm_variant(variant, max_storage), "gemm")?,
-            conv_gemm: mk_gemm(&shaders::conv_gemm_variant(variant, max_storage), "conv_gemm")?,
+            conv_gemm: mk_gemm(
+                &shaders::conv_gemm_variant(variant, max_storage),
+                "conv_gemm",
+            )?,
             conv0: mk(&shaders::conv0(), "conv0")?,
-            pos_conv: mk_gemm(&shaders::pos_conv(max_storage), "pos_conv")?,
+            pos_conv: mk_gemm(&pos_src, "pos_conv")?,
             ln: mk(&shaders::layernorm(), "ln")?,
             ln_sd: mk(&shaders::layernorm_sd(), "ln_sd")?,
             add: mk(&shaders::add(), "add")?,
@@ -480,6 +638,9 @@ impl GpuModel {
             transpose: mk(&shaders::transpose(), "transpose")?,
             gather: mk(&shaders::gather(), "gather")?,
         };
+        // The cache is a warm-start optimisation: an unwritable cache
+        // directory must not fail a model load.
+        let _ = gpu.save_pipeline_cache();
 
         Ok(Self {
             gpu,
@@ -487,6 +648,7 @@ impl GpuModel {
             pipes,
             gemm_mt,
             gemm_nt,
+            pos_mt,
             readback: std::sync::Mutex::new(Vec::new()),
             xfer: std::sync::OnceLock::new(),
             conv0_w,
@@ -544,7 +706,6 @@ impl GpuModel {
     pub fn reset_scratch(&self) {
         *self.scratch.lock().unwrap() = None;
     }
-
 
     /// Forward one z-normalised chunk; returns log_probs (T, V) on the host.
     pub fn forward(&self, input: &[f32]) -> Result<Vec<f32>> {
@@ -607,7 +768,7 @@ impl GpuModel {
     }
 
     pub(crate) fn supports_f64(&self) -> bool {
-        self.gpu.features.contains(wgpu::Features::SHADER_F64)
+        self.gpu.has_f64()
     }
 
     /// Compile the f64 Viterbi pipelines and allocate the per-file buffers.
@@ -763,7 +924,9 @@ impl GpuModel {
         let bytes = self.gpu.readback(dp.states_buf(), (t_len * 4) as u64)?;
         anyhow::ensure!(bytes.len() == t_len * 4, "state readback short");
         let states: Vec<i32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         Ok((states, total))
@@ -786,7 +949,10 @@ impl GpuModel {
         let hidden_u = u32::try_from(hidden).context("hidden")?;
         let prof = crate::viterbi_gpu::dp_prof::enabled();
         let t_rec = prof.then(std::time::Instant::now);
-        let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let guard = self
+            .gpu
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
         self.gpu
             .upload(dp.stage(), bytemuck::cast_slice(dp.hidden_rows(frame, m)?));
         let dims = GemmDims {
@@ -824,31 +990,40 @@ impl GpuModel {
         let gemm_layout = self.pipes.gemm.get_bind_group_layout(0);
         let ls_layout = self.pipes.log_softmax.get_bind_group_layout(0);
         let stage = dp.stage().clone();
-        let gemm_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("dp-replay-gemm"),
-            layout: &gemm_layout,
-            entries: &[
-                score_buf(0, &stage),
-                score_buf(1, &self.lm_wt),
-                score_buf(2, &self.lm_b),
-                score_buf(3, logits),
-                score_uni(4, &uni, 0, gemm_bytes.len() as u64),
-                score_buf(5, &self.zeros),
-                score_buf(6, &stage),
-                score_buf(7, &self.lm_wt),
-            ],
-        });
-        let ls_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("dp-replay-logsoftmax"),
-            layout: &ls_layout,
-            entries: &[
-                score_buf(0, logits),
-                score_uni(1, &uni, 256, ls_bytes.len() as u64),
-            ],
-        });
-        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("dp-replay"),
-        });
+        let gemm_bg = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dp-replay-gemm"),
+                layout: &gemm_layout,
+                entries: &[
+                    score_buf(0, &stage),
+                    score_buf(1, &self.lm_wt),
+                    score_buf(2, &self.lm_b),
+                    score_buf(3, logits),
+                    score_uni(4, &uni, 0, gemm_bytes.len() as u64),
+                    score_buf(5, &self.zeros),
+                    score_buf(6, &stage),
+                    score_buf(7, &self.lm_wt),
+                ],
+            });
+        let ls_bg = self
+            .gpu
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dp-replay-logsoftmax"),
+                layout: &ls_layout,
+                entries: &[
+                    score_buf(0, logits),
+                    score_uni(1, &uni, 256, ls_bytes.len() as u64),
+                ],
+            });
+        let mut enc = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dp-replay"),
+            });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("dp-replay-gemm"),
@@ -872,14 +1047,18 @@ impl GpuModel {
             let (gx, gy) = row_grid(m as u32);
             pass.dispatch_workgroups(gx, gy, 1);
         }
-        let steps = dp.record_steps(&self.gpu, &mut enc, logits, self.cfg.vocab_size, m, back_row0)?;
+        let steps = dp.record_steps(
+            &self.gpu,
+            &mut enc,
+            logits,
+            self.cfg.vocab_size,
+            m,
+            back_row0,
+        )?;
         self.gpu.queue.submit([enc.finish()]);
         drop((gemm_bg, ls_bg, uni, steps));
         if let Some(t) = t_rec {
-            crate::viterbi_gpu::dp_prof::add(
-                &crate::viterbi_gpu::dp_prof::RECORD_US,
-                t.elapsed(),
-            );
+            crate::viterbi_gpu::dp_prof::add(&crate::viterbi_gpu::dp_prof::RECORD_US, t.elapsed());
         }
         let t_sub = prof.then(std::time::Instant::now);
         self.gpu
@@ -891,10 +1070,7 @@ impl GpuModel {
             anyhow::bail!("gpu viterbi traceback: {e}");
         }
         if let Some(t) = t_sub {
-            crate::viterbi_gpu::dp_prof::add(
-                &crate::viterbi_gpu::dp_prof::SUBMIT_US,
-                t.elapsed(),
-            );
+            crate::viterbi_gpu::dp_prof::add(&crate::viterbi_gpu::dp_prof::SUBMIT_US, t.elapsed());
         }
         Ok(())
     }
@@ -933,15 +1109,16 @@ impl GpuModel {
         let gemm_layout = self.pipes.gemm.get_bind_group_layout(0);
         let ls_layout = self.pipes.log_softmax.get_bind_group_layout(0);
         let uni = self.gpu.uniform("dp-score-uni", 768);
-        let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let guard = self
+            .gpu
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
 
         let mut row = 0usize;
         while row < t_len {
             let m = (t_len - row).min(rows_cap).min(dp.chunk_limit());
-            self.gpu.upload(
-                dp.stage(),
-                bytemuck::cast_slice(dp.hidden_rows(row, m)?),
-            );
+            self.gpu
+                .upload(dp.stage(), bytemuck::cast_slice(dp.hidden_rows(row, m)?));
             let dims = GemmDims {
                 m: m as u32,
                 n: vocab,
@@ -976,28 +1153,34 @@ impl GpuModel {
             raw[512..512 + gather.len()].copy_from_slice(&gather);
             self.gpu.queue.write_buffer(&uni, 0, &raw);
 
-            let gemm_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("dp-score-gemm"),
-                layout: &gemm_layout,
-                entries: &[
-                    score_buf(0, dp.stage()),
-                    score_buf(1, &self.lm_wt),
-                    score_buf(2, &self.lm_b),
-                    score_buf(3, &logits),
-                    score_uni(4, &uni, 0, gemm_bytes.len() as u64),
-                    score_buf(5, &self.zeros),
-                    score_buf(6, dp.stage()),
-                    score_buf(7, &self.lm_wt),
-                ],
-            });
-            let ls_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("dp-score-logsoftmax"),
-                layout: &ls_layout,
-                entries: &[
-                    score_buf(0, &logits),
-                    score_uni(1, &uni, 256, ls_bytes.len() as u64),
-                ],
-            });
+            let gemm_bg = self
+                .gpu
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("dp-score-gemm"),
+                    layout: &gemm_layout,
+                    entries: &[
+                        score_buf(0, dp.stage()),
+                        score_buf(1, &self.lm_wt),
+                        score_buf(2, &self.lm_b),
+                        score_buf(3, &logits),
+                        score_uni(4, &uni, 0, gemm_bytes.len() as u64),
+                        score_buf(5, &self.zeros),
+                        score_buf(6, dp.stage()),
+                        score_buf(7, &self.lm_wt),
+                    ],
+                });
+            let ls_bg = self
+                .gpu
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("dp-score-logsoftmax"),
+                    layout: &ls_layout,
+                    entries: &[
+                        score_buf(0, &logits),
+                        score_uni(1, &uni, 256, ls_bytes.len() as u64),
+                    ],
+                });
             let gather_bg = dp.gather_bind_group(&self.gpu, &logits, &uni, 512);
             let mut enc = self
                 .gpu
@@ -1053,7 +1236,7 @@ impl GpuModel {
         let bytes = self.gpu.readback(dp.score_buf(), (t_len * 4) as u64)?;
         anyhow::ensure!(bytes.len() == t_len * 4, "score readback short");
         let mut out = Vec::with_capacity(t_len);
-        for c in bytes.chunks_exact(4) {
+        for c in bytes.as_chunks::<4>().0 {
             let mut b = [0u8; 4];
             b.copy_from_slice(c);
             out.push(f64::from(f32::from_le_bytes(b)));
@@ -1091,7 +1274,7 @@ impl GpuModel {
         read_hidden: bool,
         keep: Option<(usize, usize)>,
         stars: &[u32],
-        mut prev: Option<&mut GpuPending>,
+        prev: Option<&mut GpuPending>,
         download: bool,
     ) -> Result<GpuPending> {
         let gpu = &self.gpu;
@@ -1121,13 +1304,32 @@ impl GpuModel {
                 "sequence of {t} frames is too long for one GPU forward; use --window 30"
             );
         }
+        // A 30 s window is 144 MB of scores and 62 MB of logits; a 90 s one is
+        // 1.3 GB of scores, past what a 2 GiB adapter can bind at all. Both
+        // buffers are checked before anything is allocated, so the failure
+        // names the window instead of surfacing as a bind-group error.
+        let scores_bytes = (scores_n as u64)
+            .checked_mul(4)
+            .context("attention scores size overflow")?;
+        let logits_bytes = ((if read_hidden { t * hidden } else { t * vocab }) as u64)
+            .checked_mul(4)
+            .context("logits size overflow")?;
+        check_binding_limits(
+            t,
+            scores_bytes,
+            logits_bytes,
+            gpu.limits().max_storage_buffer_binding_size,
+        )?;
         let (x_in, convs, cached, mut act, ubuf, gather_buf) = {
             let mut guard = self.scratch.lock().unwrap();
             let gathered = gather.is_some();
             let reuse = guard
                 .as_ref()
                 .map(|s| {
-                    s.n_in == input.len() && s.t == t && s.gathered == gathered && s.hidden == read_hidden
+                    s.n_in == input.len()
+                        && s.t == t
+                        && s.gathered == gathered
+                        && s.hidden == read_hidden
                 })
                 .unwrap_or(false);
             if !reuse {
@@ -1293,7 +1495,10 @@ impl GpuModel {
 
         macro_rules! bind {
             ($idx:expr, $b:expr) => {
-                wgpu::BindGroupEntry { binding: $idx, resource: $b.as_entire_binding() }
+                wgpu::BindGroupEntry {
+                    binding: $idx,
+                    resource: $b.as_entire_binding(),
+                }
             };
         }
 
@@ -1310,297 +1515,545 @@ impl GpuModel {
             uni = bytes;
         }
         if !use_cache {
-        // ---- conv0 (raw waveform -> (T0, 512))
-        dispatch!(
-            P_CONV0,
-            Cfg4 { a: t0 as u32, b: 512, c: self.cfg.conv_kernel[0] as u32, d: self.cfg.conv_stride[0] as u32 },
-            (t0 as u32).div_ceil(16), (512u32).div_ceil(16),
-            bind!(0, &x_in), bind!(1, &self.conv0_w), bind!(2, &self.conv_b[0]), bind!(3, &convs[0]),
-        );
-        dispatch!(
-            P_LN,
-            Cfg4 { a: t0 as u32, b: 512, c: 10, d: 1 }, // eps 1e-5 -> 10 * 1e-6; gelu on
-            row_grid(t0 as u32).0, row_grid(t0 as u32).1,
-            bind!(0, &convs[0]), bind!(1, &self.conv_ln_w[0]), bind!(2, &self.conv_ln_b[0]),
-        );
-
-        // ---- conv layers 1..6 (each reads the previous layer's buffer)
-        let mut rows = t0;
-        for i in 1..7 {
-            let tout = (rows - self.cfg.conv_kernel[i]) / self.cfg.conv_stride[i] + 1;
+            // ---- conv0 (raw waveform -> (T0, 512))
             dispatch!(
-                P_CONV_GEMM,
-                ConvDims {
-                    m: tout as u32, n: 512,
-                    k: (self.cfg.conv_kernel[i] * 512) as u32,
-                    c_in: 512, stride: self.cfg.conv_stride[i] as u32, t_in: rows as u32,
-                    a_vec: 1, b_vec: 1,
+                P_CONV0,
+                Cfg4 {
+                    a: t0 as u32,
+                    b: 512,
+                    c: self.cfg.conv_kernel[0] as u32,
+                    d: self.cfg.conv_stride[0] as u32
                 },
-                (tout as u32).div_ceil(gemm_mt), (512u32).div_ceil(gemm_nt),
-                bind!(0, &convs[i - 1]), bind!(1, &self.conv_wt[i - 1]), bind!(2, &self.conv_b[i]), bind!(3, &convs[i]),
-                bind!(5, &convs[i - 1]), bind!(6, &self.conv_wt[i - 1]),
+                (t0 as u32).div_ceil(16),
+                (512u32).div_ceil(16),
+                bind!(0, &x_in),
+                bind!(1, &self.conv0_w),
+                bind!(2, &self.conv_b[0]),
+                bind!(3, &convs[0]),
             );
             dispatch!(
                 P_LN,
-                Cfg4 { a: tout as u32, b: 512, c: 10, d: 1 },
-                row_grid(tout as u32).0, row_grid(tout as u32).1,
-                bind!(0, &convs[i]), bind!(1, &self.conv_ln_w[i]), bind!(2, &self.conv_ln_b[i]),
+                Cfg4 {
+                    a: t0 as u32,
+                    b: 512,
+                    c: 10,
+                    d: 1
+                }, // eps 1e-5 -> 10 * 1e-6; gelu on
+                row_grid(t0 as u32).0,
+                row_grid(t0 as u32).1,
+                bind!(0, &convs[0]),
+                bind!(1, &self.conv_ln_w[0]),
+                bind!(2, &self.conv_ln_b[0]),
             );
-            rows = tout;
-        }
-        let cur = &convs[6];
 
-        // ---- feature projection: LN(512) on conv6 output, then Linear(512->1024)
-        dispatch!(
-            P_LN,
-            Cfg4 { a: rows as u32, b: 512, c: 10, d: 0 },
-            row_grid(rows as u32).0, row_grid(rows as u32).1,
-            bind!(0, &cur), bind!(1, &self.fp_ln_w), bind!(2, &self.fp_ln_b),
-        );
-        dispatch!(
-            P_GEMM,
-            GemmDims {
-                m: rows as u32, n: hidden as u32, k: 512,
-                a_stride: 512, b_stride: hidden as u32, c_stride: hidden as u32,
-                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
-                a_vec: vec4_ok(0, 512, 0), b_vec: vec4_ok(0, hidden as u32, 0), _p0: 0,
-            },
-            (rows as u32).div_ceil(gemm_mt), (hidden as u32).div_ceil(gemm_nt),
-            bind!(0, &cur), bind!(1, &self.fp_wt), bind!(2, &self.fp_b), bind!(3, &act.x), bind!(5, &self.zeros),
-            bind!(6, &cur), bind!(7, &self.fp_wt),
-        );
-
-        // ---- positional conv + add. One group per workgroup-y, gelu fused.
-        let pos_groups = self.cfg.num_conv_pos_embedding_groups as u32;
-        let pos_n = (hidden as u32) / pos_groups;
-        let pos_taps = self.cfg.num_conv_pos_embeddings as u32;
-        dispatch!(
-            P_POS,
-            PosDims {
-                m: t as u32,
-                n: pos_n,
-                k: pos_n * pos_taps,
-                c: hidden as u32,
-                in_pg: pos_n,
-                pad: pos_taps / 2,
-                _p0: 0,
-                _p1: 0,
-            },
-            (t as u32).div_ceil(shaders::POS_MT),
-            pos_groups,
-            bind!(0, &act.x), bind!(1, &self.pos_w), bind!(2, &self.pos_b), bind!(3, &act.t1),
-        );
-        // x = x + pos: write to scratch (a buffer cannot be read- and
-        // write-bound in the same dispatch), then swap
-        //
-        // n is t*hidden, so a window past 16384 frames overflows one
-        // dimension's 65535-workgroup limit: at 20 ms per frame that is a
-        // 341 s chunk, which the unchunked path (`--window 0`) can reach.
-        // The add shader folds workgroups across x and y; see `flat_grid`.
-        let (add_x, add_y) = flat_grid((t * hidden) as u32);
-        dispatch!(
-            P_ADD,
-            Cfg4 { a: (t * hidden) as u32, b: 0, c: 0, d: 0 },
-            add_x, add_y,
-            bind!(0, &act.x), bind!(1, &act.t1), bind!(2, &act.t3),
-        );
-        std::mem::swap(&mut act.x, &mut act.t3);
-
-        // ---- encoder layers. Kick splits the recording into command buffers
-        // of 8 layers so a 30 s chunk cannot sit in one submit past TDR.
-        for li in 0..self.cfg.num_hidden_layers {
-            if li > 0 && li % 8 == 0 {
-                kick!();
+            // ---- conv layers 1..6 (each reads the previous layer's buffer)
+            let mut rows = t0;
+            for i in 1..7 {
+                let tout = (rows - self.cfg.conv_kernel[i]) / self.cfg.conv_stride[i] + 1;
+                dispatch!(
+                    P_CONV_GEMM,
+                    ConvDims {
+                        m: tout as u32,
+                        n: 512,
+                        k: (self.cfg.conv_kernel[i] * 512) as u32,
+                        c_in: 512,
+                        stride: self.cfg.conv_stride[i] as u32,
+                        t_in: rows as u32,
+                        a_vec: 1,
+                        b_vec: 1,
+                    },
+                    (tout as u32).div_ceil(gemm_mt),
+                    (512u32).div_ceil(gemm_nt),
+                    bind!(0, &convs[i - 1]),
+                    bind!(1, &self.conv_wt[i - 1]),
+                    bind!(2, &self.conv_b[i]),
+                    bind!(3, &convs[i]),
+                    bind!(5, &convs[i - 1]),
+                    bind!(6, &self.conv_wt[i - 1]),
+                );
+                dispatch!(
+                    P_LN,
+                    Cfg4 {
+                        a: tout as u32,
+                        b: 512,
+                        c: 10,
+                        d: 1
+                    },
+                    row_grid(tout as u32).0,
+                    row_grid(tout as u32).1,
+                    bind!(0, &convs[i]),
+                    bind!(1, &self.conv_ln_w[i]),
+                    bind!(2, &self.conv_ln_b[i]),
+                );
+                rows = tout;
             }
-            let (t_rows, cols) = (t as u32, hidden as u32);
-            // t1 = LN(x): src/dst LN, x stays untouched as the residual
+            let cur = &convs[6];
+
+            // ---- feature projection: LN(512) on conv6 output, then Linear(512->1024)
             dispatch!(
-                P_LN_SD,
-                Cfg4 { a: t_rows, b: cols, c: 10, d: 0 },
-                row_grid(t_rows).0, row_grid(t_rows).1,
-                bind!(0, &act.x), bind!(1, &act.t1), bind!(2, &self.ln1_w[li]), bind!(3, &self.ln1_b[li]),
-            );
-            // qkv
-            dispatch!(
-                P_GEMM,
-                GemmDims {
-                    m: t_rows, n: 3 * cols, k: cols,
-                    a_stride: cols, b_stride: 3 * cols, c_stride: 3 * cols,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
-                    a_vec: vec4_ok(0, cols, 0), b_vec: vec4_ok(0, 3 * cols, 0), _p0: 0,
+                P_LN,
+                Cfg4 {
+                    a: rows as u32,
+                    b: 512,
+                    c: 10,
+                    d: 0
                 },
-                t_rows.div_ceil(gemm_mt), (3 * cols).div_ceil(gemm_nt),
-                bind!(0, &act.t1), bind!(1, &self.qkv_wt[li]), bind!(2, &self.qkv_b[li]), bind!(3, &act.qkv), bind!(5, &self.zeros),
-                bind!(6, &act.t1), bind!(7, &self.qkv_wt[li]),
+                row_grid(rows as u32).0,
+                row_grid(rows as u32).1,
+                bind!(0, &cur),
+                bind!(1, &self.fp_ln_w),
+                bind!(2, &self.fp_ln_b),
             );
-            // K^T: rows hidden, cols t, from qkv rows offset T*1024, stride 3072
             dispatch!(
-                P_TRANSPOSE,
-                // K block starts `hidden` elements into each (T, 3*hidden) row
-                Cfg4 { a: t as u32, b: hidden as u32, c: (3 * hidden) as u32, d: hidden as u32 },
-                (t as u32).div_ceil(16), (hidden as u32).div_ceil(16),
-                bind!(0, &act.qkv), bind!(1, &act.kt),
-            );
-            // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z.
-            // A is a vec4-able slice of qkv; B (kt) strides by t, which is odd
-            // for most windows, so b_vec computes to 0 and the scalar path runs
-            dispatch_z!(
                 P_GEMM,
                 GemmDims {
-                    m: t_rows, n: t_rows, k: head_dim as u32,
-                    a_stride: 3 * cols, b_stride: t as u32, c_stride: t_rows,
-                    a_off: 0, a_z: head_dim as u32,
-                    b_off: 0, b_z: head_dim as u32 * t as u32,
-                    c_off: 0, c_z: t_rows * t_rows,
-                    epilogue: 0,
-                    scale: 0.125, // head_dim^-0.5: the attention scaling
-                    a_vec: vec4_ok(0, 3 * cols, head_dim as u32),
-                    b_vec: vec4_ok(0, t as u32, head_dim as u32 * t as u32),
-                    _p0: 0,
-                },
-                t_rows.div_ceil(gemm_mt), t_rows.div_ceil(gemm_nt), heads as u32,
-                bind!(0, &act.qkv), bind!(1, &act.kt), bind!(2, &self.zeros), bind!(3, &act.scores), bind!(5, &self.zeros),
-                bind!(6, &act.qkv), bind!(7, &act.kt),
-            );
-            // softmax over each (head, query) row
-            dispatch!(
-                P_SOFTMAX,
-                Cfg4 { a: (heads as u32 * t_rows), b: t_rows, c: 0, d: 0 },
-                row_grid(heads as u32 * t_rows).0, row_grid(heads as u32 * t_rows).1,
-                bind!(0, &act.scores),
-            );
-            // per-head weighted V, z-batched: attn_h = scores_h @ v_h.
-            // B is a vec4-able slice of qkv; A (scores) strides by t, so
-            // a_vec computes to 0 and the scalar path runs
-            dispatch_z!(
-                P_GEMM,
-                GemmDims {
-                    m: t_rows, n: head_dim as u32, k: t_rows,
-                    a_stride: t_rows, b_stride: 3 * cols, c_stride: cols,
-                    a_off: 0, a_z: t_rows * t_rows,
-                    b_off: (2 * hidden) as u32, b_z: head_dim as u32,
-                    c_off: 0, c_z: head_dim as u32,
+                    m: rows as u32,
+                    n: hidden as u32,
+                    k: 512,
+                    a_stride: 512,
+                    b_stride: hidden as u32,
+                    c_stride: hidden as u32,
+                    a_off: 0,
+                    b_off: 0,
+                    c_off: 0,
+                    a_z: 0,
+                    b_z: 0,
+                    c_z: 0,
                     epilogue: 0,
                     scale: 1.0,
-                    a_vec: vec4_ok(0, t_rows, t_rows * t_rows),
-                    b_vec: vec4_ok((2 * hidden) as u32, 3 * cols, head_dim as u32),
+                    a_vec: vec4_ok(0, 512, 0),
+                    b_vec: vec4_ok(0, hidden as u32, 0),
                     _p0: 0,
                 },
-                t_rows.div_ceil(gemm_mt), (head_dim as u32).div_ceil(gemm_nt), heads as u32,
-                bind!(0, &act.scores), bind!(1, &act.qkv), bind!(2, &self.zeros), bind!(3, &act.attn_o), bind!(5, &self.zeros),
-                bind!(6, &act.scores), bind!(7, &act.qkv),
+                (rows as u32).div_ceil(gemm_mt),
+                (hidden as u32).div_ceil(gemm_nt),
+                bind!(0, &cur),
+                bind!(1, &self.fp_wt),
+                bind!(2, &self.fp_b),
+                bind!(3, &act.x),
+                bind!(5, &self.zeros),
+                bind!(6, &cur),
+                bind!(7, &self.fp_wt),
             );
-            // out proj + residual
-            dispatch!(
-                P_GEMM,
-                GemmDims {
-                    m: t_rows, n: cols, k: cols,
-                    a_stride: cols, b_stride: cols, c_stride: cols,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 2, scale: 1.0,
-                    a_vec: vec4_ok(0, cols, 0), b_vec: vec4_ok(0, cols, 0), _p0: 0,
-                },
-                t_rows.div_ceil(gemm_mt), cols.div_ceil(gemm_nt),
-                bind!(0, &act.attn_o), bind!(1, &self.out_wt[li]), bind!(2, &self.out_b[li]), bind!(3, &act.t3), bind!(5, &act.x),
-                bind!(6, &act.attn_o), bind!(7, &self.out_wt[li]),
-            );
-            // FFN: t3 is the new residual; swap x <-> t3
-            std::mem::swap(&mut act.x, &mut act.t3);
-            // t1 = LN(x) — again src/dst, no staging copy
-            dispatch!(
-                P_LN_SD,
-                Cfg4 { a: t_rows, b: cols, c: 10, d: 0 },
-                row_grid(t_rows).0, row_grid(t_rows).1,
-                bind!(0, &act.x), bind!(1, &act.t1), bind!(2, &self.ln2_w[li]), bind!(3, &self.ln2_b[li]),
-            );
-            dispatch!(
-                P_GEMM,
-                GemmDims {
-                    m: t_rows, n: self.cfg.intermediate_size as u32, k: cols,
-                    a_stride: cols, b_stride: self.cfg.intermediate_size as u32, c_stride: self.cfg.intermediate_size as u32,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 1, scale: 1.0,
-                    a_vec: vec4_ok(0, cols, 0), b_vec: vec4_ok(0, self.cfg.intermediate_size as u32, 0), _p0: 0,
-                },
-                t_rows.div_ceil(gemm_mt), (self.cfg.intermediate_size as u32).div_ceil(gemm_nt),
-                bind!(0, &act.t1), bind!(1, &self.ff1_wt[li]), bind!(2, &self.ff1_b[li]), bind!(3, &act.t2), bind!(5, &self.zeros),
-                bind!(6, &act.t1), bind!(7, &self.ff1_wt[li]),
-            );
-            dispatch!(
-                P_GEMM,
-                GemmDims {
-                    m: t_rows, n: cols, k: self.cfg.intermediate_size as u32,
-                    a_stride: self.cfg.intermediate_size as u32, b_stride: cols, c_stride: cols,
-                    a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 2, scale: 1.0,
-                    a_vec: vec4_ok(0, self.cfg.intermediate_size as u32, 0), b_vec: vec4_ok(0, cols, 0), _p0: 0,
-                },
-                t_rows.div_ceil(gemm_mt), cols.div_ceil(gemm_nt),
-                bind!(0, &act.t2), bind!(1, &self.ff2_wt[li]), bind!(2, &self.ff2_b[li]), bind!(3, &act.t1), bind!(5, &act.x),
-                bind!(6, &act.t2), bind!(7, &self.ff2_wt[li]),
-            );
-            std::mem::swap(&mut act.x, &mut act.t1);
-        }
 
-        // ---- final LN, LM head, log softmax.  The hidden readback stops at
-        // the LN: act.x then holds the stream the host-side head re-run
-        // consumes, and the two head dispatches stay out of the graph.
-        dispatch!(
-            P_LN,
-            Cfg4 { a: t as u32, b: hidden as u32, c: 10, d: 0 },
-            row_grid(t as u32).0, row_grid(t as u32).1,
-            bind!(0, &act.x), bind!(1, &self.final_ln_w), bind!(2, &self.final_ln_b),
-        );
-        if !read_hidden {
-        dispatch!(
-            P_GEMM,
-            GemmDims {
-                m: t as u32, n: vocab as u32, k: hidden as u32,
-                a_stride: hidden as u32, b_stride: vocab as u32, c_stride: vocab as u32,
-                a_off: 0, b_off: 0, c_off: 0, a_z: 0, b_z: 0, c_z: 0, epilogue: 0, scale: 1.0,
-                a_vec: vec4_ok(0, hidden as u32, 0), b_vec: vec4_ok(0, vocab as u32, 0), _p0: 0,
-            },
-            (t as u32).div_ceil(gemm_mt), (vocab as u32).div_ceil(gemm_nt),
-            bind!(0, &act.x), bind!(1, &self.lm_wt), bind!(2, &self.lm_b), bind!(3, &act.logits), bind!(5, &self.zeros),
-            bind!(6, &act.x), bind!(7, &self.lm_wt),
-        );
-        dispatch!(
-            P_LOGSOFTMAX,
-            Cfg4 { a: t as u32, b: vocab as u32, c: 0, d: 0 },
-            row_grid(t as u32).0, row_grid(t as u32).1,
-            bind!(0, &act.logits),
-        );
-        }
-        // gathered alignment: one dispatch collecting the trellis labels'
-        // log-probs, so the readback below is (T, S) instead of (T, V). Part
-        // of the recorded graph: only the labels buffer's *contents* change
-        // per chunk, never its handle, so a replay reruns the dispatch as
-        // recorded against the scratch's gather-out buffer.
-        if let Some(expanded) = gather {
-            // S grows with the transcript, so T*S overflows a single
-            // dimension's 65535-workgroup limit on anything but a short
-            // transcript (15 m audio: T=1700, S=31130 -> 206595 groups).
-            // The gather kernel folds workgroups across x and y; see
-            // `flat_grid`.
-            anyhow::ensure!(
-                expanded.len() <= 65536,
-                "transcript too long for the labels buffer"
-            );
-            let total = u32::try_from(t * expanded.len()).context("gather size")?;
-            let (gx, gy) = flat_grid(total);
+            // ---- positional conv + add. One group per workgroup-y, gelu fused.
+            let pos_groups = self.cfg.num_conv_pos_embedding_groups as u32;
+            let pos_n = (hidden as u32) / pos_groups;
+            let pos_taps = self.cfg.num_conv_pos_embeddings as u32;
             dispatch!(
-                P_GATHER,
-                Cfg4 { a: total, b: expanded.len() as u32, c: vocab as u32, d: 0 },
-                gx, gy,
-                bind!(0, &act.logits), bind!(1, &self.labels), bind!(2, gather_buf.as_ref().context("missing gather buffer")?),
-                bind!(4, &self.star_flags),
+                P_POS,
+                PosDims {
+                    m: t as u32,
+                    n: pos_n,
+                    k: pos_n * pos_taps,
+                    c: hidden as u32,
+                    in_pg: pos_n,
+                    pad: pos_taps / 2,
+                    _p0: 0,
+                    _p1: 0,
+                },
+                (t as u32).div_ceil(self.pos_mt),
+                pos_groups,
+                bind!(0, &act.x),
+                bind!(1, &self.pos_w),
+                bind!(2, &self.pos_b),
+                bind!(3, &act.t1),
             );
-        }
-        {
-            let mut guard = self.scratch.lock().unwrap();
-            if let Some(s) = guard.as_mut() {
-                s.jobs = batches.clone();
-                s.uni = uni.clone();
-                s.out_x = act.x.clone();
+            // x = x + pos: write to scratch (a buffer cannot be read- and
+            // write-bound in the same dispatch), then swap
+            //
+            // n is t*hidden, so a window past 16384 frames overflows one
+            // dimension's 65535-workgroup limit: at 20 ms per frame that is a
+            // 341 s chunk, which the unchunked path (`--window 0`) can reach.
+            // The add shader folds workgroups across x and y; see `flat_grid`.
+            let (add_x, add_y) = flat_grid((t * hidden) as u32);
+            dispatch!(
+                P_ADD,
+                Cfg4 {
+                    a: (t * hidden) as u32,
+                    b: 0,
+                    c: 0,
+                    d: 0
+                },
+                add_x,
+                add_y,
+                bind!(0, &act.x),
+                bind!(1, &act.t1),
+                bind!(2, &act.t3),
+            );
+            std::mem::swap(&mut act.x, &mut act.t3);
+
+            // ---- encoder layers. Kick splits the recording into command buffers
+            // of 8 layers so a 30 s chunk cannot sit in one submit past TDR.
+            for li in 0..self.cfg.num_hidden_layers {
+                if li > 0 && li % 8 == 0 {
+                    kick!();
+                }
+                let (t_rows, cols) = (t as u32, hidden as u32);
+                // t1 = LN(x): src/dst LN, x stays untouched as the residual
+                dispatch!(
+                    P_LN_SD,
+                    Cfg4 {
+                        a: t_rows,
+                        b: cols,
+                        c: 10,
+                        d: 0
+                    },
+                    row_grid(t_rows).0,
+                    row_grid(t_rows).1,
+                    bind!(0, &act.x),
+                    bind!(1, &act.t1),
+                    bind!(2, &self.ln1_w[li]),
+                    bind!(3, &self.ln1_b[li]),
+                );
+                // qkv
+                dispatch!(
+                    P_GEMM,
+                    GemmDims {
+                        m: t_rows,
+                        n: 3 * cols,
+                        k: cols,
+                        a_stride: cols,
+                        b_stride: 3 * cols,
+                        c_stride: 3 * cols,
+                        a_off: 0,
+                        b_off: 0,
+                        c_off: 0,
+                        a_z: 0,
+                        b_z: 0,
+                        c_z: 0,
+                        epilogue: 0,
+                        scale: 1.0,
+                        a_vec: vec4_ok(0, cols, 0),
+                        b_vec: vec4_ok(0, 3 * cols, 0),
+                        _p0: 0,
+                    },
+                    t_rows.div_ceil(gemm_mt),
+                    (3 * cols).div_ceil(gemm_nt),
+                    bind!(0, &act.t1),
+                    bind!(1, &self.qkv_wt[li]),
+                    bind!(2, &self.qkv_b[li]),
+                    bind!(3, &act.qkv),
+                    bind!(5, &self.zeros),
+                    bind!(6, &act.t1),
+                    bind!(7, &self.qkv_wt[li]),
+                );
+                // K^T: rows hidden, cols t, from qkv rows offset T*1024, stride 3072
+                dispatch!(
+                    P_TRANSPOSE,
+                    // K block starts `hidden` elements into each (T, 3*hidden) row
+                    Cfg4 {
+                        a: t as u32,
+                        b: hidden as u32,
+                        c: (3 * hidden) as u32,
+                        d: hidden as u32
+                    },
+                    (t as u32).div_ceil(16),
+                    (hidden as u32).div_ceil(16),
+                    bind!(0, &act.qkv),
+                    bind!(1, &act.kt),
+                );
+                // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z.
+                // A is a vec4-able slice of qkv; B (kt) strides by t, which is odd
+                // for most windows, so b_vec computes to 0 and the scalar path runs
+                dispatch_z!(
+                    P_GEMM,
+                    GemmDims {
+                        m: t_rows,
+                        n: t_rows,
+                        k: head_dim as u32,
+                        a_stride: 3 * cols,
+                        b_stride: t as u32,
+                        c_stride: t_rows,
+                        a_off: 0,
+                        a_z: head_dim as u32,
+                        b_off: 0,
+                        b_z: head_dim as u32 * t as u32,
+                        c_off: 0,
+                        c_z: t_rows * t_rows,
+                        epilogue: 0,
+                        scale: 0.125, // head_dim^-0.5: the attention scaling
+                        a_vec: vec4_ok(0, 3 * cols, head_dim as u32),
+                        b_vec: vec4_ok(0, t as u32, head_dim as u32 * t as u32),
+                        _p0: 0,
+                    },
+                    t_rows.div_ceil(gemm_mt),
+                    t_rows.div_ceil(gemm_nt),
+                    heads as u32,
+                    bind!(0, &act.qkv),
+                    bind!(1, &act.kt),
+                    bind!(2, &self.zeros),
+                    bind!(3, &act.scores),
+                    bind!(5, &self.zeros),
+                    bind!(6, &act.qkv),
+                    bind!(7, &act.kt),
+                );
+                // softmax over each (head, query) row
+                dispatch!(
+                    P_SOFTMAX,
+                    Cfg4 {
+                        a: (heads as u32 * t_rows),
+                        b: t_rows,
+                        c: 0,
+                        d: 0
+                    },
+                    row_grid(heads as u32 * t_rows).0,
+                    row_grid(heads as u32 * t_rows).1,
+                    bind!(0, &act.scores),
+                );
+                // per-head weighted V, z-batched: attn_h = scores_h @ v_h.
+                // B is a vec4-able slice of qkv; A (scores) strides by t, so
+                // a_vec computes to 0 and the scalar path runs
+                dispatch_z!(
+                    P_GEMM,
+                    GemmDims {
+                        m: t_rows,
+                        n: head_dim as u32,
+                        k: t_rows,
+                        a_stride: t_rows,
+                        b_stride: 3 * cols,
+                        c_stride: cols,
+                        a_off: 0,
+                        a_z: t_rows * t_rows,
+                        b_off: (2 * hidden) as u32,
+                        b_z: head_dim as u32,
+                        c_off: 0,
+                        c_z: head_dim as u32,
+                        epilogue: 0,
+                        scale: 1.0,
+                        a_vec: vec4_ok(0, t_rows, t_rows * t_rows),
+                        b_vec: vec4_ok((2 * hidden) as u32, 3 * cols, head_dim as u32),
+                        _p0: 0,
+                    },
+                    t_rows.div_ceil(gemm_mt),
+                    (head_dim as u32).div_ceil(gemm_nt),
+                    heads as u32,
+                    bind!(0, &act.scores),
+                    bind!(1, &act.qkv),
+                    bind!(2, &self.zeros),
+                    bind!(3, &act.attn_o),
+                    bind!(5, &self.zeros),
+                    bind!(6, &act.scores),
+                    bind!(7, &act.qkv),
+                );
+                // out proj + residual
+                dispatch!(
+                    P_GEMM,
+                    GemmDims {
+                        m: t_rows,
+                        n: cols,
+                        k: cols,
+                        a_stride: cols,
+                        b_stride: cols,
+                        c_stride: cols,
+                        a_off: 0,
+                        b_off: 0,
+                        c_off: 0,
+                        a_z: 0,
+                        b_z: 0,
+                        c_z: 0,
+                        epilogue: 2,
+                        scale: 1.0,
+                        a_vec: vec4_ok(0, cols, 0),
+                        b_vec: vec4_ok(0, cols, 0),
+                        _p0: 0,
+                    },
+                    t_rows.div_ceil(gemm_mt),
+                    cols.div_ceil(gemm_nt),
+                    bind!(0, &act.attn_o),
+                    bind!(1, &self.out_wt[li]),
+                    bind!(2, &self.out_b[li]),
+                    bind!(3, &act.t3),
+                    bind!(5, &act.x),
+                    bind!(6, &act.attn_o),
+                    bind!(7, &self.out_wt[li]),
+                );
+                // FFN: t3 is the new residual; swap x <-> t3
+                std::mem::swap(&mut act.x, &mut act.t3);
+                // t1 = LN(x) — again src/dst, no staging copy
+                dispatch!(
+                    P_LN_SD,
+                    Cfg4 {
+                        a: t_rows,
+                        b: cols,
+                        c: 10,
+                        d: 0
+                    },
+                    row_grid(t_rows).0,
+                    row_grid(t_rows).1,
+                    bind!(0, &act.x),
+                    bind!(1, &act.t1),
+                    bind!(2, &self.ln2_w[li]),
+                    bind!(3, &self.ln2_b[li]),
+                );
+                dispatch!(
+                    P_GEMM,
+                    GemmDims {
+                        m: t_rows,
+                        n: self.cfg.intermediate_size as u32,
+                        k: cols,
+                        a_stride: cols,
+                        b_stride: self.cfg.intermediate_size as u32,
+                        c_stride: self.cfg.intermediate_size as u32,
+                        a_off: 0,
+                        b_off: 0,
+                        c_off: 0,
+                        a_z: 0,
+                        b_z: 0,
+                        c_z: 0,
+                        epilogue: 1,
+                        scale: 1.0,
+                        a_vec: vec4_ok(0, cols, 0),
+                        b_vec: vec4_ok(0, self.cfg.intermediate_size as u32, 0),
+                        _p0: 0,
+                    },
+                    t_rows.div_ceil(gemm_mt),
+                    (self.cfg.intermediate_size as u32).div_ceil(gemm_nt),
+                    bind!(0, &act.t1),
+                    bind!(1, &self.ff1_wt[li]),
+                    bind!(2, &self.ff1_b[li]),
+                    bind!(3, &act.t2),
+                    bind!(5, &self.zeros),
+                    bind!(6, &act.t1),
+                    bind!(7, &self.ff1_wt[li]),
+                );
+                dispatch!(
+                    P_GEMM,
+                    GemmDims {
+                        m: t_rows,
+                        n: cols,
+                        k: self.cfg.intermediate_size as u32,
+                        a_stride: self.cfg.intermediate_size as u32,
+                        b_stride: cols,
+                        c_stride: cols,
+                        a_off: 0,
+                        b_off: 0,
+                        c_off: 0,
+                        a_z: 0,
+                        b_z: 0,
+                        c_z: 0,
+                        epilogue: 2,
+                        scale: 1.0,
+                        a_vec: vec4_ok(0, self.cfg.intermediate_size as u32, 0),
+                        b_vec: vec4_ok(0, cols, 0),
+                        _p0: 0,
+                    },
+                    t_rows.div_ceil(gemm_mt),
+                    cols.div_ceil(gemm_nt),
+                    bind!(0, &act.t2),
+                    bind!(1, &self.ff2_wt[li]),
+                    bind!(2, &self.ff2_b[li]),
+                    bind!(3, &act.t1),
+                    bind!(5, &act.x),
+                    bind!(6, &act.t2),
+                    bind!(7, &self.ff2_wt[li]),
+                );
+                std::mem::swap(&mut act.x, &mut act.t1);
             }
-        }
+
+            // ---- final LN, LM head, log softmax.  The hidden readback stops at
+            // the LN: act.x then holds the stream the host-side head re-run
+            // consumes, and the two head dispatches stay out of the graph.
+            dispatch!(
+                P_LN,
+                Cfg4 {
+                    a: t as u32,
+                    b: hidden as u32,
+                    c: 10,
+                    d: 0
+                },
+                row_grid(t as u32).0,
+                row_grid(t as u32).1,
+                bind!(0, &act.x),
+                bind!(1, &self.final_ln_w),
+                bind!(2, &self.final_ln_b),
+            );
+            if !read_hidden {
+                dispatch!(
+                    P_GEMM,
+                    GemmDims {
+                        m: t as u32,
+                        n: vocab as u32,
+                        k: hidden as u32,
+                        a_stride: hidden as u32,
+                        b_stride: vocab as u32,
+                        c_stride: vocab as u32,
+                        a_off: 0,
+                        b_off: 0,
+                        c_off: 0,
+                        a_z: 0,
+                        b_z: 0,
+                        c_z: 0,
+                        epilogue: 0,
+                        scale: 1.0,
+                        a_vec: vec4_ok(0, hidden as u32, 0),
+                        b_vec: vec4_ok(0, vocab as u32, 0),
+                        _p0: 0,
+                    },
+                    (t as u32).div_ceil(gemm_mt),
+                    (vocab as u32).div_ceil(gemm_nt),
+                    bind!(0, &act.x),
+                    bind!(1, &self.lm_wt),
+                    bind!(2, &self.lm_b),
+                    bind!(3, &act.logits),
+                    bind!(5, &self.zeros),
+                    bind!(6, &act.x),
+                    bind!(7, &self.lm_wt),
+                );
+                dispatch!(
+                    P_LOGSOFTMAX,
+                    Cfg4 {
+                        a: t as u32,
+                        b: vocab as u32,
+                        c: 0,
+                        d: 0
+                    },
+                    row_grid(t as u32).0,
+                    row_grid(t as u32).1,
+                    bind!(0, &act.logits),
+                );
+            }
+            // gathered alignment: one dispatch collecting the trellis labels'
+            // log-probs, so the readback below is (T, S) instead of (T, V). Part
+            // of the recorded graph: only the labels buffer's *contents* change
+            // per chunk, never its handle, so a replay reruns the dispatch as
+            // recorded against the scratch's gather-out buffer.
+            if let Some(expanded) = gather {
+                // S grows with the transcript, so T*S overflows a single
+                // dimension's 65535-workgroup limit on anything but a short
+                // transcript (15 m audio: T=1700, S=31130 -> 206595 groups).
+                // The gather kernel folds workgroups across x and y; see
+                // `flat_grid`.
+                anyhow::ensure!(
+                    expanded.len() <= 65536,
+                    "transcript too long for the labels buffer"
+                );
+                let total = u32::try_from(t * expanded.len()).context("gather size")?;
+                let (gx, gy) = flat_grid(total);
+                dispatch!(
+                    P_GATHER,
+                    Cfg4 {
+                        a: total,
+                        b: expanded.len() as u32,
+                        c: vocab as u32,
+                        d: 0
+                    },
+                    gx,
+                    gy,
+                    bind!(0, &act.logits),
+                    bind!(1, &self.labels),
+                    bind!(2, gather_buf.as_ref().context("missing gather buffer")?),
+                    bind!(4, &self.star_flags),
+                );
+            }
+            {
+                let mut guard = self.scratch.lock().unwrap();
+                if let Some(s) = guard.as_mut() {
+                    s.jobs = batches.clone();
+                    s.uni = uni.clone();
+                    s.out_x = act.x.clone();
+                }
+            }
         }
 
         // gathered alignment: read back the trellis columns the caller keeps
@@ -1610,7 +2063,8 @@ impl GpuModel {
         let prof = prof_mode.as_deref() == Some("1");
         // CTC_PROFILE=2 timestamps every dispatch of the first forward so the
         // per-kernel split is visible. Later chunks stay on the fast path.
-        static SPLIT_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static SPLIT_ONCE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         let do_split = prof_mode.as_deref() == Some("2")
             && gpu.features.contains(wgpu::Features::TIMESTAMP_QUERY)
             && !SPLIT_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed);
@@ -1624,7 +2078,7 @@ impl GpuModel {
         // The logits path only bounces into a side buffer here; its DMA is on
         // the transfer queue. On this P104 the copy still finishes after the
         // compute submitted below.
-        if let Some(p) = prev.as_deref_mut() {
+        if let Some(p) = prev {
             p.arm(&self.gpu)?;
         }
         gpu.upload(&x_in, bytemuck::cast_slice(input));
@@ -1721,8 +2175,20 @@ impl GpuModel {
             // the LN and the GEMM epilogue), so the names after P_LN_SD were
             // off by one slot until this list stopped carrying a gelu entry
             let names = [
-                "gemm", "conv_gemm", "conv0", "pos", "ln", "ln_sd", "add", "softmax",
-                "logsoftmax", "transpose", "gather", "  scores", "  pv", "  gemm-main",
+                "gemm",
+                "conv_gemm",
+                "conv0",
+                "pos",
+                "ln",
+                "ln_sd",
+                "add",
+                "softmax",
+                "logsoftmax",
+                "transpose",
+                "gather",
+                "  scores",
+                "  pv",
+                "  gemm-main",
             ];
             let mut acc = [0f64; 16];
             let mut cnt = [0u32; 16];
@@ -1732,7 +2198,7 @@ impl GpuModel {
                     // split the gemm pipeline by dispatch shape: pv is n=64
                     // (gy=1), scores is n=t, everything else is a main GEMM.
                     // The three buckets are the last three names above.
-                    let mut b = p as usize;
+                    let mut b = p;
                     if p == P_GEMM {
                         b = if gy == 1 {
                             12
@@ -1776,7 +2242,10 @@ impl GpuModel {
                 })
                 .unwrap_or((0, t));
             (
-                gather_buf.as_ref().context("missing gather buffer")?.clone(),
+                gather_buf
+                    .as_ref()
+                    .context("missing gather buffer")?
+                    .clone(),
                 (lo * states * 4) as u64,
                 (hi - lo) * states,
             )
@@ -2209,7 +2678,82 @@ struct Scratch {
 
 #[cfg(test)]
 mod tests {
-    use super::transpose_pos;
+    use super::{check_binding_limits, transpose_pos};
+
+    /// The model's shape: 16 heads, 10288 vocabulary, f32.
+    const HEADS: u64 = 16;
+    const VOCAB: u64 = 10288;
+    /// 2047 MiB, what this machine's Vulkan adapter reports.
+    const BINDING: u64 = 2047 << 20;
+
+    fn bytes(t: u64, read_hidden: bool, hidden: u64) -> (u64, u64) {
+        let scores = HEADS * t * t * 4;
+        let logits = (if read_hidden { t * hidden } else { t * VOCAB }) * 4;
+        (scores, logits)
+    }
+
+    #[test]
+    fn binding_limits_accept_a_normal_window() {
+        // 30 s at 50 fps: 1500 frames -> 144 MB of scores, 62 MB of logits.
+        let (scores, logits) = bytes(1500, false, 1024);
+        assert_eq!(scores, 144_000_000);
+        assert!(logits < BINDING);
+        assert!(check_binding_limits(1500, scores, logits, BINDING).is_ok());
+        // even a 60 s window still fits this adapter
+        let (scores, logits) = bytes(3000, false, 1024);
+        assert!(check_binding_limits(3000, scores, logits, BINDING).is_ok());
+    }
+
+    #[test]
+    fn binding_limits_reject_an_oversized_scores_buffer() {
+        // 90 s: 4500 frames -> 1.3 GB of scores, over a 1 GiB binding cap.
+        let cap = 1024 << 20;
+        let (scores, logits) = bytes(4500, false, 1024);
+        assert!(scores > cap && logits < cap);
+        let err = check_binding_limits(4500, scores, logits, cap).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("attention scores"), "{msg}");
+        assert!(msg.contains(&scores.to_string()), "{msg}");
+        assert!(msg.contains(&cap.to_string()), "{msg}");
+        // the advice is a window whose scores fit, not the one that failed
+        assert!(msg.contains("--window"), "{msg}");
+        let secs: u64 = msg
+            .split("--window ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("a concrete --window value");
+        assert!(secs >= 1 && secs < 90, "{secs}s does not fit: {msg}");
+        let (fits, _) = bytes(secs * 50, false, 1024);
+        assert!(fits <= cap, "{secs}s still needs {fits} B of {cap}");
+    }
+
+    #[test]
+    fn binding_limits_reject_an_oversized_logits_buffer() {
+        // A 1 MiB cap: the scores of a 100-frame window fit (640 KB, they
+        // grow with t²), but its 4 MB of logits do not.
+        let cap = 1 << 20;
+        let (scores, logits) = bytes(100, false, 1024);
+        assert!(scores < cap && logits > cap, "{scores} {logits}");
+        let err = check_binding_limits(100, scores, logits, cap).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("logits"), "{msg}");
+        assert!(msg.contains(&logits.to_string()), "{msg}");
+        assert!(msg.contains(&cap.to_string()), "{msg}");
+        assert!(msg.contains("--window"), "{msg}");
+    }
+
+    #[test]
+    fn binding_limits_measure_the_hidden_path_by_hidden_size() {
+        // The hidden readback never allocates the (t, vocab) logits buffer, so
+        // its ceiling is the (t, hidden) one.
+        let cap = 8 << 20;
+        let (scores, full) = bytes(300, false, 1024);
+        let (_, hidden) = bytes(300, true, 1024);
+        assert!(hidden < full);
+        assert!(check_binding_limits(300, scores, hidden, cap).is_ok());
+        assert!(check_binding_limits(300, scores, full, cap).is_err());
+    }
 
     #[test]
     fn pos_weight_index_matches_scalar_dot() {
@@ -2268,4 +2812,3 @@ struct ActSet {
     attn_o: wgpu::Buffer,
     logits: wgpu::Buffer,
 }
-

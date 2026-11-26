@@ -13,8 +13,47 @@ mod gemm_kernel;
 
 pub use gemm_kernel::{
     conv_gemm, conv_gemm_variant, gemm_bias, gemm_bias_tiled, gemm_shared_bytes, gemm_tile,
-    gemm_variant, pos_conv, pick_gemm_variant, GemmVariant, KS, MT, NT, POS_KS, POS_MT, POS_NT,
+    gemm_variant, pick_gemm_variant, pick_gemm_variant_for, pos_conv, GemmVariant, KS, MT, NT,
+    POS_KS, POS_MT, POS_NT,
 };
+
+/// What a device's subgroup width means for a reduction kernel.
+///
+/// `Warp32`/`Warp64` are the two shapes a warp-wide `subgroupAdd` can take;
+/// `Generic` is any other advertised range (Intel 8..32, wraparound 32..64),
+/// where the kernel has to read the width from `@builtin(subgroup_size)`.
+/// `None` keeps the shared-memory tree.
+///
+/// Classified from the adapter's reported limits, never from the vendor, so a
+/// driver that clamps its range is followed rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubgroupMode {
+    None,
+    Warp32,
+    Warp64,
+    Generic,
+}
+
+impl SubgroupMode {
+    /// `has_subgroups` is the negotiated [`wgpu::Features::SUBGROUP`] flag;
+    /// `min`/`max` are the adapter's subgroup size range.
+    pub fn from_limits(
+        has_subgroups: bool,
+        min_subgroup_size: u32,
+        max_subgroup_size: u32,
+    ) -> Self {
+        if !has_subgroups || min_subgroup_size == 0 || max_subgroup_size == 0 {
+            return Self::None;
+        }
+        if min_subgroup_size == 32 && max_subgroup_size == 32 {
+            return Self::Warp32;
+        }
+        if min_subgroup_size == 64 && max_subgroup_size == 64 {
+            return Self::Warp64;
+        }
+        Self::Generic
+    }
+}
 
 /// Row LayerNorm over `cols` (affine, biased variance, eps inside sqrt) then
 /// gelu when `do_gelu` is 1.  256 threads per row; the row lives in registers
@@ -53,8 +92,10 @@ pub(crate) fn layernorm_sd() -> String {
 }
 
 fn emit_ln(bindings: &str, load: &str, store: &str) -> String {
-    let mut s = String::from("struct Cfg { rows: u32, cols: u32, eps_x_1e6: u32, do_gelu: u32 }
-");
+    let mut s = String::from(
+        "struct Cfg { rows: u32, cols: u32, eps_x_1e6: u32, do_gelu: u32 }
+",
+    );
     s.push_str(bindings);
     s.push_str(
         r#"
@@ -411,4 +452,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubgroupMode;
+
+    #[test]
+    fn subgroup_mode_follows_the_adapter_range() {
+        // No feature, or a range the driver left at zero: no subgroup path.
+        assert_eq!(SubgroupMode::from_limits(false, 32, 32), SubgroupMode::None);
+        assert_eq!(SubgroupMode::from_limits(false, 0, 0), SubgroupMode::None);
+        assert_eq!(SubgroupMode::from_limits(true, 0, 32), SubgroupMode::None);
+        assert_eq!(SubgroupMode::from_limits(true, 32, 0), SubgroupMode::None);
+        // NVIDIA / RDNA: one fixed width.
+        assert_eq!(
+            SubgroupMode::from_limits(true, 32, 32),
+            SubgroupMode::Warp32
+        );
+        // AMD GCN/Vega: 64-wide.
+        assert_eq!(
+            SubgroupMode::from_limits(true, 64, 64),
+            SubgroupMode::Warp64
+        );
+        // Intel and anything that reports a range: read the width at runtime.
+        assert_eq!(
+            SubgroupMode::from_limits(true, 8, 32),
+            SubgroupMode::Generic
+        );
+        assert_eq!(
+            SubgroupMode::from_limits(true, 32, 64),
+            SubgroupMode::Generic
+        );
+    }
 }

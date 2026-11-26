@@ -455,6 +455,10 @@ impl GpuDp {
         let step_pipe = pipe(gpu, "viterbi-step", STEP_WGSL, &step_layout)?;
         let gather_pipe = pipe(gpu, "viterbi-gather", GATHER_WGSL, &gather_layout)?;
         let trace_pipe = pipe(gpu, "viterbi-trace", TRACE_WGSL, &trace_layout)?;
+        // Fold the DP's four pipelines into the same cache file the encoder
+        // wrote. A warm start then compiles them too; an unwritable cache
+        // directory must not fail the DP, so the result is dropped.
+        let _ = gpu.save_pipeline_cache();
         let trace_uni = gpu.uniform("dp-trace-uni", 32);
 
         let ncheck = if linear {
