@@ -1,10 +1,29 @@
-//! CTC Viterbi on the GPU, f64 alphas, full rows.
+//! CTC Viterbi on the GPU: signed 64-bit `Q31.32` fixed-point alphas.
 //!
-//! Alphas stay f64 because an hour-long path sits near −80000, where an f32
-//! ulp is large enough to move a boundary. Devices without `SHADER_F64`
-//! (Apple Silicon Metal, Intel Arc/iGPU) run the same DP on `df64` — a
-//! `(hi, lo)` pair of f32s carrying 48 significand bits, laid out exactly like
-//! an f64 so every buffer, checkpoint and backpointer stride is unchanged.
+//! An hour of audio sums to an alpha near −80,000, where one f32 ulp is 1/128
+//! — large enough to move a boundary, and the reason this DP used to need
+//! `SHADER_F64` on some devices and a `df64` `(hi, lo)` pair on the rest. The
+//! frame-max normalization that replaced them shifts each row by one scalar
+//! per frame, which keeps the *leading* states near zero but cannot keep a
+//! state that lags the row max by thousands of nats near zero at the same
+//! time: `90s_ja.wav` starts with an ASCII header the Japanese audio does not
+//! pronounce, so the leading `<blank>` stays at 0 while the forced states sit
+//! −2,400 nats behind. There the lagging path rounded at 2.4e-4, and a
+//! one-frame boundary flipped.
+//!
+//! So the alphas are integers: `Q31.32`, 32 fractional bits of a signed
+//! 64-bit value, held in WGSL as `vec2<u32>` — `x` the low word, `y` the high
+//! word's bit pattern — which in little-endian memory is bit for bit a Rust
+//! `i64`. Integer addition and comparison are exact and associative by spec,
+//! so every state carries 2^-32 (2.3e-10) of absolute precision whether it
+//! sits at 0, at −2,600, or at −80,000, and the kernel is plain `u32`/`i32`
+//! arithmetic on every adapter: no `SHADER_F64`, no `df64`, no `df_keep`.
+//!
+//! The range is ±2.1e9, which at a tenth of a nat a frame is over ten
+//! thousand hours of audio. Nothing is added back on the host either: the row
+//! *is* the absolute log-probability, so a checkpoint is the row itself and
+//! replaying a segment from it reproduces the forward pass bit for bit.
+//!
 //! The choice table is kept only when it fits the Viterbi budget. Longer
 //! files store one alpha row per segment and rebuild that segment while
 //! tracing back.
@@ -39,6 +58,10 @@ struct StepCfg {
     s: u32,
     stride: u32,
     row: u32,
+    /// Bit 0: the ping the host dispatches this frame with. The shader never
+    /// reads it — which row is `prev` is the bind group's job — but the host
+    /// asserts the uniform and the bind group agree, which is how the replay's
+    /// ping bookkeeping stayed honest.
     mode: u32,
     back_row: u32,
     rb_u32: u32,
@@ -72,128 +95,131 @@ const _: () = assert!(std::mem::size_of::<StepCfg>() == 32);
 const _: () = assert!(std::mem::size_of::<GatherCfg>() == 16);
 const _: () = assert!(std::mem::size_of::<TraceCfg>() == 32);
 
-/// Which alpha representation the DP runs in.
-///
-/// `F64` is `SHADER_F64` straight: 53 significand bits, and the only path that
-/// existed before `df64`. `Df64` is a pair of f32s (`hi`, `lo`) summing to the
-/// value — 48 significand bits, evaluable on any adapter, and the same 8 bytes
-/// per state so no buffer or stride has to change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DpPrecision {
-    F64,
-    Df64,
-}
+// ---------------------------------------------------------------------------
+// Q31.32 on the host.
+//
+// The value is `hi + lo / 2^32` in two's complement, so its little-endian
+// byte image is `[lo: u32, hi: i32]` — exactly the `vec2<u32>` the kernels
+// load. Decoding splits the halves rather than dividing the `i64`, because
+// `hi as f64 + lo as f64 * 2^-32` keeps all 53 bits of mantissa even when
+// `|v| > 2^53`, which an `i64 as f64` cast would not.
+// ---------------------------------------------------------------------------
 
-impl DpPrecision {
-    /// The `(f64)` / `(df64)` tag the run log carries.
-    fn tag(self) -> &'static str {
-        match self {
-            DpPrecision::F64 => "f64",
-            DpPrecision::Df64 => "df64",
-        }
+/// The unreachable sentinel: `i64::MIN`, bytes `[0u32, 0x8000_0000u32]`.
+/// `-inf` must never reach the recurrence — `(-inf) - (-inf)` is a NaN, and
+/// one NaN would silently poison every transition that flows through an
+/// unreachable state, surfacing as a wrong boundary seconds away from the
+/// state that produced it. The high word being `i32::MIN` puts it far below
+/// [`Q_NINF_CUT`], and the kernels test that by threshold, not equality.
+const Q_NINF: i64 = i64::MIN;
+/// Anything at or below this is unreachable: −2e9 in value terms, which no
+/// live score over any real file comes close to.
+const Q_NINF_CUT: i64 = (-2_000_000_000i64) << 32;
+/// `2^-32`, the Q31.32 fractional step.
+const Q_INV: f64 = 1.0 / 4_294_967_296.0;
+
+/// A Q31.32 value back in `f64`, with the sentinel mapped to `-inf`.
+fn q64_to_f64(v: i64) -> f64 {
+    if v <= Q_NINF_CUT {
+        f64::NEG_INFINITY
+    } else {
+        let hi = (v >> 32) as i32;
+        let lo = v as u32;
+        (hi as f64) + (lo as f64) * Q_INV
     }
 }
 
-/// Resolve `CTC_GPU_DP_MODE` against the adapter's `SHADER_F64`.
-///
-/// `auto`/unset/empty follow the device; `f64` is a request that fails rather
-/// than silently downgrading precision, because a caller that asked for it is
-/// asking about the last ulp; `df64` works everywhere.
-pub(crate) fn select_dp_precision(has_f64: bool, env_val: Option<&str>) -> Result<DpPrecision> {
-    let mode = env_val.map(str::trim).unwrap_or_default();
-    match mode.to_ascii_lowercase().as_str() {
-        "" | "auto" => {
-            if has_f64 {
-                Ok(DpPrecision::F64)
-            } else {
-                Ok(DpPrecision::Df64)
-            }
-        }
-        "f64" => {
-            if has_f64 {
-                Ok(DpPrecision::F64)
-            } else {
-                bail!("CTC_GPU_DP_MODE=f64 requested, but adapter lacks SHADER_F64")
-            }
-        }
-        "df64" => Ok(DpPrecision::Df64),
-        other => bail!("CTC_GPU_DP_MODE={other} is not one of auto, f64, df64"),
-    }
-}
-
-/// The `f32` half of the finite unreachable sentinel. `-inf` must never reach
-/// the two-sum below: `(-inf) - (-inf)` is a NaN, which would silently poison
-/// every transition that flows through an unreachable state.
-pub(crate) const DF_NINF_HI: f32 = -3.4e38;
-/// Anything at or below this is unreachable. Well above `DF_NINF_HI`, well
-/// below any real path score (an hour of audio is near −80,000).
-const DF_NINF_CUT: f32 = -1.0e37;
-const DF_NINF_CUT_F64: f64 = -1.0e37;
-
-/// One f64 as a `df64` pair.
-///
-/// `hi` carries 24 bits and `lo` the next 24, so the pair is exact to about
-/// 48 bits: at the −80,000 of an hour-long alpha that is an ulp below 1e-9.
-/// Negative infinity (and anything past the sentinel cutoff) becomes the
-/// finite sentinel the shader compares against.
-pub(crate) fn f64_to_df64(x: f64) -> [f32; 2] {
-    if (!x.is_finite() && x.is_sign_negative()) || x <= DF_NINF_CUT_F64 {
-        return [DF_NINF_HI, 0.0];
-    }
-    let hi = x as f32;
-    let lo = (x - hi as f64) as f32;
-    [hi, lo]
-}
-
-/// One `df64` pair back to f64, the inverse of [`f64_to_df64`] on the values
-/// the DP produces.
-pub(crate) fn df64_to_f64(hi: f32, lo: f32) -> f64 {
-    if hi <= DF_NINF_CUT {
-        return f64::NEG_INFINITY;
-    }
-    (hi as f64) + (lo as f64)
-}
-
-/// An alpha row as the 8 bytes per state the device buffer holds.
-///
-/// Both precisions are 8 bytes per state, which is what keeps the alpha
-/// ping-pong, the checkpoint rows and `load_alpha` identical between them.
-pub(crate) fn encode_alpha_bytes(precision: DpPrecision, alpha: &[f64]) -> Vec<u8> {
-    let mut bytes = vec![0u8; alpha.len() * 8];
-    for (i, v) in alpha.iter().enumerate() {
-        let at = i * 8;
-        match precision {
-            DpPrecision::F64 => bytes[at..at + 8].copy_from_slice(&v.to_le_bytes()),
-            DpPrecision::Df64 => {
-                let [hi, lo] = f64_to_df64(*v);
-                bytes[at..at + 4].copy_from_slice(&hi.to_le_bytes());
-                bytes[at + 4..at + 8].copy_from_slice(&lo.to_le_bytes());
-            }
-        }
-    }
-    bytes
-}
-
-/// Decode what [`encode_alpha_bytes`] wrote. `raw` must be 8-byte values;
-/// trailing bytes that do not fill one are ignored.
-pub(crate) fn decode_alpha_bytes(precision: DpPrecision, raw: &[u8]) -> Vec<f64> {
+/// One Q31.32 row out of device bytes: `[lo: u32, hi: i32]` per value.
+fn decode_q64_bytes(raw: &[u8]) -> Vec<i64> {
     raw.as_chunks::<8>()
         .0
         .iter()
-        .map(|c| match precision {
-            DpPrecision::F64 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(c);
-                f64::from_le_bytes(b)
-            }
-            DpPrecision::Df64 => {
-                let hi = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                let lo = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
-                df64_to_f64(hi, lo)
-            }
+        .map(|c| {
+            let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let hi = i32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            ((hi as i64) << 32) | (lo as i64)
         })
         .collect()
 }
+
+/// The inverse of [`decode_q64_bytes`], written word by word so it is
+/// endian-independent.
+fn encode_q64_bytes(vals: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 8);
+    for &v in vals {
+        out.extend_from_slice(&(v as u32).to_le_bytes());
+        out.extend_from_slice(&((v >> 32) as i32).to_le_bytes());
+    }
+    out
+}
+
+/// States one workgroup owns, the `base = wid.x * 4096u` stride of the step
+/// kernel and the 16 KiB its `choices` array holds.
+const WG_STATES: usize = 4096;
+
+/// `state_meta` bits 0..29: the vocabulary column the state gathers.
+const META_COL: u32 = (1 << 30) - 1;
+/// `state_meta` bit 30: the skip arc is forbidden (`skip_dead`).
+const META_SKIP_DEAD: u32 = 1 << 30;
+/// `state_meta` bit 31: the state is a `<star>` target.
+const META_STAR: u32 = 1 << 31;
+
+/// Workgroups the kernels need for `s` states: one per 4096, at least one.
+fn num_workgroups(s: usize) -> u32 {
+    (s.div_ceil(WG_STATES)).max(1) as u32
+}
+
+/// The `Q31.32` arithmetic, shared by the step and init kernels.
+const Q_WGSL: &str = r#"
+const NINF_HI: i32 = -2147483647 - 1;
+const NINF_CUT_HI: i32 = -2000000000;
+const Q_SCALE: f32 = 4294967296.0;
+
+fn q_ninf() -> vec2<u32> {
+    return vec2<u32>(0u, bitcast<u32>(NINF_HI));
+}
+
+fn q_ge(a: vec2<u32>, b: vec2<u32>) -> bool {
+    let ah = bitcast<i32>(a.y);
+    let bh = bitcast<i32>(b.y);
+    return (ah > bh) || (ah == bh && a.x >= b.x);
+}
+
+fn f32_to_q(x: f32) -> vec2<u32> {
+    // Catches -inf, NaN, and sentinel values cleanly without NaN propagation.
+    if (!(x > -1000000.0)) {
+        return q_ninf();
+    }
+    let cx = min(x, 1000000.0);
+    let t = trunc(cx);
+    let r = cx - t;
+    // Since |r| < 1.0 in f32, |r| <= 1.0 - 2^-24, so |r| * 2^32 <= 2^32 - 256
+    // < u32::MAX.
+    let mag = u32(round(abs(r) * Q_SCALE));
+    var hi = i32(t);
+    var lo = mag;
+    if (r < 0.0 && mag != 0u) {
+        hi = hi - 1;
+        lo = 0u - mag;
+    }
+    return vec2<u32>(lo, bitcast<u32>(hi));
+}
+
+fn q_add_f32(a: vec2<u32>, e: f32) -> vec2<u32> {
+    let ah = bitcast<i32>(a.y);
+    if (ah <= NINF_CUT_HI || !(e > -1000000.0)) {
+        return q_ninf();
+    }
+    let b = f32_to_q(e);
+    let lo = a.x + b.x;
+    let carry = select(0, 1, lo < a.x);
+    let hi = ah + bitcast<i32>(b.y) + carry;
+    if (hi <= NINF_CUT_HI) {
+        return q_ninf();
+    }
+    return vec2<u32>(lo, bitcast<u32>(hi));
+}
+"#;
 
 const STEP_WGSL: &str = r#"
 struct StepCfg {
@@ -207,61 +233,65 @@ struct StepCfg {
     pad1: u32,
 }
 
-@group(0) @binding(0) var<storage, read> prev_row: array<f64>;
-@group(0) @binding(1) var<storage, read_write> next_row: array<f64>;
+@group(0) @binding(0) var<storage, read> prev_row: array<vec2<u32>>;
+@group(0) @binding(1) var<storage, read_write> next_row: array<vec2<u32>>;
 @group(0) @binding(2) var<storage, read> src: array<f32>;
-@group(0) @binding(3) var<storage, read> cols: array<u32>;
-@group(0) @binding(4) var<storage, read> skip_dead: array<u32>;
-@group(0) @binding(5) var<storage, read> star: array<u32>;
-@group(0) @binding(6) var<storage, read_write> back: array<u32>;
-@group(0) @binding(7) var<storage, read> ninf_buf: array<f64>;
-@group(0) @binding(8) var<uniform> cfg: StepCfg;
+@group(0) @binding(3) var<storage, read> state_meta: array<u32>;
+@group(0) @binding(4) var<storage, read_write> back: array<u32>;
+@group(0) @binding(5) var<uniform> cfg: StepCfg;
 
+const META_COL: u32 = 0x3fffffffu;
+const META_SKIP_DEAD: u32 = 0x40000000u;
+const META_STAR: u32 = 0x80000000u;
+"#;
+
+const STEP_BODY_WGSL: &str = r#"
 // One workgroup covers 4096 states (256 threads x 16 states). A thread's 16
 // states are STRIDED by the workgroup width, not contiguous: at loop step k
-// the 32 threads of a warp touch 32 consecutive states, so every f64 row
-// load is a coalesced 256 B. The row-major mapping this replaced made each
-// thread own states [g*16, g*16+16), which read 16 cache lines per warp load
-// — measured 120 us per frame on the DP, 16x the row's actual traffic.
+// the 32 threads of a warp touch 32 consecutive states, so every row load is
+// a coalesced 256 B of vec2<u32>. The row-major mapping this replaced made
+// each thread own states [g*16, g*16+16), which read 16 cache lines per warp
+// load — measured 120 us per frame on the DP, 16x the row's actual traffic.
+// 4096 u32 is exactly the 16 KiB workgroup-storage floor.
 var<workgroup> choices: array<u32, 4096>;
 
 fn emit_at(st: u32) -> f32 {
-    if (star[st] != 0u) {
+    let m = state_meta[st];
+    if ((m & META_STAR) != 0u) {
         return -1.0;
     }
-    return src[cfg.row * cfg.stride + cols[st]];
+    return src[cfg.row * cfg.stride + (m & META_COL)];
 }
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-    let base = wid.x * 4096u;
     let me = lid.x;
-    let ninf = ninf_buf[0];
+    let base = wid.x * 4096u;
     for (var k = 0u; k < 16u; k = k + 1u) {
         let st = base + k * 256u + me;
         var choice = 0u;
         if (st < cfg.s) {
             let stay = prev_row[st];
-            var adv = ninf;
-            var skip_v = ninf;
+            var adv = q_ninf();
+            var skip_v = q_ninf();
             if (st >= 1u) {
                 adv = prev_row[st - 1u];
             }
-            if (st >= 2u && skip_dead[st] == 0u) {
+            if (st >= 2u && (state_meta[st] & META_SKIP_DEAD) == 0u) {
                 skip_v = prev_row[st - 2u];
             }
             var best = stay;
-            if (stay >= adv && stay >= skip_v) {
+            if (q_ge(stay, adv) && q_ge(stay, skip_v)) {
                 // stay: choice 0
-            } else if (adv >= skip_v) {
+            } else if (q_ge(adv, skip_v)) {
                 choice = 1u;
                 best = adv;
             } else {
                 choice = 2u;
                 best = skip_v;
             }
-            next_row[st] = best + f64(emit_at(st));
+            next_row[st] = q_add_f32(best, emit_at(st));
         }
         choices[k * 256u + me] = choice;
     }
@@ -293,208 +323,37 @@ struct StepCfg {
     pad1: u32,
 }
 
-@group(0) @binding(0) var<storage, read_write> next_row: array<f64>;
+@group(0) @binding(0) var<storage, read_write> next_row: array<vec2<u32>>;
 @group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read> cols: array<u32>;
-@group(0) @binding(3) var<storage, read> star: array<u32>;
-@group(0) @binding(4) var<storage, read> ninf_buf: array<f64>;
-@group(0) @binding(5) var<uniform> cfg: StepCfg;
+@group(0) @binding(2) var<storage, read> state_meta: array<u32>;
+@group(0) @binding(3) var<uniform> cfg: StepCfg;
 
+const META_COL: u32 = 0x3fffffffu;
+const META_STAR: u32 = 0x80000000u;
+"#;
+
+const INIT_BODY_WGSL: &str = r#"
 fn emit_at(st: u32) -> f32 {
-    if (star[st] != 0u) {
+    let m = state_meta[st];
+    if ((m & META_STAR) != 0u) {
         return -1.0;
     }
-    return src[cfg.row * cfg.stride + cols[st]];
+    return src[cfg.row * cfg.stride + (m & META_COL)];
 }
 
+// Frame 0: only the two states a path can start in are reachable. Both are
+// absolute, so there is no row shift to record — the number in the buffer is
+// the log-probability itself.
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let st = gid.x;
-    if (st >= cfg.s) {
-        return;
-    }
-    var v = ninf_buf[0];
-    if (st <= 1u) {
-        v = f64(emit_at(st));
-    }
-    next_row[st] = v;
-}
-"#;
-
-/// The `df64` step kernel: the f64 one, with each alpha carried as a
-/// `(hi, lo)` f32 pair and a FINITE unreachable sentinel.
-///
-/// `-inf` never enters the two-sum: `(-inf) - (-inf)` is a NaN, and one NaN
-/// would silently corrupt every transition that flows through an unreachable
-/// state — the damage would surface as a wrong boundary seconds away from the
-/// state that produced it. `-3.4e38` is finite, far below any real path score,
-/// and is tested by threshold rather than equality.
-///
-/// Tie-breaking is the f64 rule, `stay >= adv && stay >= skip`: two
-/// unreachable states compare equal (`df_ge` is true for identical hi/lo), so
-/// `stay` wins exactly as `-inf >= -inf` does. For normalized finite pairs the
-/// lexicographic order on `(hi, lo)` is the exact order of the values.
-const STEP_DF64_WGSL: &str = r#"
-struct StepCfg {
-    s: u32,
-    stride: u32,
-    row: u32,
-    mode: u32,
-    back_row: u32,
-    rb_u32: u32,
-    pad0: u32,
-    pad1: u32,
-}
-
-@group(0) @binding(0) var<storage, read> prev_row: array<vec2<f32>>;
-@group(0) @binding(1) var<storage, read_write> next_row: array<vec2<f32>>;
-@group(0) @binding(2) var<storage, read> src: array<f32>;
-@group(0) @binding(3) var<storage, read> cols: array<u32>;
-@group(0) @binding(4) var<storage, read> skip_dead: array<u32>;
-@group(0) @binding(5) var<storage, read> star: array<u32>;
-@group(0) @binding(6) var<storage, read_write> back: array<u32>;
-@group(0) @binding(7) var<storage, read> ninf_buf: array<vec2<f32>>;
-@group(0) @binding(8) var<uniform> cfg: StepCfg;
-
-// Same strided 4096-state workgroup as the f64 kernel: 16 KiB, and a warp's
-// 32 threads still touch 32 consecutive states per step, so the 8-byte rows
-// load as coalesced 256 B.
-var<workgroup> choices: array<u32, 4096>;
-
-fn emit_at(st: u32) -> f32 {
-    if (star[st] != 0u) {
-        return -1.0;
-    }
-    return src[cfg.row * cfg.stride + cols[st]];
-}
-
-fn df_is_ninf(a: vec2<f32>) -> bool {
-    return a.x <= -1.0e37;
-}
-
-fn df_ge(a: vec2<f32>, b: vec2<f32>) -> bool {
-    return (a.x > b.x) || (a.x == b.x && a.y >= b.y);
-}
-
-// A clamp whose bounds no value of this DP can reach: |alpha| stays near
-// 80,000 and every residual is smaller still.
-//
-// It is not decoration. Vulkan implementations are allowed to simplify float
-// expressions algebraically, and this machine's NVIDIA driver does: without
-// the clamps it rewrites `(a.x + b) - a.x` to `b`, which makes every error
-// term below zero and silently turns the pair back into plain f32 (measured:
-// the alpha came out 3.7e-4 off the f64 run over 700 frames instead of 1e-8).
-// `min`/`max` are exact here and opaque to that rewriting, so each partial
-// result reaches the next step as the value IEEE arithmetic produced.
-fn df_keep(x: f32) -> f32 {
-    return min(max(x, -3.0e38), 3.0e38);
-}
-
-// Knuth TwoSum of (a.x, b), then a FastTwoSum renormalization of the pair
-// with a's own residual. Any unreachable operand short-circuits to the
-// sentinel before an infinity can reach the subtraction.
-fn df_add_f32(a: vec2<f32>, b: f32) -> vec2<f32> {
-    if (df_is_ninf(a) || b <= -1.0e37) {
-        return vec2<f32>(-3.4e38, 0.0);
-    }
-    let s = df_keep(a.x + b);
-    let v = df_keep(s - a.x);
-    let p = df_keep(s - v);
-    let e = df_keep((a.x - p) + (b - v));
-    let lo = df_keep(a.y + e);
-    let hi = df_keep(s + lo);
-    let err = df_keep(lo - (hi - s));
-    return vec2<f32>(hi, err);
-}
-
-@compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
-    let base = wid.x * 4096u;
-    let me = lid.x;
-    let ninf = ninf_buf[0];
-    for (var k = 0u; k < 16u; k = k + 1u) {
-        let st = base + k * 256u + me;
-        var choice = 0u;
-        if (st < cfg.s) {
-            let stay = prev_row[st];
-            var adv = ninf;
-            var skip_v = ninf;
-            if (st >= 1u) {
-                adv = prev_row[st - 1u];
-            }
-            if (st >= 2u && skip_dead[st] == 0u) {
-                skip_v = prev_row[st - 2u];
-            }
-            var best = stay;
-            if (df_ge(stay, adv) && df_ge(stay, skip_v)) {
-                // stay: choice 0
-            } else if (df_ge(adv, skip_v)) {
-                choice = 1u;
-                best = adv;
-            } else {
-                choice = 2u;
-                best = skip_v;
-            }
-            next_row[st] = df_add_f32(best, emit_at(st));
+    if (st < cfg.s) {
+        var v = q_ninf();
+        if (st <= 1u) {
+            v = f32_to_q(emit_at(st));
         }
-        choices[k * 256u + me] = choice;
+        next_row[st] = v;
     }
-    workgroupBarrier();
-    let u = wid.x * 256u + me;
-    if (u < cfg.rb_u32) {
-        var packed = 0u;
-        for (var j = 0u; j < 16u; j = j + 1u) {
-            let local = u * 16u + j - base;
-            let c = choices[(local >> 8u) * 256u + (local & 255u)];
-            packed = packed | ((c & 3u) << (j * 2u));
-        }
-        back[cfg.back_row * cfg.rb_u32 + u] = packed;
-    }
-}
-"#;
-
-/// The `df64` first-frame kernel: [`INIT_WGSL`] over `vec2<f32>` rows.
-const INIT_DF64_WGSL: &str = r#"
-struct StepCfg {
-    s: u32,
-    stride: u32,
-    row: u32,
-    mode: u32,
-    back_row: u32,
-    rb_u32: u32,
-    pad0: u32,
-    pad1: u32,
-}
-
-@group(0) @binding(0) var<storage, read_write> next_row: array<vec2<f32>>;
-@group(0) @binding(1) var<storage, read> src: array<f32>;
-@group(0) @binding(2) var<storage, read> cols: array<u32>;
-@group(0) @binding(3) var<storage, read> star: array<u32>;
-@group(0) @binding(4) var<storage, read> ninf_buf: array<vec2<f32>>;
-@group(0) @binding(5) var<uniform> cfg: StepCfg;
-
-fn emit_at(st: u32) -> f32 {
-    if (star[st] != 0u) {
-        return -1.0;
-    }
-    return src[cfg.row * cfg.stride + cols[st]];
-}
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let st = gid.x;
-    if (st >= cfg.s) {
-        return;
-    }
-    var v = ninf_buf[0];
-    if (st <= 1u) {
-        let e = emit_at(st);
-        if (e > -1.0e37) {
-            v = vec2<f32>(e, 0.0);
-        }
-    }
-    next_row[st] = v;
 }
 "#;
 
@@ -502,10 +361,12 @@ const GATHER_WGSL: &str = r#"
 struct Cfg { row0: u32, rows: u32, vocab: u32, s: u32 }
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> states: array<u32>;
-@group(0) @binding(2) var<storage, read> cols: array<u32>;
-@group(0) @binding(3) var<storage, read> star: array<u32>;
-@group(0) @binding(4) var<storage, read_write> outp: array<f32>;
-@group(0) @binding(5) var<uniform> cfg: Cfg;
+@group(0) @binding(2) var<storage, read> state_meta: array<u32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<uniform> cfg: Cfg;
+
+const META_COL: u32 = 0x3fffffffu;
+const META_STAR: u32 = 0x80000000u;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -516,8 +377,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let g = cfg.row0 + local;
     let st = states[g];
     var v = -1.0;
-    if (st < cfg.s && star[st] == 0u) {
-        v = logits[local * cfg.vocab + cols[st]];
+    if (st < cfg.s) {
+        let m = state_meta[st];
+        if ((m & META_STAR) == 0u) {
+            v = logits[local * cfg.vocab + (m & META_COL)];
+        }
     }
     outp[g] = v;
 }
@@ -566,9 +430,9 @@ fn main() {
 ///
 /// `max_binding` is [`Gpu::effective_max_binding`]: the smaller of the
 /// adapter's `max_storage_buffer_binding_size` and `max_buffer_size`, because
-/// a buffer is created against the one and bound against the other. The six
-/// sizes are the six storage buffers the DP binds; `alpha`, `ckpt`, `states`
-/// and `scores` are derived here from the state and frame counts, so a caller
+/// a buffer is created against the one and bound against the other. The three
+/// sizes the caller knows are passed in; `alpha`, `meta`, `states` and
+/// `scores` are derived here from the state and frame counts, so a caller
 /// cannot forget one.
 fn check_dp_buffer_limits(
     max_binding: u64,
@@ -579,8 +443,11 @@ fn check_dp_buffer_limits(
     ckpt_bytes: u64,
 ) -> Result<()> {
     let frames = n_frames as u64;
+    let states = s as u64;
     for (what, need) in [
-        ("dp-alpha", (s as u64) * 8),
+        // One Q31.32 row: 8 bytes a state.
+        ("dp-alpha", states * 8),
+        ("dp-meta", states * 4),
         ("dp-back", back_bytes),
         ("dp-stage", stage_bytes),
         ("dp-ckpt", ckpt_bytes),
@@ -607,13 +474,13 @@ fn check_dp_buffer_limits(
 /// rebuilds a single segment of choices. Encoder rows stay on the host
 /// because a second encode would cost more than the rows do.
 pub(crate) struct GpuDp {
+    /// Two ping-pong rows of Q31.32 alpha, 8 bytes a state.
     alpha: [wgpu::Buffer; 2],
     back: wgpu::Buffer,
     cfg: wgpu::Buffer,
-    ninf: wgpu::Buffer,
-    cols: wgpu::Buffer,
-    skip: wgpu::Buffer,
-    star: wgpu::Buffer,
+    /// `cols`, `skip_dead` and `star` in one u32 per state: three buffers and
+    /// three scattered reads per state became one of each.
+    meta: wgpu::Buffer,
     /// One window of encoder rows. Replay uploads a slice here; the full
     /// audio never gets a device copy.
     stage: wgpu::Buffer,
@@ -648,11 +515,7 @@ pub(crate) struct GpuDp {
     linear: bool,
     seg: usize,
     ckpt: wgpu::Buffer,
-    ckpt_host: Vec<f64>,
-    /// `f64` on an adapter with `SHADER_F64`, the `vec2<f32>` pair otherwise.
-    /// Both are 8 bytes per state, so only the kernels and the host-side
-    /// encode/decode change.
-    precision: DpPrecision,
+    ckpt_host: Vec<i64>,
 }
 
 impl GpuDp {
@@ -664,26 +527,43 @@ impl GpuDp {
         n_frames: usize,
         hidden: usize,
     ) -> Result<Self> {
-        let precision = select_dp_precision(
-            gpu.has_f64(),
-            std::env::var("CTC_GPU_DP_MODE").ok().as_deref(),
-        )?;
-        Self::new_with_precision(
-            gpu, token_ids, star_id, blank_id, n_frames, hidden, precision,
-        )
+        Self::with_plan(gpu, token_ids, star_id, blank_id, n_frames, hidden, None)
     }
 
-    /// [`GpuDp::new`] with the precision chosen by the caller instead of by
-    /// `CTC_GPU_DP_MODE`. The tests run both precisions on one device.
+    /// [`GpuDp::new`] with the space plan forced instead of resolved by
+    /// [`dp_plan`]. The checkpoint-replay test needs the linear plan on a file
+    /// short enough that the budget would keep the whole table.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_precision(
+    pub(crate) fn new_linear_for_test(
         gpu: &Gpu,
         token_ids: &[usize],
         star_id: usize,
         blank_id: usize,
         n_frames: usize,
         hidden: usize,
-        precision: DpPrecision,
+        seg: usize,
+    ) -> Result<Self> {
+        Self::with_plan(
+            gpu,
+            token_ids,
+            star_id,
+            blank_id,
+            n_frames,
+            hidden,
+            Some((seg, true)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_plan(
+        gpu: &Gpu,
+        token_ids: &[usize],
+        star_id: usize,
+        blank_id: usize,
+        n_frames: usize,
+        hidden: usize,
+        plan: Option<(usize, bool)>,
     ) -> Result<Self> {
         anyhow::ensure!(
             CTC_STAR_SCORE == -1.0,
@@ -699,8 +579,7 @@ impl GpuDp {
         let rb_u32 = u32::try_from(s.div_ceil(16)).context("backpointer groups")?;
 
         let mut cols = vec![0u32; s];
-        let mut skip = vec![0u32; s];
-        let mut star = vec![0u32; s];
+        let mut meta = vec![0u32; s];
         let blank_col = u32::try_from(blank_id).context("blank id")?;
         for (st, &lab) in labels.iter().enumerate() {
             cols[st] = if lab == star_id {
@@ -709,15 +588,20 @@ impl GpuDp {
                 u32::try_from(lab).context("label id")?
             };
         }
-        for st in 2..s {
-            if labels[st] == blank_id || labels[st] == labels[st - 2] {
-                skip[st] = 1;
+        anyhow::ensure!(
+            cols.iter().all(|&c| c <= META_COL),
+            "gpu viterbi: vocabulary column over the 30-bit state_meta field"
+        );
+        for st in 0..s {
+            meta[st] = cols[st];
+            if st >= 2 && (labels[st] == blank_id || labels[st] == labels[st - 2]) {
+                meta[st] |= META_SKIP_DEAD;
             }
         }
         if star_id != usize::MAX {
             for (i, &tok) in token_ids.iter().enumerate() {
                 if tok == star_id {
-                    star[2 * i + 1] = 1;
+                    meta[2 * i + 1] |= META_STAR;
                 }
             }
         }
@@ -726,7 +610,7 @@ impl GpuDp {
         // allocation: one past the binding limit otherwise surfaces as a
         // validation error inside the first window, with nothing pointing at
         // the transcript or the window length.
-        let (seg, linear) = dp_plan(n_frames, s, rb);
+        let (seg, linear) = plan.unwrap_or_else(|| dp_plan(n_frames, s, rb));
         // Non-linear: the whole table is read back per window, so the device
         // buffer holds one window. Linear: the choices are traced back ON the
         // device one segment at a time, so it holds one segment instead —
@@ -758,18 +642,10 @@ impl GpuDp {
             gpu.storage("dp-alpha-0", (s * 8) as u64),
             gpu.storage("dp-alpha-1", (s * 8) as u64),
         ];
-        fill_ninf(gpu, &alpha[0], s, precision);
-        fill_ninf(gpu, &alpha[1], s, precision);
-        let ninf = gpu.storage("dp-ninf", 8);
-        // The kernels read their unreachable value from here: `-inf` for f64,
-        // the finite sentinel for df64.
-        gpu.upload(&ninf, &encode_alpha_bytes(precision, &[f64::NEG_INFINITY]));
-        let cols_buf = gpu.storage("dp-cols", (s * 4) as u64);
-        let skip_buf = gpu.storage("dp-skip", (s * 4) as u64);
-        let star_buf = gpu.storage("dp-star", (s * 4) as u64);
-        gpu.upload(&cols_buf, bytemuck::cast_slice(&cols));
-        gpu.upload(&skip_buf, bytemuck::cast_slice(&skip));
-        gpu.upload(&star_buf, bytemuck::cast_slice(&star));
+        fill_ninf(gpu, &alpha[0], s);
+        fill_ninf(gpu, &alpha[1], s);
+        let meta_buf = gpu.storage("dp-meta", (s * 4) as u64);
+        gpu.upload(&meta_buf, bytemuck::cast_slice(&meta));
 
         let slot = (gpu.device.limits().min_uniform_buffer_offset_alignment as u64).max(UNI_SIZE);
         let cfg = gpu.uniform("dp-cfg", slot * BACK_CAP as u64);
@@ -795,9 +671,7 @@ impl GpuDp {
                 storage_layout(0, false),
                 storage_layout(1, true),
                 storage_layout(2, true),
-                storage_layout(3, true),
-                storage_layout(4, true),
-                uniform_layout(5),
+                uniform_layout(3),
             ],
         );
         let step_layout = bind_layout(
@@ -808,11 +682,8 @@ impl GpuDp {
                 storage_layout(1, false),
                 storage_layout(2, true),
                 storage_layout(3, true),
-                storage_layout(4, true),
-                storage_layout(5, true),
-                storage_layout(6, false),
-                storage_layout(7, true),
-                uniform_layout(8),
+                storage_layout(4, false),
+                uniform_layout(5),
             ],
         );
         let gather_layout = bind_layout(
@@ -822,9 +693,8 @@ impl GpuDp {
                 storage_layout(0, true),
                 storage_layout(1, true),
                 storage_layout(2, true),
-                storage_layout(3, true),
-                storage_layout(4, false),
-                uniform_static(5, 16),
+                storage_layout(3, false),
+                uniform_static(4, 16),
             ],
         );
         let trace_layout = bind_layout(
@@ -836,12 +706,10 @@ impl GpuDp {
                 uniform_static(2, 32),
             ],
         );
-        let (init_src, step_src) = match precision {
-            DpPrecision::F64 => (INIT_WGSL, STEP_WGSL),
-            DpPrecision::Df64 => (INIT_DF64_WGSL, STEP_DF64_WGSL),
-        };
-        let init_pipe = pipe(gpu, "viterbi-init", init_src, &init_layout)?;
-        let step_pipe = pipe(gpu, "viterbi-step", step_src, &step_layout)?;
+        let init_src = format!("{INIT_WGSL}{Q_WGSL}{INIT_BODY_WGSL}");
+        let step_src = format!("{STEP_WGSL}{Q_WGSL}{STEP_BODY_WGSL}");
+        let init_pipe = pipe(gpu, "viterbi-init", &init_src, &init_layout)?;
+        let step_pipe = pipe(gpu, "viterbi-step", &step_src, &step_layout)?;
         let gather_pipe = pipe(gpu, "viterbi-gather", GATHER_WGSL, &gather_layout)?;
         let trace_pipe = pipe(gpu, "viterbi-trace", TRACE_WGSL, &trace_layout)?;
         // Fold the DP's four pipelines into the same cache file the encoder
@@ -859,14 +727,12 @@ impl GpuDp {
         if linear {
             let ck_mb = (ncheck * s * 8) as f64 / (1024.0 * 1024.0);
             let seg_mb = (seg as f64) * (rb as f64) / (1024.0 * 1024.0);
-            let prec = precision.tag();
             eprintln!(
-                "ctc-aligner: viterbi on gpu ({prec}), checkpoints {ck_mb:.0} MB every {seg} frames, one segment {seg_mb:.0} MB rebuilt on traceback, hidden grows to {hid_mb:.0} MB (full table would be {back_mb:.0} MB)"
+                "ctc-aligner: viterbi on gpu (q31.32), checkpoints {ck_mb:.0} MB every {seg} frames, one segment {seg_mb:.0} MB rebuilt on traceback, hidden grows to {hid_mb:.0} MB (full table would be {back_mb:.0} MB)"
             );
         } else {
-            let prec = precision.tag();
             eprintln!(
-                "ctc-aligner: viterbi on gpu ({prec}), one pass, backpointers {back_mb:.0} MB, hidden grows to {hid_mb:.0} MB"
+                "ctc-aligner: viterbi on gpu (q31.32), one pass, backpointers {back_mb:.0} MB, hidden grows to {hid_mb:.0} MB"
             );
         }
 
@@ -874,10 +740,7 @@ impl GpuDp {
             alpha,
             back,
             cfg,
-            ninf,
-            cols: cols_buf,
-            skip: skip_buf,
-            star: star_buf,
+            meta: meta_buf,
             stage,
             states_buf,
             score_out,
@@ -907,7 +770,6 @@ impl GpuDp {
             seg,
             ckpt,
             ckpt_host: Vec::new(),
-            precision,
         })
     }
 
@@ -1027,10 +889,9 @@ impl GpuDp {
             entries: &[
                 buf_entry(0, logits),
                 buf_entry(1, &self.states_buf),
-                buf_entry(2, &self.cols),
-                buf_entry(3, &self.star),
-                buf_entry(4, &self.score_out),
-                uni_entry(5, uni, uni_off, 16),
+                buf_entry(2, &self.meta),
+                buf_entry(3, &self.score_out),
+                uni_entry(4, uni, uni_off, 16),
             ],
         })
     }
@@ -1058,8 +919,13 @@ impl GpuDp {
             let bytes = (ncheck * self.s as usize * 8) as u64;
             let raw = gpu.readback(&self.ckpt, bytes)?;
             anyhow::ensure!(raw.len() == bytes as usize, "checkpoint readback short");
-            self.ckpt_host = decode_alpha_bytes(self.precision, &raw);
+            self.ckpt_host = decode_q64_bytes(&raw);
+            anyhow::ensure!(
+                self.ckpt_host.len() == ncheck * self.s as usize,
+                "checkpoint row count"
+            );
         }
+        anyhow::ensure!(self.frames >= 1, "gpu viterbi: no frames read back");
         let (ram, disk) = self.backs.megabytes();
         let hid = (self.hidden_host.len() * 4) as f64 / (1024.0 * 1024.0);
         let ck = (self.ckpt_host.len() * 8) as f64 / (1024.0 * 1024.0);
@@ -1106,15 +972,19 @@ impl GpuDp {
         let mut kinds = Vec::with_capacity(n_kept);
         let mut cfgs = Vec::with_capacity(n_kept);
         let mut back_row = 0u32;
+        let mut front = self.front;
         for local in 0..n_kept {
             let row = u32::try_from(row0 + local).context("logit row")?;
             let init = self.frames == 0 && local == 0;
+            if init {
+                front = 0;
+            }
             kinds.push(!init);
             cfgs.push(StepCfg {
                 s: self.s,
                 stride,
                 row,
-                mode: 0,
+                mode: if init { 0 } else { front as u32 },
                 back_row: if init { 0 } else { back_row },
                 rb_u32: self.rb_u32,
                 pad0: 0,
@@ -1122,6 +992,7 @@ impl GpuDp {
             });
             if !init {
                 back_row += 1;
+                front ^= 1;
             }
         }
         let produced = back_row as usize;
@@ -1140,10 +1011,8 @@ impl GpuDp {
             entries: &[
                 buf_entry(0, &self.alpha[0]),
                 buf_entry(1, logits),
-                buf_entry(2, &self.cols),
-                buf_entry(3, &self.star),
-                buf_entry(4, &self.ninf),
-                dyn_uni(5, &self.cfg),
+                buf_entry(2, &self.meta),
+                dyn_uni(3, &self.cfg),
             ],
         });
         let bg01 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1153,12 +1022,9 @@ impl GpuDp {
                 buf_entry(0, &self.alpha[0]),
                 buf_entry(1, &self.alpha[1]),
                 buf_entry(2, logits),
-                buf_entry(3, &self.cols),
-                buf_entry(4, &self.skip),
-                buf_entry(5, &self.star),
-                buf_entry(6, &self.back),
-                buf_entry(7, &self.ninf),
-                dyn_uni(8, &self.cfg),
+                buf_entry(3, &self.meta),
+                buf_entry(4, &self.back),
+                dyn_uni(5, &self.cfg),
             ],
         });
         let bg10 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1168,12 +1034,9 @@ impl GpuDp {
                 buf_entry(0, &self.alpha[1]),
                 buf_entry(1, &self.alpha[0]),
                 buf_entry(2, logits),
-                buf_entry(3, &self.cols),
-                buf_entry(4, &self.skip),
-                buf_entry(5, &self.star),
-                buf_entry(6, &self.back),
-                buf_entry(7, &self.ninf),
-                dyn_uni(8, &self.cfg),
+                buf_entry(3, &self.meta),
+                buf_entry(4, &self.back),
+                dyn_uni(5, &self.cfg),
             ],
         });
 
@@ -1198,7 +1061,7 @@ impl GpuDp {
             hidden_bytes as u64,
         );
         let mut front = self.front;
-        let step_groups = self.s.div_ceil(16).div_ceil(256).max(1);
+        let step_groups = num_workgroups(self.s as usize);
         let init_groups = self.s.div_ceil(256).max(1);
         // One compute pass for the window's frames; dispatches inside a pass
         // are ordered with full memory visibility, so the alpha ping-pong is
@@ -1212,6 +1075,7 @@ impl GpuDp {
         for (i, &is_step) in kinds.iter().enumerate() {
             let off = (i * uni) as u32;
             if is_step {
+                debug_assert_eq!(front as u32, cfgs[i].mode, "ping drifted");
                 pass.set_pipeline(&self.step_pipe);
                 let bg = if front == 0 { &bg01 } else { &bg10 };
                 pass.set_bind_group(0, bg, &[off]);
@@ -1316,7 +1180,10 @@ impl GpuDp {
         self.s as usize
     }
 
-    pub(crate) fn checkpoint(&self, k: usize) -> Result<&[f64]> {
+    /// One checkpoint row: the Q31.32 alpha this segment replays from. It is
+    /// the absolute row, not a normalized one — there is no shift to restore,
+    /// so [`load_alpha`](Self::load_alpha) uploads it as it stands.
+    pub(crate) fn checkpoint(&self, k: usize) -> Result<&[i64]> {
         let s = self.s as usize;
         let start = k.checked_mul(s).context("checkpoint index")?;
         self.ckpt_host.get(start..start + s).with_context(|| {
@@ -1327,11 +1194,12 @@ impl GpuDp {
         })
     }
 
-    /// Put a segment's starting alpha in buffer 0. The next step reads it.
-    pub(crate) fn load_alpha(&mut self, gpu: &Gpu, alpha: &[f64]) -> Result<()> {
+    /// Put a segment's starting alpha in buffer 0. The rows are absolute, so
+    /// replaying from a checkpoint reproduces the forward pass's numbers bit
+    /// for bit with nothing else to restore.
+    pub(crate) fn load_alpha(&mut self, gpu: &Gpu, alpha: &[i64]) -> Result<()> {
         anyhow::ensure!(alpha.len() == self.s as usize, "alpha width");
-        let bytes = encode_alpha_bytes(self.precision, alpha);
-        gpu.upload(&self.alpha[0], &bytes);
+        gpu.upload(&self.alpha[0], &encode_q64_bytes(alpha));
         self.front = 0;
         Ok(())
     }
@@ -1356,17 +1224,23 @@ impl GpuDp {
         let stride = u32::try_from(vocab).context("vocab")?;
         let uni = self.slot as usize;
         let mut raw = vec![0u8; n * uni];
+        // Two counters on purpose: `mode` decides the ping each frame's
+        // uniform carries, `front` decides which bind group that frame is
+        // dispatched with. They must agree, and one variable for both is how
+        // the replay ended up reading the previous segment's row.
+        let mut flags = self.front;
         for local in 0..n {
             let cfg = StepCfg {
                 s: self.s,
                 stride,
                 row: u32::try_from(local).context("replay row")?,
-                mode: 0,
+                mode: flags as u32,
                 back_row: u32::try_from(back_row0 + local).context("replay back row")?,
                 rb_u32: self.rb_u32,
                 pad0: 0,
                 pad1: 0,
             };
+            flags ^= 1;
             let off = local * uni;
             let b = bytemuck::bytes_of(&cfg);
             raw[off..off + b.len()].copy_from_slice(b);
@@ -1379,12 +1253,9 @@ impl GpuDp {
                 buf_entry(0, &self.alpha[0]),
                 buf_entry(1, &self.alpha[1]),
                 buf_entry(2, logits),
-                buf_entry(3, &self.cols),
-                buf_entry(4, &self.skip),
-                buf_entry(5, &self.star),
-                buf_entry(6, &self.back),
-                buf_entry(7, &self.ninf),
-                dyn_uni(8, &self.cfg),
+                buf_entry(3, &self.meta),
+                buf_entry(4, &self.back),
+                dyn_uni(5, &self.cfg),
             ],
         });
         let g1 = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1394,16 +1265,13 @@ impl GpuDp {
                 buf_entry(0, &self.alpha[1]),
                 buf_entry(1, &self.alpha[0]),
                 buf_entry(2, logits),
-                buf_entry(3, &self.cols),
-                buf_entry(4, &self.skip),
-                buf_entry(5, &self.star),
-                buf_entry(6, &self.back),
-                buf_entry(7, &self.ninf),
-                dyn_uni(8, &self.cfg),
+                buf_entry(3, &self.meta),
+                buf_entry(4, &self.back),
+                dyn_uni(5, &self.cfg),
             ],
         });
+        let groups = num_workgroups(self.s as usize);
         let mut front = self.front;
-        let groups = self.s.div_ceil(16).div_ceil(256).max(1);
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("viterbi-replay-frames"),
@@ -1575,10 +1443,15 @@ impl GpuDp {
         Ok(())
     }
 
+    /// The last alpha row as `f64` absolute log-probabilities; an unreachable
+    /// state is `-inf` again instead of the sentinel.
     pub(crate) fn read_alpha(&self, gpu: &Gpu) -> Result<Vec<f64>> {
         let bytes = gpu.readback(&self.alpha[self.front], self.s as u64 * 8)?;
         anyhow::ensure!(bytes.len() == self.s as usize * 8, "alpha readback short");
-        Ok(decode_alpha_bytes(self.precision, &bytes))
+        Ok(decode_q64_bytes(&bytes)
+            .into_iter()
+            .map(q64_to_f64)
+            .collect())
     }
 }
 
@@ -1887,13 +1760,9 @@ pub(crate) mod dp_prof {
     }
 }
 
-fn fill_ninf(gpu: &Gpu, buf: &wgpu::Buffer, n: usize, precision: DpPrecision) {
-    let unit = encode_alpha_bytes(precision, &[f64::NEG_INFINITY]);
-    let mut bytes = vec![0u8; n * 8];
-    for chunk in bytes.as_chunks_mut::<8>().0 {
-        chunk.copy_from_slice(&unit);
-    }
-    gpu.upload(buf, &bytes);
+fn fill_ninf(gpu: &Gpu, buf: &wgpu::Buffer, n: usize) {
+    let row = vec![Q_NINF; n];
+    gpu.upload(buf, &encode_q64_bytes(&row));
 }
 
 fn storage_layout(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -1995,44 +1864,62 @@ mod tests {
     use super::*;
 
     // ------------------------------------------------------------------
-    // The df64 rule set, mirrored from `STEP_DF64_WGSL` line for line.
+    // The Q31.32 rule set, mirrored from `Q_WGSL` / `STEP_BODY_WGSL` line for
+    // line.
     //
     // The pure tests below drive exactly these, so a change to the shader
     // that is not made here too shows up as a path difference rather than as
     // a silently different answer.
     // ------------------------------------------------------------------
 
-    fn df_is_ninf(a: [f32; 2]) -> bool {
-        a[0] <= -1.0e37
-    }
+    /// `Q_SCALE` in the shader's own precision.
+    const Q_SCALE_F32: f32 = 4294967296.0;
+    /// `NINF_CUT_HI`: a high word at or below this is unreachable.
+    const NINF_CUT_HI: i32 = -2_000_000_000;
 
-    fn df_ge(a: [f32; 2], b: [f32; 2]) -> bool {
-        a[0] > b[0] || (a[0] == b[0] && a[1] >= b[1])
-    }
-
-    /// The shader's `df_keep`. Rust evaluates float expressions in the order
-    /// written, so this is the identity here; it is mirrored because the
-    /// shader needs it to stop a driver from folding the two-sum away.
-    fn df_keep(x: f32) -> f32 {
-        x.min(3.0e38).max(-3.0e38)
-    }
-
-    fn df_add_f32(a: [f32; 2], b: f32) -> [f32; 2] {
-        if df_is_ninf(a) || b <= -1.0e37 {
-            return [DF_NINF_HI, 0.0];
+    /// Mirror of `f32_to_q`.
+    fn f32_to_q(x: f32) -> i64 {
+        if !(x > -1_000_000.0) {
+            return Q_NINF;
         }
-        let s = df_keep(a[0] + b);
-        let v = df_keep(s - a[0]);
-        let p = df_keep(s - v);
-        let e = df_keep((a[0] - p) + (b - v));
-        let lo = df_keep(a[1] + e);
-        let hi = df_keep(s + lo);
-        let err = df_keep(lo - (hi - s));
-        [hi, err]
+        let cx = x.min(1_000_000.0);
+        let t = cx.trunc();
+        let r = cx - t;
+        let mag = (r.abs() * Q_SCALE_F32).round() as u32;
+        let mut hi = t as i32;
+        let mut lo = mag;
+        if r < 0.0 && mag != 0 {
+            hi -= 1;
+            lo = 0u32.wrapping_sub(mag);
+        }
+        ((hi as i64) << 32) | (lo as i64)
     }
 
-    /// `(choices, final alpha)`. The rule is the shader's: `stay` wins a tie,
-    /// then `advance`, then `skip`.
+    /// Mirror of `q_ge`.
+    fn q_ge(a: i64, b: i64) -> bool {
+        let ah = (a >> 32) as i32;
+        let bh = (b >> 32) as i32;
+        ah > bh || (ah == bh && (a as u32) >= (b as u32))
+    }
+
+    /// Mirror of `q_add_f32`.
+    fn q_add_f32(a: i64, e: f32) -> i64 {
+        let ah = (a >> 32) as i32;
+        if ah <= NINF_CUT_HI || !(e > -1_000_000.0) {
+            return Q_NINF;
+        }
+        let b = f32_to_q(e);
+        let lo = (a as u32).wrapping_add(b as u32);
+        let carry = i32::from(lo < a as u32);
+        let hi = ah.wrapping_add((b >> 32) as i32).wrapping_add(carry);
+        if hi <= NINF_CUT_HI {
+            return Q_NINF;
+        }
+        ((hi as i64) << 32) | (lo as i64)
+    }
+
+    /// `(choices, final alpha)` from a full-precision `f64` DP. The rule is
+    /// the shader's: `stay` wins a tie, then `advance`, then `skip`.
     fn reference_dp_f64(
         logits: &[f32],
         vocab: usize,
@@ -2080,54 +1967,63 @@ mod tests {
         (choices, prev)
     }
 
-    /// The same DP on `df64` pairs. Returns the choice table, the final alpha
-    /// and whether any stored half ever became a NaN.
-    fn reference_dp_df64(
+    /// The host mirror of the kernels: the same Q31.32 recurrence, the same
+    /// sentinel. Returns the choice table and the final absolute row.
+    fn reference_dp_q32(
         logits: &[f32],
         vocab: usize,
         cols: &[usize],
         skip_dead: &[bool],
         t_len: usize,
         s: usize,
-    ) -> (Vec<u8>, Vec<[f32; 2]>, bool) {
+    ) -> (Vec<u8>, Vec<i64>) {
+        let (choices, rows) =
+            reference_dp_q32_rows(logits, vocab, cols, skip_dead, t_len, s);
+        (choices, rows.last().cloned().expect("one row per frame"))
+    }
+
+    /// [`reference_dp_q32`] keeping every row, for the checkpoint tests.
+    fn reference_dp_q32_rows(
+        logits: &[f32],
+        vocab: usize,
+        cols: &[usize],
+        skip_dead: &[bool],
+        t_len: usize,
+        s: usize,
+    ) -> (Vec<u8>, Vec<Vec<i64>>) {
         let emit = |t: usize, st: usize| logits[t * vocab + cols[st]];
-        let ninf = [DF_NINF_HI, 0.0];
-        let mut prev = vec![ninf; s];
+        let mut prev = vec![Q_NINF; s];
         for st in 0..s {
             if st <= 1 {
-                let e = emit(0, st);
-                prev[st] = if e > -1.0e37 { [e, 0.0] } else { ninf };
+                prev[st] = f32_to_q(emit(0, st));
             }
         }
         let mut choices = vec![0u8; t_len * s];
-        let mut nan = false;
+        let mut rows = vec![prev.clone()];
         for t in 1..t_len {
-            // A separate row: `adv`/`skip` read the *previous* frame while
-            // this loop overwrites the current one.
-            let mut next = vec![ninf; s];
+            let mut next = vec![Q_NINF; s];
             for st in 0..s {
                 let stay = prev[st];
-                let adv = if st >= 1 { prev[st - 1] } else { ninf };
+                let adv = if st >= 1 { prev[st - 1] } else { Q_NINF };
                 let skip = if st >= 2 && !skip_dead[st] {
                     prev[st - 2]
                 } else {
-                    ninf
+                    Q_NINF
                 };
-                let (choice, best) = if df_ge(stay, adv) && df_ge(stay, skip) {
+                let (choice, best) = if q_ge(stay, adv) && q_ge(stay, skip) {
                     (0u8, stay)
-                } else if df_ge(adv, skip) {
+                } else if q_ge(adv, skip) {
                     (1u8, adv)
                 } else {
                     (2u8, skip)
                 };
-                let v = df_add_f32(best, emit(t, st));
-                nan |= v[0].is_nan() || v[1].is_nan();
-                next[st] = v;
+                next[st] = q_add_f32(best, emit(t, st));
                 choices[(t - 1) * s + st] = choice;
             }
             prev = next;
+            rows.push(prev.clone());
         }
-        (choices, prev, nan)
+        (choices, rows)
     }
 
     /// Walk a choice table back from the same end state the kernels pick:
@@ -2148,24 +2044,80 @@ mod tests {
     }
 
     /// Per-frame emissions whose mean is `-0.44`, so an hour of frames lands
-    /// the alpha near −80,000, with a ~1e-5 spread between states: orders of
-    /// magnitude above the df64 rounding error and far below f32's.
+    /// the absolute alpha near −80,000.
+    ///
+    /// `spread` sets how far apart competing paths sit. It has to stay well
+    /// above the Q31.32 error the recurrence accumulates over `t_len` frames
+    /// (< 1e-4 even at 180,000 frames), or the test would be measuring which
+    /// of two numerically indistinguishable paths wins rather than whether the
+    /// two recurrences agree.
     ///
     /// `dead` is one vocabulary column that stays at `-inf` over `window`,
     /// which makes the states carrying that label unreachable there — the
-    /// only way a real `-inf` reaches the DP, and the case the finite
-    /// sentinel exists for.
+    /// only way a real `-inf` reaches the DP, and the case the sentinel
+    /// exists for.
     fn synthetic_logits(
         vocab: usize,
         t_len: usize,
         dead: usize,
         window: std::ops::Range<usize>,
+        spread: f32,
     ) -> Vec<f32> {
         let mut out = vec![0f32; t_len * vocab];
         for t in 0..t_len {
             for v in 0..vocab {
                 let wiggle = ((t * 37 + v * 11) % 7) as f32 - 3.0;
-                out[t * vocab + v] = -0.44 + 1e-5 * wiggle;
+                out[t * vocab + v] = -0.44 + spread * wiggle;
+            }
+        }
+        for t in window {
+            if t < t_len {
+                out[t * vocab + dead] = f32::NEG_INFINITY;
+            }
+        }
+        out
+    }
+
+    /// Emissions with a *pinned* path: at every frame one column is `PIN`
+    /// better than the rest, so the winning path's margin per decision is
+    /// billions of times the Q31.32 step, whether that is over 100 frames or
+    /// over 180,000. That is what makes "the path is exactly the f64 path" a
+    /// statement about the recurrence rather than about which of two paths
+    /// separated by 1e-10 wins a coin toss — the flat
+    /// [`synthetic_logits`] field below is where near-ties are exercised.
+    ///
+    /// 25 frames on a blank, then 25 on the next label, monotonically: the
+    /// path has to advance, hold, and take the skip arc over the blank between
+    /// one label and the next. `block` is the frames per stage.
+    const PIN: f32 = 4.0;
+    fn synthetic_logits_walk(
+        vocab: usize,
+        t_len: usize,
+        dead: usize,
+        window: std::ops::Range<usize>,
+        block: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; t_len * vocab];
+        for t in 0..t_len {
+            // The path never has to move backwards, which no CTC path can.
+            let block = t / block;
+            let max_label = vocab - 1;
+            let good = if block > 2 * max_label {
+                max_label
+            } else if block % 2 == 0 {
+                0
+            } else {
+                1 + (block / 2).min(max_label - 1)
+            };
+            for v in 0..vocab {
+                // Every column gets its own value: an *exact* tie is broken by
+                // accumulated rounding rather than by the rule, so a row of
+                // identical emissions would make "the path is identical" a
+                // statement about that rounding. Distinct values 1e-3 apart sit
+                // seven orders of magnitude above the drift measured below, and
+                // the tie-break rules themselves are exercised by the shorter,
+                // flat-spread GPU tests.
+                out[t * vocab + v] = -0.44 + 1e-3 * v as f32 - if v == good { 0.0 } else { PIN };
             }
         }
         for t in window {
@@ -2190,122 +2142,157 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn dp_precision_follows_the_adapter_and_the_override() {
-        // No override: whatever the device can do, it does.
-        assert_eq!(select_dp_precision(true, None).unwrap(), DpPrecision::F64);
-        assert_eq!(
-            select_dp_precision(true, Some("")).unwrap(),
-            DpPrecision::F64
-        );
-        assert_eq!(
-            select_dp_precision(true, Some("auto")).unwrap(),
-            DpPrecision::F64
-        );
-        assert_eq!(
-            select_dp_precision(true, Some("AUTO")).unwrap(),
-            DpPrecision::F64
-        );
-        assert_eq!(select_dp_precision(false, None).unwrap(), DpPrecision::Df64);
-        assert_eq!(
-            select_dp_precision(false, Some("auto")).unwrap(),
-            DpPrecision::Df64
-        );
-        // `f64` is a request, not a wish: it fails on an adapter that cannot
-        // run it instead of quietly dropping 5 bits.
-        assert_eq!(
-            select_dp_precision(true, Some("f64")).unwrap(),
-            DpPrecision::F64
-        );
-        let err = select_dp_precision(false, Some("f64")).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("SHADER_F64"), "{msg}");
-        assert!(msg.contains("CTC_GPU_DP_MODE=f64"), "{msg}");
-        // `df64` works everywhere, including where f64 would.
-        assert_eq!(
-            select_dp_precision(true, Some("df64")).unwrap(),
-            DpPrecision::Df64
-        );
-        assert_eq!(
-            select_dp_precision(false, Some("DF64")).unwrap(),
-            DpPrecision::Df64
-        );
-        // Anything else is refused with the accepted set in the message.
-        for bad in ["f32", "double", "1", "on"] {
-            let err = select_dp_precision(true, Some(bad)).unwrap_err();
-            let msg = format!("{err}");
-            assert!(msg.contains(bad), "{msg}");
-            assert!(msg.contains("df64"), "{msg}");
-        }
+    /// The largest gap between the device's de-coded `f64` row and the CPU's,
+    /// over the states that are reachable in both.
+    fn worst_gap(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .filter(|(_, want)| want.is_finite())
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f64, f64::max)
     }
 
     #[test]
-    fn df64_round_trips_hold_half_the_f64_bits() {
-        // The sentinel, both ways.
-        assert_eq!(f64_to_df64(f64::NEG_INFINITY), [DF_NINF_HI, 0.0]);
-        assert_eq!(df64_to_f64(DF_NINF_HI, 0.0), f64::NEG_INFINITY);
-        // Past the cutoff on the finite side is unreachable too.
-        assert_eq!(f64_to_df64(-1.0e37), [DF_NINF_HI, 0.0]);
-        assert_eq!(f64_to_df64(-1.0e40), [DF_NINF_HI, 0.0]);
-        assert!(df64_to_f64(-1.0e37, 0.0).is_infinite());
-
-        // Exactly representable values stay exact.
-        for v in [0.0f64, -0.5, -1.0, -2.0, -4096.0] {
-            let [hi, lo] = f64_to_df64(v);
-            assert_eq!(df64_to_f64(hi, lo), v, "{v}");
-            assert_eq!(lo, 0.0, "{v} has no residual");
-        }
-
-        // The interesting one: an hour-long alpha, where an f32 ulp is 1/128
-        // and the f32 path would move a boundary. df64's is below 1e-9.
-        for v in [
-            -80_000.123_456_789f64,
-            -79_999.999_987_654,
-            -12_345.678_901,
-            1e-7,
+    fn the_shaders_are_native_integer_and_fit_the_webgpu_floors() {
+        let init_src = format!("{INIT_WGSL}{Q_WGSL}{INIT_BODY_WGSL}");
+        let step_src = format!("{STEP_WGSL}{Q_WGSL}{STEP_BODY_WGSL}");
+        for (src, what) in [
+            (init_src.as_str(), "viterbi-init"),
+            (step_src.as_str(), "viterbi-step"),
+            (GATHER_WGSL, "viterbi-gather"),
+            (TRACE_WGSL, "viterbi-trace"),
         ] {
-            let [hi, lo] = f64_to_df64(v);
-            let back = df64_to_f64(hi, lo);
-            assert!((back - v).abs() < 1e-9, "{v} came back as {back}");
-            // and the pair is a genuine refinement of the f32 half
-            assert!((hi as f64 - v).abs() >= (back - v).abs(), "{v}");
+            crate::shaders::naga_validate(src, what);
+            // No double precision anywhere: not the type, not a cast, not the
+            // `enable` directive that would unlock it.
+            assert!(!src.contains("f64"), "{what} still names f64");
+            assert!(!src.contains("df_keep"), "{what} still has the df64 clamp");
+            assert!(!src.contains("enable "), "{what} enables a feature");
+            assert!(!src.contains("subgroups"), "{what} needs subgroups");
         }
-        // The ulp at -80,000, spelled out: 48 bits of significand.
-        let at = f64_to_df64(-80_000.0);
-        let step = f64_to_df64(-80_000.0 + 1e-9);
-        assert_eq!(at[0], step[0], "1e-9 is below one f32 ulp here");
-        assert_ne!(at[1], step[1], "but df64 resolves it");
-
-        // The byte codec is the buffer layout: 8 bytes per state, both ways.
-        let alpha = vec![-80_000.123_456_789f64, 0.0, -1.5, f64::NEG_INFINITY];
-        for p in [DpPrecision::F64, DpPrecision::Df64] {
-            let bytes = encode_alpha_bytes(p, &alpha);
-            assert_eq!(bytes.len(), alpha.len() * 8, "{p:?}");
-            let back = decode_alpha_bytes(p, &bytes);
-            assert_eq!(back.len(), alpha.len(), "{p:?}");
-            for (i, (got, want)) in back.iter().zip(&alpha).enumerate() {
-                if want.is_infinite() {
-                    assert_eq!(got, want, "{p:?} [{i}]");
-                } else {
-                    assert!((got - want).abs() < 1e-9, "{p:?} [{i}]: {want} vs {got}");
-                }
-            }
+        // The rows the DP binds are Q31.32 (8 bytes a state) and u32 metadata.
+        assert!(step_src.contains("prev_row: array<vec2<u32>>"));
+        assert!(step_src.contains("next_row: array<vec2<u32>>"));
+        assert!(init_src.contains("next_row: array<vec2<u32>>"));
+        assert!(step_src.contains("state_meta: array<u32>"));
+        assert!(!step_src.contains("cols: array<u32>"));
+        assert!(!step_src.contains("star: array<u32>"));
+        assert!(!step_src.contains("ninf_buf"));
+        assert!(!step_src.contains("norm: array"));
+        // 4096 u32 of workgroup storage is exactly WebGPU's 16 KiB floor, and
+        // it is the only array the step kernel declares.
+        assert_eq!(step_src.matches("var<workgroup>").count(), 1);
+        assert!(step_src.contains("var<workgroup> choices: array<u32, 4096>;"));
+        assert_eq!(WG_STATES * std::mem::size_of::<u32>(), 16 * 1024);
+        // One barrier: no frame-max reduction is left to synchronise.
+        assert_eq!(step_src.matches("workgroupBarrier()").count(), 1);
+        // StepCfg is the 32-byte uniform the per-frame write packs; the
+        // bindings are 5 storage + 1 dynamic uniform, 3 + 1, 4 + 1, 2 + 1.
+        assert_eq!(std::mem::size_of::<StepCfg>(), 32);
+        assert_eq!(
+            [5u32, 3, 4, 2],
+            [
+                step_src.as_str(),
+                init_src.as_str(),
+                GATHER_WGSL,
+                TRACE_WGSL
+            ]
+            .map(|s| { s.matches("var<storage").count() as u32 })
+        );
+        for (src, what) in [
+            (init_src.as_str(), "viterbi-init"),
+            (step_src.as_str(), "viterbi-step"),
+            (GATHER_WGSL, "viterbi-gather"),
+            (TRACE_WGSL, "viterbi-trace"),
+        ] {
+            assert_eq!(src.matches("var<uniform>").count(), 1, "{what}");
         }
     }
 
     #[test]
-    fn df64_rules_match_f64_over_an_hour_of_frames() {
-        // A 3-state tie: two unreachable states compare equal, so `stay`
-        // wins, exactly as `-inf >= -inf` does in f64.
-        assert!(df_ge([DF_NINF_HI, 0.0], [DF_NINF_HI, 0.0]));
-        assert!(df_is_ninf([DF_NINF_HI, 0.0]));
-        assert!(!df_is_ninf([-80_000.0, 0.0]));
-        // and a finite pair orders lexicographically
-        let a = f64_to_df64(-100.25);
-        let b = f64_to_df64(-100.5);
-        assert!(df_ge(a, b) && !df_ge(b, a));
+    fn q32_conversions_hold_their_corners() {
+        let step = 1.0 / 4_294_967_296.0;
+        // Exact values land exactly.
+        assert_eq!(f32_to_q(0.0), 0);
+        assert_eq!(q64_to_f64(f32_to_q(0.0)), 0.0);
+        assert_eq!(q64_to_f64(f32_to_q(-1.0)), -1.0);
+        assert_eq!(f32_to_q(-1.0), -4_294_967_296);
+        assert_eq!(q64_to_f64(f32_to_q(-0.25)), -0.25);
+        assert_eq!(q64_to_f64(f32_to_q(0.5)), 0.5);
 
-        // An hour at 50 Hz.
+        // Within half a step for everything else.
+        for x in [-1e-8f32, 1e-8, 3.25, -3.25, 123.456, -0.7, 0.7] {
+            let got = q64_to_f64(f32_to_q(x));
+            assert!(
+                (got - f64::from(x)).abs() <= step * 0.5 + 1e-15,
+                "{x} -> {got}"
+            );
+        }
+
+        // Underflow to zero: the fractional part rounds away, and no sign
+        // bit survives to make it -0.
+        assert_eq!(f32_to_q(-1e-12), 0);
+        assert_eq!(q64_to_f64(f32_to_q(-1e-12)), 0.0);
+
+        // The worst-case magnitude: |r| <= 1 - 2^-24, so `r * 2^32` is
+        // 2^32 - 256 and never wraps the u32.
+        let below_one = -(1.0 - 2f32.powi(-24));
+        let q = f32_to_q(below_one);
+        assert_eq!(q >> 32, -1);
+        assert_eq!(q as u32, 256);
+        assert_eq!(q64_to_f64(q), f64::from(below_one));
+        let above = 1.0 - 2f32.powi(-24);
+        let q = f32_to_q(above);
+        assert_eq!(q >> 32, 0);
+        assert_eq!(q as u32, u32::MAX - 255);
+        assert_eq!(q64_to_f64(q), f64::from(above));
+
+        // Out-of-band inputs: -inf, NaN and the sentinel-ish magnitude all
+        // decode to the unreachable sentinel instead of poisoning the DP.
+        for x in [f32::NEG_INFINITY, f32::NAN, -3.4e38, -1.0e7] {
+            assert_eq!(f32_to_q(x), Q_NINF, "{x}");
+            assert_eq!(q64_to_f64(f32_to_q(x)), f64::NEG_INFINITY, "{x}");
+        }
+        assert_eq!(q64_to_f64(Q_NINF), f64::NEG_INFINITY);
+        assert_eq!(q64_to_f64(Q_NINF_CUT), f64::NEG_INFINITY);
+        assert!(q64_to_f64(Q_NINF_CUT + (1 << 32)).is_finite());
+
+        // Carry across the low word, both directions.
+        let half = f32_to_q(0.5);
+        assert_eq!(q64_to_f64(q_add_f32(half, 0.5)), 1.0);
+        assert_eq!(q_add_f32(half, 0.5), 1i64 << 32);
+        assert_eq!(q64_to_f64(q_add_f32(f32_to_q(0.75), 0.25)), 1.0);
+        assert_eq!(q64_to_f64(q_add_f32(f32_to_q(-0.5), -0.5)), -1.0);
+        // A fractional add just below -1 borrows into `hi` and lands on the
+        // 2^-32 grid.
+        let near_one = q64_to_f64(f32_to_q(-0.99999994));
+        let got = q64_to_f64(q_add_f32(f32_to_q(-0.99999994), -1e-9));
+        assert!((got - (near_one - 1e-9)).abs() <= step, "{got}");
+        assert!(got > -1.0 && got < -0.9999999, "{got}");
+
+        // A sentinel predecessor stays sentinel: no subtraction can resurrect
+        // an unreachable state, and a dead emission kills a live one.
+        assert_eq!(q_add_f32(Q_NINF, -0.44), Q_NINF);
+        assert_eq!(q_add_f32(Q_NINF, f32::NEG_INFINITY), Q_NINF);
+        assert_eq!(q_add_f32(f32_to_q(-1.0), f32::NEG_INFINITY), Q_NINF);
+
+        // Ordering matches the integer ordering of the pair.
+        assert!(q_ge(f32_to_q(1.0), f32_to_q(0.9999999)));
+        assert!(!q_ge(f32_to_q(0.9999999), f32_to_q(1.0)));
+        assert!(q_ge(Q_NINF, Q_NINF));
+        assert!(q_ge(f32_to_q(0.0), Q_NINF));
+        assert!(!q_ge(Q_NINF, f32_to_q(0.0)));
+        // A value one step below zero still compares below zero.
+        assert!(!q_ge(-1, 0));
+        assert!(q_ge(0, -1));
+    }
+
+    #[test]
+    fn q32_keeps_every_state_and_the_whole_choice_table_over_an_hour() {
+        // An hour at 50 Hz. The absolute alpha reaches −80,000, where one f32
+        // ulp is 1/128; Q31.32's step is 2.3e-10 there too, and the row *is*
+        // the absolute number, so no state's precision depends on how far
+        // behind the row max it has fallen.
         let t_len = 180_000usize;
         let tokens: Vec<usize> = (1..=8).collect();
         let blank = 0usize;
@@ -2314,76 +2301,70 @@ mod tests {
         let s = labels.len();
         let dead = skip_dead(&labels, blank);
         // Label 3 is unreachable for 60 frames: the states carrying it (and
-        // the blanks behind them) carry -inf through 60 transitions.
-        let logits = synthetic_logits(vocab, t_len, 3, 100..160);
+        // the blanks behind them) carry the sentinel through 60 transitions,
+        // and the pinned path has to route around the frames where that
+        // column would otherwise be the best one.
+        let logits = synthetic_logits_walk(vocab, t_len, 3, 100..160, 25);
 
         let (c64, alpha64) = reference_dp_f64(&logits, vocab, &labels, &dead, t_len, s);
-        let (cd, alphad, nan) = reference_dp_df64(&logits, vocab, &labels, &dead, t_len, s);
+        let (cq, row) = reference_dp_q32(&logits, vocab, &labels, &dead, t_len, s);
+        let recovered: Vec<f64> = row.iter().map(|&v| q64_to_f64(v)).collect();
 
-        assert!(!nan, "a df64 half became NaN");
-        for a in &alphad {
-            assert!(a[0].is_finite() || df_is_ninf(*a), "{a:?}");
-            assert!(a[1].is_finite(), "{a:?}");
-        }
-
-        // The magnitude the test is about: an hour of -0.44 per frame.
-        let total = alpha64[s - 1].max(alpha64[s - 2]);
+        // The magnitude this test is about: an hour of −0.44 a frame.
+        let total64 = alpha64[s - 1].max(alpha64[s - 2]);
         assert!(
-            (-85_000.0..-75_000.0).contains(&total),
-            "alpha {total} is not an hour of frames"
+            (-95_000.0..-70_000.0).contains(&total64),
+            "alpha {total64} is not an hour of frames"
         );
-        // and the unreachable window really was unreachable: the state that
-        // carries label 3 is -inf for those frames in both runs.
-        let recovered = alphad
-            .iter()
-            .map(|a| df64_to_f64(a[0], a[1]))
-            .collect::<Vec<_>>();
-        for (i, (f, d)) in alpha64.iter().zip(&recovered).enumerate() {
-            if f.is_infinite() {
-                assert!(d.is_infinite(), "state {i}: f64 -inf, df64 {d}");
-            } else {
-                assert!((f - d).abs() < 1e-6, "state {i}: {f} vs {d}");
-            }
-        }
 
-        // The point of the exercise: the path cannot move.
+        // Every state, including the ones that lagged the row max by
+        // thousands, is within 1e-4 of the f64 run. Every emission in this
+        // field is an f32 below 2^7, so it sits on the 2^-32 grid exactly and
+        // the accumulated sum stays on it too: `worst` comes out at zero, the
+        // bound the recurrence promises without spending any of it.
+        let mut worst = 0.0f64;
+        for (i, (got, want)) in recovered.iter().zip(&alpha64).enumerate() {
+            if want.is_infinite() {
+                assert!(got.is_infinite(), "state {i}: f64 -inf, q32 {got}");
+                continue;
+            }
+            let gap = (got - want).abs();
+            worst = worst.max(gap);
+            assert!(gap < 1e-4, "state {i}: {want} vs {got} (gap {gap:e})");
+        }
+        assert!(worst < 1e-9, "a state drifted by {worst:e} over {t_len} frames");
+
+        // ... and the recurrence resolves every arc exactly as `f64` does,
+        // so the choice table — not just the path the traceback walks — is
+        // identical frame for frame.
+        assert_eq!(cq, c64, "the Q31.32 choice table differs from the f64 one");
+
         let path64 = trace_back(&c64, &alpha64, s, t_len);
-        let path_df = trace_back(&cd, &recovered, s, t_len);
+        let path_q = trace_back(&cq, &recovered, s, t_len);
         assert_eq!(path64.len(), t_len);
         for t in 0..t_len {
-            assert_eq!(path64[t], path_df[t], "path diverged at frame {t}");
+            assert_eq!(path64[t], path_q[t], "path diverged at frame {t}");
         }
-        // none of the choice tables drifted either
-        assert_eq!(c64, cd, "a choice differs from the f64 rule");
-    }
 
-    #[test]
-    fn df64_shaders_parse_and_validate() {
-        // No device needed: this is the check a machine without Vulkan can
-        // still run, and the one that proves the `vec2<f32>` rows, the
-        // sentinel arithmetic and the workgroup declarations are well typed.
-        crate::shaders::naga_validate(INIT_DF64_WGSL, "viterbi-init-df64");
-        crate::shaders::naga_validate(STEP_DF64_WGSL, "viterbi-step-df64");
-        // The f64 kernels are untouched, so they must still validate too.
-        crate::shaders::naga_validate(INIT_WGSL, "viterbi-init-f64");
-        crate::shaders::naga_validate(STEP_WGSL, "viterbi-step-f64");
-        // 8 bytes per state on both sides of the boundary: no stride changes.
-        assert_eq!(std::mem::size_of::<[f32; 2]>(), std::mem::size_of::<f64>());
-        for src in [INIT_DF64_WGSL, STEP_DF64_WGSL] {
-            assert!(src.contains("array<vec2<f32>>"), "a df64 row is a pair");
-            // no double-width type anywhere: the DP runs on f32 pairs alone
-            assert!(
-                !src.contains("array<f64>"),
-                "df64 must not declare f64 rows"
+        // A row that ends *inside* the dead window: a state there is either
+        // the sentinel (its predecessors were already dead) or the logits'
+        // own `-inf`. Neither survives, and neither is resurrected.
+        let t_dead = 130usize;
+        let logits_dead = synthetic_logits_walk(vocab, t_dead, 3, 100..t_dead, 25);
+        let (_, row_dead) = reference_dp_q32(&logits_dead, vocab, &labels, &dead, t_dead, s);
+        let dead_states: Vec<usize> = (0..s).filter(|&st| labels[st] == 3).collect();
+        assert!(!dead_states.is_empty(), "the dead label owns no state");
+        for st in dead_states {
+            assert_eq!(
+                q64_to_f64(row_dead[st]),
+                f64::NEG_INFINITY,
+                "state {st} was resurrected at the end of a dead window"
             );
-            assert!(!src.contains("f64("), "df64 must not cast to f64");
-            assert!(!src.contains(": f64"), "df64 must not name f64");
         }
-        assert!(STEP_DF64_WGSL.contains("var<workgroup> choices: array<u32, 4096>;"));
     }
 
     // ------------------------------------------------------------------
-    // The one GPU test in this module. It takes the same lock `shaders::tests`
+    // The GPU tests in this module. Each takes the same lock `shaders::tests`
     // does: `cargo test` runs both in parallel threads and this machine's
     // driver does not survive two Vulkan devices in one process.
     // ------------------------------------------------------------------
@@ -2401,105 +2382,300 @@ mod tests {
         }
     }
 
+    /// Run one forward pass on the device and return its state path, its
+    /// absolute alpha and the raw Q31.32 bytes of the last row.
+    fn gpu_forward(
+        gpu: &Gpu,
+        tokens: &[usize],
+        blank: usize,
+        vocab: usize,
+        logits: &[f32],
+        t_len: usize,
+    ) -> (Vec<i32>, Vec<f64>, Vec<i64>) {
+        let logits_buf = gpu.storage("t-dp-logits", (logits.len() * 4) as u64);
+        gpu.upload(&logits_buf, bytemuck::cast_slice(logits));
+        let out_x = gpu.storage("t-dp-hidden", (t_len * 4) as u64);
+        let mut dp = GpuDp::new(gpu, tokens, usize::MAX, blank, t_len, 1)
+            .unwrap_or_else(|e| panic!("dp pipeline: {e:#}"));
+        dp.submit_window(gpu, &logits_buf, &out_x, vocab, 0, t_len)
+            .unwrap_or_else(|e| panic!("dp submit: {e:#}"));
+        dp.finish(gpu)
+            .unwrap_or_else(|e| panic!("dp finish: {e:#}"));
+        let alpha = dp
+            .read_alpha(gpu)
+            .unwrap_or_else(|e| panic!("dp readback: {e:#}"));
+        assert!(alpha.iter().all(|v| !v.is_nan()), "the DP produced a NaN");
+        let raw = gpu
+            .readback(&dp.alpha[dp.front], (dp.s as usize * 8) as u64)
+            .unwrap_or_else(|e| panic!("raw alpha readback: {e:#}"));
+        let raw = decode_q64_bytes(&raw);
+        let (states, total) = dp
+            .trace_states(&alpha)
+            .unwrap_or_else(|e| panic!("dp traceback: {e:#}"));
+        // The reported total is the last row's own entry, bit for bit.
+        assert_eq!(total, alpha[states[t_len - 1] as usize]);
+        (states, alpha, raw)
+    }
+
     #[test]
-    fn vulkan_df64_dp_matches_the_f64_kernel_and_the_cpu_dp() {
+    fn vulkan_q32_dp_matches_the_cpu_dp() {
         let _gpu_lock = crate::shaders::GPU_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let Some(gpu) = vulkan() else { return };
         eprintln!("[dp] {}", gpu.describe());
 
-        let tokens: Vec<usize> = (1..=6).collect();
+        let tokens: Vec<usize> = (1..=21).collect();
         let blank = 0usize;
-        let vocab = 8usize;
-        let t_len = 700usize;
+        let vocab = 23usize;
+        let t_len = 100usize;
+        let labels = expanded(&tokens, blank);
+        let s = labels.len();
+        assert_eq!(s, 43, "the standard trellis width");
+        let dead = skip_dead(&labels, blank);
+        // Label 3 is unreachable for 20 frames, so the kernels carry the
+        // sentinel through the recurrence rather than only at the edges.
+        let logits = synthetic_logits_walk(vocab, t_len, 3, 40..60, 5);
+
+        let (c64, alpha64) = reference_dp_f64(&logits, vocab, &labels, &dead, t_len, s);
+        let path_cpu = trace_back(&c64, &alpha64, s, t_len);
+        let want: Vec<i32> = path_cpu.iter().map(|&s| s as i32).collect();
+
+        // The device against the f64 reference: the whole point of the
+        // exercise is that these two agree on the path, not just on the score.
+        let (states, alpha, raw) = gpu_forward(&gpu, &tokens, blank, vocab, &logits, t_len);
+        let gap = worst_gap(&alpha, &alpha64);
+        assert_eq!(
+            states, want,
+            "the q31.32 path differs from the f64 DP (gap {gap:e})"
+        );
+        for (i, (a, b)) in alpha.iter().zip(&alpha64).enumerate() {
+            if b.is_infinite() {
+                assert!(a.is_infinite(), "state {i}: {a} vs {b}");
+            } else {
+                assert!((a - b).abs() < 1e-6, "state {i}: {a} vs {b}");
+            }
+        }
+        // ... and the device's own row is bit-for-bit the host mirror's.
+        let (_, mirror) = reference_dp_q32(&logits, vocab, &labels, &dead, t_len, s);
+        assert_eq!(raw, mirror, "the device row is not the host mirror's");
+
+        // The flat field: competing paths sit within 1e-3 of each other, three
+        // orders of magnitude above Q31.32's 2.3e-10 step, so the tie-break has
+        // real margins and the device must land on the f64 path too.
+        let flat = synthetic_logits(vocab, t_len, 3, 40..60, 0.05);
+        let (c64f, alpha64f) = reference_dp_f64(&flat, vocab, &labels, &dead, t_len, s);
+        let flat_want: Vec<i32> = trace_back(&c64f, &alpha64f, s, t_len)
+            .iter()
+            .map(|&s| s as i32)
+            .collect();
+        let (flat_states, flat_alpha, flat_raw) =
+            gpu_forward(&gpu, &tokens, blank, vocab, &flat, t_len);
+        let flat_gap = worst_gap(&flat_alpha, &alpha64f);
+        assert_eq!(
+            flat_states, flat_want,
+            "the flat-field path differs from the f64 DP (gap {flat_gap:e})"
+        );
+        for (i, (a, b)) in flat_alpha.iter().zip(&alpha64f).enumerate() {
+            if b.is_infinite() {
+                assert!(a.is_infinite(), "state {i}: {a} vs {b}");
+            } else {
+                assert!((a - b).abs() < 1e-6, "state {i}: {a} vs {b}");
+            }
+        }
+        let (_, flat_mirror) = reference_dp_q32(&flat, vocab, &labels, &dead, t_len, s);
+        assert_eq!(
+            flat_raw, flat_mirror,
+            "the device's flat-field row is not the host mirror's"
+        );
+    }
+
+    #[test]
+    fn vulkan_multi_workgroup_q32_matches_the_cpu_dp() {
+        let _gpu_lock = crate::shaders::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(gpu) = vulkan() else { return };
+        eprintln!("[dp] {}", gpu.describe());
+
+        // 4151 states is one past the 4096 a workgroup owns, so the choice
+        // packing and the row state span two workgroups.
+        let tokens: Vec<usize> = (1..=2075).collect();
+        let blank = 0usize;
+        let vocab = 2076usize;
+        let t_len = 40usize;
+        let labels = expanded(&tokens, blank);
+        let s = labels.len();
+        assert_eq!(s, 4151, "one state past a single workgroup");
+        assert_eq!(num_workgroups(s), 2, "the row must span two groups");
+        let dead = skip_dead(&labels, blank);
+        let logits = synthetic_logits_walk(vocab, t_len, 7, 10..20, 4);
+
+        let (c64, alpha64) = reference_dp_f64(&logits, vocab, &labels, &dead, t_len, s);
+        let path_cpu = trace_back(&c64, &alpha64, s, t_len);
+        let (states, alpha, raw) = gpu_forward(&gpu, &tokens, blank, vocab, &logits, t_len);
+        let want: Vec<i32> = path_cpu.iter().map(|&s| s as i32).collect();
+        let gap = worst_gap(&alpha, &alpha64);
+        assert_eq!(
+            states, want,
+            "the two-workgroup path differs from the f64 DP (gap {gap:e})"
+        );
+        for (i, (a, b)) in alpha.iter().zip(&alpha64).enumerate() {
+            if b.is_infinite() {
+                assert!(a.is_infinite(), "state {i}: {a} vs {b}");
+            } else {
+                assert!((a - b).abs() < 1e-6, "state {i}: {a} vs {b}");
+            }
+        }
+        let (_, mirror) = reference_dp_q32(&logits, vocab, &labels, &dead, t_len, s);
+        assert_eq!(raw, mirror, "the device row is not the host mirror's");
+    }
+
+    #[test]
+    fn vulkan_linear_checkpoint_replay_reproduces_the_forward_pass() {
+        let _gpu_lock = crate::shaders::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(gpu) = vulkan() else { return };
+        eprintln!("[dp] {}", gpu.describe());
+
+        let tokens: Vec<usize> = (1..=21).collect();
+        let blank = 0usize;
+        let vocab = 23usize;
+        let t_len = 60usize;
+        let seg = 17usize;
         let labels = expanded(&tokens, blank);
         let s = labels.len();
         let dead = skip_dead(&labels, blank);
-        // Label 3 is unreachable for 60 frames, so the kernels carry the
-        // sentinel through `df_add_f32` and the -inf path through the f64 one.
-        let logits = synthetic_logits(vocab, t_len, 3, 100..160);
+        let logits = synthetic_logits_walk(vocab, t_len, 3, 20..30, 4);
 
-        let (c64, alpha64_cpu) = reference_dp_f64(&logits, vocab, &labels, &dead, t_len, s);
-        let path_cpu = trace_back(&c64, &alpha64_cpu, s, t_len);
+        let (c64, alpha64) = reference_dp_f64(&logits, vocab, &labels, &dead, t_len, s);
+        let path_cpu = trace_back(&c64, &alpha64, s, t_len);
+        let want: Vec<i32> = path_cpu.iter().map(|&s| s as i32).collect();
+        let (_, mirror_rows) = reference_dp_q32_rows(&logits, vocab, &labels, &dead, t_len, s);
 
-        let logits_buf = gpu.storage("t-dp-logits", (t_len * vocab * 4) as u64);
+        let logits_buf = gpu.storage("t-dp-logits", (logits.len() * 4) as u64);
         gpu.upload(&logits_buf, bytemuck::cast_slice(&logits));
         let out_x = gpu.storage("t-dp-hidden", (t_len * 4) as u64);
+        // Forced linear on a file the budget would keep whole: this is the
+        // plan a long file takes, and the one whose replay has to be exact.
+        let mut dp = GpuDp::new_linear_for_test(&gpu, &tokens, usize::MAX, blank, t_len, 1, seg)
+            .unwrap_or_else(|e| panic!("linear dp pipeline: {e:#}"));
+        assert!(dp.is_linear(), "the test forced the linear plan");
+        assert_eq!(dp.seg(), seg);
+        dp.submit_window(&gpu, &logits_buf, &out_x, vocab, 0, t_len)
+            .unwrap_or_else(|e| panic!("linear dp submit: {e:#}"));
+        dp.finish(&gpu)
+            .unwrap_or_else(|e| panic!("linear dp finish: {e:#}"));
+        let alpha = dp
+            .read_alpha(&gpu)
+            .unwrap_or_else(|e| panic!("linear dp readback: {e:#}"));
+        let ncheck = (t_len - 1) / seg + 1;
 
-        let run = |precision: DpPrecision| -> (Vec<i32>, Vec<f64>) {
-            let mut dp =
-                GpuDp::new_with_precision(&gpu, &tokens, usize::MAX, blank, t_len, 1, precision)
-                    .unwrap_or_else(|e| panic!("{precision:?} pipeline: {e:#}"));
-            dp.submit_window(&gpu, &logits_buf, &out_x, vocab, 0, t_len)
-                .unwrap_or_else(|e| panic!("{precision:?} submit: {e:#}"));
-            dp.finish(&gpu)
-                .unwrap_or_else(|e| panic!("{precision:?} finish: {e:#}"));
-            let alpha = dp
-                .read_alpha(&gpu)
-                .unwrap_or_else(|e| panic!("{precision:?} readback: {e:#}"));
-            assert!(
-                alpha.iter().all(|v| !v.is_nan()),
-                "{precision:?} produced a NaN"
+        // The forward pass itself is the same DP: the plan changes what is
+        // stored, never what is computed.
+        for (i, (a, b)) in alpha.iter().zip(&alpha64).enumerate() {
+            if b.is_infinite() {
+                assert!(a.is_infinite(), "state {i}: {a} vs {b}");
+            } else {
+                assert!((a - b).abs() < 1e-6, "state {i}: {a} vs {b}");
+            }
+        }
+
+        // Every checkpoint row is the forward's own row at that frame, bit
+        // for bit: there is no shift to fold in, so the row is the value.
+        assert_eq!(dp.ckpt_host.len(), ncheck * s, "one row per segment start");
+        for k in 0..ncheck {
+            let got = &dp.ckpt_host[k * s..(k + 1) * s];
+            assert_eq!(
+                got,
+                &mirror_rows[k * seg][..],
+                "checkpoint {k} is not the frame {} row",
+                k * seg
             );
-            let (states, _total) = dp
-                .trace_states(&alpha)
-                .unwrap_or_else(|e| panic!("{precision:?} traceback: {e:#}"));
-            (states, alpha)
-        };
-
-        // The rule set on the host, for comparison with the device's copy of
-        // it: if the two ever disagree, the shader and this module have
-        // drifted apart.
-        let (cd, ad, _) = reference_dp_df64(&logits, vocab, &labels, &dead, t_len, s);
-        let host_total: Vec<f64> = ad.iter().map(|a| df64_to_f64(a[0], a[1])).collect();
-        for (i, (a, b)) in host_total.iter().zip(&alpha64_cpu).enumerate() {
-            if b.is_infinite() {
-                assert!(a.is_infinite(), "host df64 state {i}: {a} vs {b}");
-            } else {
-                assert!((a - b).abs() < 1e-6, "host df64 state {i}: {a} vs {b}");
-            }
-        }
-        assert_eq!(
-            trace_back(&cd, &host_total, s, t_len)
-                .iter()
-                .map(|&s| s as i32)
-                .collect::<Vec<_>>(),
-            path_cpu.iter().map(|&s| s as i32).collect::<Vec<_>>(),
-            "the host mirror of the df64 rules disagrees with the f64 DP"
-        );
-
-        // df64 works on every adapter, including this one.
-        let (states_df, alpha_df) = run(DpPrecision::Df64);
-        let want: Vec<i32> = path_cpu.iter().map(|&s| s as i32).collect();
-        let worst = alpha_df
-            .iter()
-            .zip(&alpha64_cpu)
-            .filter(|(_, b)| b.is_finite())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f64, f64::max);
-        assert_eq!(
-            states_df, want,
-            "df64 path differs from the CPU f64 DP (worst alpha gap {worst:e})"
-        );
-        for (i, (a, b)) in alpha_df.iter().zip(&alpha64_cpu).enumerate() {
-            if b.is_infinite() {
-                assert!(a.is_infinite(), "df64 state {i}: {a} vs {b}");
-            } else {
-                assert!((a - b).abs() < 1e-6, "df64 state {i}: {a} vs {b}");
-            }
         }
 
-        // And f64, where the adapter has it, agrees with both.
-        if gpu.has_f64() {
-            let (states_64, alpha_64) = run(DpPrecision::F64);
-            assert_eq!(states_64, want, "f64 path differs from the CPU f64 DP");
-            for (i, (a, b)) in alpha_64.iter().zip(&alpha_df).enumerate() {
-                assert!((a - b).abs() < 1e-6, "state {i}: f64 {a} vs df64 {b}");
-            }
+        // Replay every segment the way `gpu_dp_traceback` does: seed the end
+        // state, then for each segment load its checkpoint, re-run the steps
+        // from it, and walk the fresh choices back.
+        let s_end = if s >= 2 && alpha[s - 2] > alpha[s - 1] {
+            s - 2
         } else {
-            eprintln!("[dp] no SHADER_F64 on this adapter; df64 matched the CPU DP alone");
+            s - 1
+        };
+        let seed = s_end as u32;
+        gpu.queue.write_buffer(
+            dp.states_buf(),
+            ((t_len - 1) * 4) as u64,
+            bytemuck::bytes_of(&seed),
+        );
+        let mut b = ((t_len - 1) / seg) * seg;
+        loop {
+            let k = b / seg;
+            let lo = b + 1;
+            let hi = (b + seg).min(t_len - 1);
+            if lo <= hi {
+                let start = dp
+                    .checkpoint(k)
+                    .unwrap_or_else(|e| panic!("checkpoint {k}: {e:#}"))
+                    .to_vec();
+                dp.load_alpha(&gpu, &start)
+                    .unwrap_or_else(|e| panic!("load alpha {k}: {e:#}"));
+                let n = hi - lo + 1;
+                // The replay chunk's logits live at rows 0..n, which is where
+                // the lm-head replay writes them.
+                gpu.upload(
+                    &logits_buf,
+                    bytemuck::cast_slice(&logits[lo * vocab..(hi + 1) * vocab]),
+                );
+                let mut enc = gpu
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("t-dp-replay"),
+                    });
+                let binds = dp
+                    .record_steps(&gpu, &mut enc, &logits_buf, vocab, n, 0)
+                    .unwrap_or_else(|e| panic!("replay {lo}..={hi}: {e:#}"));
+                gpu.queue.submit([enc.finish()]);
+                drop(binds);
+                // The invariant the whole plan rests on: replaying the segment
+                // from checkpoint k reproduces checkpoint k+1 exactly, because
+                // the row is absolute and the recurrence is integer.
+                if (k + 1) * seg <= t_len - 1 {
+                    let raw = gpu
+                        .readback(&dp.alpha[dp.front], (s * 8) as u64)
+                        .unwrap_or_else(|e| panic!("replay readback {k}: {e:#}"));
+                    let replay = decode_q64_bytes(&raw);
+                    let next = dp
+                        .checkpoint(k + 1)
+                        .unwrap_or_else(|e| panic!("checkpoint {}: {e:#}", k + 1))
+                        .to_vec();
+                    assert_eq!(
+                        replay, next,
+                        "segment {k}: the replay is not the forward row"
+                    );
+                }
+                dp.trace_segment(&gpu, lo, hi)
+                    .unwrap_or_else(|e| panic!("trace {lo}..={hi}: {e:#}"));
+            }
+            if b == 0 {
+                break;
+            }
+            b -= seg;
         }
+        let bytes = gpu
+            .readback(dp.states_buf(), (t_len * 4) as u64)
+            .unwrap_or_else(|e| panic!("state readback: {e:#}"));
+        let states: Vec<i32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect();
+        assert_eq!(
+            states, want,
+            "the replayed path differs from the CPU f64 DP"
+        );
     }
 
     #[test]
@@ -2553,8 +2729,9 @@ mod tests {
         let (s, n) = (43usize, 3000usize);
         assert!(check_dp_buffer_limits(cap, s, n, 16 << 20, 64 << 20, 8 << 20).is_ok());
         // The two the caller does not size itself are covered too: 8 bytes a
-        // state and 4 bytes a frame.
+        // state for the ping-pong rows, 4 for the metadata, 4 a frame.
         assert!(check_dp_buffer_limits(cap, (cap / 8 + 1) as usize, n, 16, 16, 16).is_err());
+        assert!(check_dp_buffer_limits(cap, (cap / 4 + 1) as usize, n, 16, 16, 16).is_err());
         assert!(check_dp_buffer_limits(cap, s, (cap / 4 + 1) as usize, 16, 16, 16).is_err());
 
         // Each named buffer is reported with what it needs, the adapter limit
@@ -2572,5 +2749,80 @@ mod tests {
             assert!(msg.contains("CTC_GPU_DP=0"), "{msg}");
             assert!(msg.contains("--window"), "{msg}");
         }
+
+        // The derived sizes are exactly 8 bytes a state (the Q31.32 row) and
+        // 4 a state for the metadata and 4 a frame for state and score.
+        let alpha_b = s as u64 * 8;
+        assert_eq!(alpha_b, s as u64 * std::mem::size_of::<i64>() as u64);
+        assert!(check_dp_buffer_limits(alpha_b, s, 0, 0, 0, 0).is_ok());
+        assert!(check_dp_buffer_limits(alpha_b - 1, s, 0, 0, 0, 0).is_err());
+        let states_b = n as u64 * 4;
+        assert!(check_dp_buffer_limits(states_b, 1, n, 0, 0, 0).is_ok());
+        assert!(check_dp_buffer_limits(states_b - 1, 1, n, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn q64_bytes_round_trip_independently_of_the_host_layout() {
+        let vals = [
+            Q_NINF,
+            Q_NINF_CUT,
+            Q_NINF_CUT + 1,
+            -1,
+            0,
+            1,
+            1i64 << 32,
+            -4_294_967_296,
+            ((i32::MIN + 1) as i64) << 32,
+        ];
+        let bytes = encode_q64_bytes(&vals);
+        assert_eq!(bytes.len(), vals.len() * 8);
+        assert_eq!(decode_q64_bytes(&bytes), vals);
+        // The sentinel's byte image is the zero low word and a negative high
+        // word, which is what the kernel's `vec2<u32>(0u, bitcast(i32::MIN))`
+        // writes on a little-endian device.
+        assert_eq!(&bytes[..8], &[0, 0, 0, 0, 0, 0, 0, 0x80]);
+        // -1.0 is `[0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]`.
+        assert_eq!(&bytes[56..64], &[0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn state_meta_packs_the_column_the_skip_flag_and_the_star() {
+        // The three buffers this replaced, in one word: a 30-bit column, the
+        // skip-dead bit, the star bit.
+        let tokens = [4usize, 9, 4];
+        let labels = expanded(&tokens, 0);
+        let mut meta = vec![0u32; labels.len()];
+        for (st, &lab) in labels.iter().enumerate() {
+            meta[st] = u32::try_from(lab).unwrap();
+            if st >= 2 && (lab == 0 || lab == labels[st - 2]) {
+                meta[st] |= META_SKIP_DEAD;
+            }
+        }
+        meta[3] |= META_STAR;
+        // A star target keeps the blank's column, so the mask still resolves
+        // a real vocabulary index for the score replay.
+        meta[5] |= META_STAR;
+        for st in 0..meta.len() {
+            let m = meta[st];
+            assert_eq!(
+                m & META_COL,
+                u32::try_from(labels[st]).unwrap(),
+                "state {st}"
+            );
+            assert_eq!(
+                m & META_SKIP_DEAD != 0,
+                st >= 2 && (labels[st] == 0 || labels[st] == labels[st - 2]),
+                "state {st}"
+            );
+        }
+        assert_ne!(meta[3] & META_STAR, 0);
+        assert_eq!(meta[4] & META_STAR, 0);
+        // The bits do not collide: a full 30-bit column leaves both flags.
+        assert_eq!(META_COL, 0x3fff_ffff);
+        assert_eq!(META_SKIP_DEAD, 0x4000_0000);
+        assert_eq!(META_STAR, 0x8000_0000);
+        assert_eq!(META_COL & META_SKIP_DEAD, 0);
+        assert_eq!(META_COL & META_STAR, 0);
+        assert_eq!(META_SKIP_DEAD & META_STAR, 0);
     }
 }

@@ -1213,9 +1213,10 @@ impl GpuModel {
         self.forward_begin(input, None, false, None, &[], prev, true)
     }
 
-    /// Compile the f64 Viterbi pipelines and allocate the per-file buffers.
-    /// Fails if the shader does not validate; the caller keeps the CPU DP only
-    /// when the device never advertised [`wgpu::Features::SHADER_F64`].
+    /// Compile the Q31.32 Viterbi pipelines and allocate the per-file
+    /// buffers. Fails if a shader does not validate. No adapter feature is
+    /// needed: the DP is signed 64-bit fixed point on `u32`/`i32` arithmetic,
+    /// so it runs identically on every device the encoder itself can use.
     pub(crate) fn new_dp(
         &self,
         token_ids: &[usize],

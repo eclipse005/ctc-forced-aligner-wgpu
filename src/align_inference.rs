@@ -1364,10 +1364,8 @@ impl Aligner {
     /// Logits streaming on any GPU. `CTC_GPU_DP=0` keeps the CPU row team.
     /// Columns and hidden stay on the CPU path.
     ///
-    /// An adapter without `SHADER_F64` runs the same DP on `df64` pairs (see
-    /// `viterbi_gpu::DpPrecision`), which is why this no longer asks the device
-    /// whether it can do f64: only `CTC_GPU_DP_MODE=f64` can refuse, and it
-    /// fails at DP construction with the reason.
+    /// Every adapter runs the same Q31.32 signed 64-bit fixed-point DP (see
+    /// `viterbi_gpu`), so no `SHADER_F64` probe or precision override is needed.
     fn use_gpu_viterbi(&self, kind: &BlockKind) -> bool {
         if !matches!(kind, BlockKind::Logits { .. }) {
             return false;
