@@ -205,6 +205,23 @@ struct Cfg4 {
     d: u32,
 }
 
+/// [`shaders::transpose`]'s uniform. Separate from [`Cfg4`] because the output
+/// pitch is independent of its width: `kt` is `(hidden, t_pad)`, so the rows
+/// the attention GEMM reads with `vec4` loads start every `t_pad` elements
+/// while only `t` of them hold data.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+struct TransposeCfg {
+    rows: u32,
+    cols: u32,
+    a_stride: u32,
+    a_off: u32,
+    o_stride: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}
+
 /// One recorded dispatch. Uniform bytes live in a side buffer; the bind group
 /// already points at its slot, so replay is just set/dispatch.
 /// Cloned across chunks of the same length: the buffers and the grid don't change.
@@ -622,6 +639,9 @@ impl GpuModel {
         let variant = shaders::pick_gemm_variant(max_storage);
         let (gemm_mt, gemm_nt) = shaders::gemm_tile(variant);
         let (pos_src, pos_mt) = shaders::pos_conv(max_storage);
+        // The row kernels fold a row with the device's subgroup shape when it
+        // has one: two barriers per reduction instead of eighteen tree steps.
+        let sg = gpu.subgroup_mode();
         let pipes = Pipe {
             gemm: mk_gemm(&shaders::gemm_variant(variant, max_storage), "gemm")?,
             conv_gemm: mk_gemm(
@@ -630,11 +650,11 @@ impl GpuModel {
             )?,
             conv0: mk(&shaders::conv0(), "conv0")?,
             pos_conv: mk_gemm(&pos_src, "pos_conv")?,
-            ln: mk(&shaders::layernorm(), "ln")?,
-            ln_sd: mk(&shaders::layernorm_sd(), "ln_sd")?,
+            ln: mk(&shaders::layernorm(sg), "ln")?,
+            ln_sd: mk(&shaders::layernorm_sd(sg), "ln_sd")?,
             add: mk(&shaders::add(), "add")?,
-            softmax: mk(&shaders::softmax(), "softmax")?,
-            log_softmax: mk(&shaders::log_softmax(), "log_softmax")?,
+            softmax: mk(&shaders::softmax(sg), "softmax")?,
+            log_softmax: mk(&shaders::log_softmax(sg), "log_softmax")?,
             transpose: mk(&shaders::transpose(), "transpose")?,
             gather: mk(&shaders::gather(), "gather")?,
         };
@@ -1293,11 +1313,18 @@ impl GpuModel {
             t = (t - self.cfg.conv_kernel[i]) / self.cfg.conv_stride[i] + 1;
         }
         let t0 = (input.len() - self.cfg.conv_kernel[0]) / self.cfg.conv_stride[0] + 1;
+        // Both operands of the attention GEMMs are read as `vec4`s only when
+        // every row starts on a 16-byte boundary, and the scores / `K^T`
+        // rows are `t` elements wide. Padding the row pitch to a multiple of
+        // 4 buys the 128-bit loads for every window instead of the windows
+        // whose frame count happens to be a multiple of 4.
+        let t_pad = t.next_multiple_of(4);
+        let t_pad_u = t_pad as u32;
         let f32s = |n: usize| (n * 4) as u64;
 
         let scores_n = heads
             .checked_mul(t)
-            .and_then(|n| n.checked_mul(t))
+            .and_then(|n| n.checked_mul(t_pad))
             .context("frame count overflow")?;
         if t > 12000 || scores_n > 200_000_000 {
             anyhow::bail!(
@@ -1355,7 +1382,7 @@ impl GpuModel {
                     t2: st("t2", t * hidden.max(self.cfg.intermediate_size)),
                     t3: st("t3", t * hidden),
                     qkv: st("qkv", t * 3 * hidden),
-                    kt: st("kt", hidden * t),
+                    kt: st("kt", hidden * t_pad),
                     scores: st("scores", scores_n),
                     attn_o: st("attn_o", t * hidden),
                     // the hidden readback never runs the head, so its logits
@@ -1741,12 +1768,16 @@ impl GpuModel {
                 // K^T: rows hidden, cols t, from qkv rows offset T*1024, stride 3072
                 dispatch!(
                     P_TRANSPOSE,
-                    // K block starts `hidden` elements into each (T, 3*hidden) row
-                    Cfg4 {
-                        a: t as u32,
-                        b: hidden as u32,
-                        c: (3 * hidden) as u32,
-                        d: hidden as u32
+                    // K block starts `hidden` elements into each (T, 3*hidden) row;
+                    // the output rows are `t_pad` wide, so the scores GEMM below
+                    // can read them with vec4 loads
+                    TransposeCfg {
+                        rows: t as u32,
+                        cols: hidden as u32,
+                        a_stride: (3 * hidden) as u32,
+                        a_off: hidden as u32,
+                        o_stride: t_pad_u,
+                        ..Default::default()
                     },
                     (t as u32).div_ceil(16),
                     (hidden as u32).div_ceil(16),
@@ -1754,8 +1785,8 @@ impl GpuModel {
                     bind!(1, &act.kt),
                 );
                 // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z.
-                // A is a vec4-able slice of qkv; B (kt) strides by t, which is odd
-                // for most windows, so b_vec computes to 0 and the scalar path runs
+                // Both operands are vec4-able now: kt rows start every t_pad
+                // elements, so b_vec is 1 for every window
                 dispatch_z!(
                     P_GEMM,
                     GemmDims {
@@ -1763,18 +1794,18 @@ impl GpuModel {
                         n: t_rows,
                         k: head_dim as u32,
                         a_stride: 3 * cols,
-                        b_stride: t as u32,
-                        c_stride: t_rows,
+                        b_stride: t_pad_u,
+                        c_stride: t_pad_u,
                         a_off: 0,
                         a_z: head_dim as u32,
                         b_off: 0,
-                        b_z: head_dim as u32 * t as u32,
+                        b_z: head_dim as u32 * t_pad_u,
                         c_off: 0,
-                        c_z: t_rows * t_rows,
+                        c_z: t_rows * t_pad_u,
                         epilogue: 0,
                         scale: 0.125, // head_dim^-0.5: the attention scaling
                         a_vec: vec4_ok(0, 3 * cols, head_dim as u32),
-                        b_vec: vec4_ok(0, t as u32, head_dim as u32 * t as u32),
+                        b_vec: vec4_ok(0, t_pad_u, head_dim as u32 * t_pad_u),
                         _p0: 0,
                     },
                     t_rows.div_ceil(gemm_mt),
@@ -1788,13 +1819,13 @@ impl GpuModel {
                     bind!(6, &act.qkv),
                     bind!(7, &act.kt),
                 );
-                // softmax over each (head, query) row
+                // softmax over each (head, query) row; the row pitch is t_pad
                 dispatch!(
                     P_SOFTMAX,
                     Cfg4 {
                         a: (heads as u32 * t_rows),
                         b: t_rows,
-                        c: 0,
+                        c: t_pad_u,
                         d: 0
                     },
                     row_grid(heads as u32 * t_rows).0,
@@ -1802,26 +1833,26 @@ impl GpuModel {
                     bind!(0, &act.scores),
                 );
                 // per-head weighted V, z-batched: attn_h = scores_h @ v_h.
-                // B is a vec4-able slice of qkv; A (scores) strides by t, so
-                // a_vec computes to 0 and the scalar path runs
+                // B is a vec4-able slice of qkv and A (scores) now has an
+                // aligned row pitch, so a_vec is 1 for every window too
                 dispatch_z!(
                     P_GEMM,
                     GemmDims {
                         m: t_rows,
                         n: head_dim as u32,
                         k: t_rows,
-                        a_stride: t_rows,
+                        a_stride: t_pad_u,
                         b_stride: 3 * cols,
                         c_stride: cols,
                         a_off: 0,
-                        a_z: t_rows * t_rows,
+                        a_z: t_rows * t_pad_u,
                         b_off: (2 * hidden) as u32,
                         b_z: head_dim as u32,
                         c_off: 0,
                         c_z: head_dim as u32,
                         epilogue: 0,
                         scale: 1.0,
-                        a_vec: vec4_ok(0, t_rows, t_rows * t_rows),
+                        a_vec: vec4_ok(0, t_pad_u, t_rows * t_pad_u),
                         b_vec: vec4_ok((2 * hidden) as u32, 3 * cols, head_dim as u32),
                         _p0: 0,
                     },

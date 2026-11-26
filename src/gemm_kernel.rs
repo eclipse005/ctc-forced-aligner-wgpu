@@ -433,10 +433,47 @@ fn emit_loads(s: &mut String, t: &Tile, kind: Kind, sa: &str, sb: &str) {
             s.push_str("        }\n");
         }
         Kind::Conv => {
-            // im2col crosses a tap when c_in is not a multiple of 4, so the
-            // guarded gather is used for every K tile. Conv is a few layers
-            // once per chunk; the encoder GEMMs dominate.
+            // Tile-level im2col: when a K tile stays inside one tap and every
+            // row it covers is in range, the gather is the same vec4 address
+            // arithmetic for every row, so the per-lane divisions and the
+            // tap memo can be hoisted out of the loop. c_in is 512 across the
+            // conv stack, so every tile but the partial edges takes this
+            // path; the guarded gather below still covers the rest.
+            s.push_str("        {\n");
+            s.push_str("            let tap0 = k0 / d.c_in;\n");
+            let _ = writeln!(
+                s,
+                "            let single = (k0 + {}u) / d.c_in == tap0;",
+                t.ks - 1
+            );
+            s.push_str("            let ci0 = k0 % d.c_in;\n");
+            let _ = writeln!(
+                s,
+                "            let last_src = (m0 + {}u) * d.stride + tap0;",
+                t.mt - 1
+            );
+            s.push_str(
+                "            if (m_full && k_full && single && d.a_vec == 1u && d.c_in % 4u == 0u && ci0 % 4u == 0u && last_src < d.t_in) {\n",
+            );
+            s.push_str("                let c_in4 = d.c_in / 4u;\n");
+            s.push_str("                let ci0_4 = ci0 / 4u;\n");
+            let _ = writeln!(
+                s,
+                "                for (var i = tid; i < {a_vecs}u; i = i + 256u) {{"
+            );
+            let _ = writeln!(s, "                    let rr = i / {kv}u;");
+            let _ = writeln!(s, "                    let kvi = i % {kv}u;");
+            s.push_str("                    let src = (m0 + rr) * d.stride + tap0;\n");
+            let _ = writeln!(
+                s,
+                "                    {sa}[(rr * {}u) + kvi] = x4[src * c_in4 + ci0_4 + kvi];",
+                t.sa_stride
+            );
+            s.push_str("                }\n");
+            s.push_str("            } else {\n");
             emit_im2col(s, t, a_vecs, kv, sa);
+            s.push_str("            }\n");
+            s.push_str("        }\n");
             s.push_str("        if (n_full && k_full) {\n");
             emit_b_fast(s, t, b_vecs, "gk * d.n + gn", "wt", sb, Some("wt4"));
             s.push_str("        } else {\n");
