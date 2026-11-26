@@ -519,6 +519,18 @@ impl Gpu {
         self.features.contains(wgpu::Features::SUBGROUP)
     }
 
+    /// The largest storage buffer this device can both allocate and bind.
+    ///
+    /// WebGPU lets `max_buffer_size` and `max_storage_buffer_binding_size`
+    /// differ: a buffer is created against the first and bound against the
+    /// second, so anything this crate allocates and dispatches on has to fit
+    /// the smaller of the two. Every size check reads this one number.
+    pub fn effective_max_binding(&self) -> u64 {
+        self.limits
+            .max_storage_buffer_binding_size
+            .min(self.limits.max_buffer_size)
+    }
+
     /// The subgroup shape the reduction kernels may assume. The range comes
     /// from the adapter info: wgpu 30 exposes `subgroup_min_size` /
     /// `subgroup_max_size` there, not on [`wgpu::Limits`].
@@ -538,13 +550,11 @@ impl Gpu {
 
     /// Whether a kernel may carry `enable f16;` and `f16` shared memory.
     ///
-    /// `CTC_F16_KERNEL=0|false|off` forces it off; `1|true|on|auto`, unset or
-    /// empty follow the device. It never returns `true` on a device without
-    /// [`wgpu::Features::SHADER_F16`], because the shader would not compile.
-    ///
-    /// Unused until the f16 GEMM path lands; the probe it answers is part of
-    /// the device state every caller already reports.
-    #[allow(dead_code)]
+    /// `CTC_F16_KERNEL=1|true|on` opts in; `auto`, unset or empty leave it
+    /// off, because the weights are native `f32` and the `f16` tiles have not
+    /// been measured 0-diff on real hardware. It never returns `true` on a
+    /// device without [`wgpu::Features::SHADER_F16`], because the shader would
+    /// not compile.
     pub fn use_f16_kernel(&self) -> bool {
         resolve_f16_kernel(
             self.has_f16(),
@@ -856,12 +866,26 @@ fn env_flag_off(v: Option<&str>) -> bool {
 /// Whether the f16 kernels may run, from the device and the `CTC_F16_KERNEL`
 /// value (`None` when unset).
 ///
-/// `has_f16` is a hard gate: no environment value can make an `enable f16;`
-/// module compile on a device that never advertised
-/// [`wgpu::Features::SHADER_F16`]. `CTC_F16_KERNEL=0|false|off` opts out on a
-/// device that has it.
+/// The checkpoint is native `f32` and the `f16` shared-tile GEMM has not been
+/// measured 0-diff against it on real `f16` hardware, so the default is
+/// precision first: `auto`, unset, empty and anything unrecognised answer
+/// `false`. Only `1|true|on` opts in.
+///
+/// `has_f16` is a hard gate on that opt-in: no environment value can make an
+/// `enable f16;` module compile on a device that never advertised
+/// [`wgpu::Features::SHADER_F16`].
 pub fn resolve_f16_kernel(has_f16: bool, env_val: Option<&str>) -> bool {
-    has_f16 && !env_flag_off(env_val)
+    if !has_f16 {
+        return false;
+    }
+    matches!(
+        env_val
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on"
+    )
 }
 
 /// Write `data` to `path` unless it is empty or byte-identical to `last`;
@@ -1192,18 +1216,23 @@ mod tests {
 
     #[test]
     fn f16_kernel_follows_the_device_and_the_env() {
-        assert!(!resolve_f16_kernel(false, None));
-        for v in ["0", "false", "off", "FALSE", "Off", " 0 "] {
-            assert!(!resolve_f16_kernel(true, Some(v)), "{v}");
+        // Precision first: `auto`, unset, empty and anything unknown stay on
+        // the native f32 path, because the f16 tiles are unverified against
+        // the f32 checkpoint.
+        for v in [None, Some(""), Some(" "), Some("auto"), Some("Auto")] {
+            assert!(!resolve_f16_kernel(true, v), "{v:?}");
         }
-        for v in ["1", "true", "on", "auto", "", "TRUE", "Auto"] {
+        for v in ["1", "true", "on", "TRUE", " On ", " True "] {
             assert!(resolve_f16_kernel(true, Some(v)), "{v}");
         }
-        assert!(resolve_f16_kernel(true, None));
+        for v in ["0", "false", "off", "FALSE", "Off", " 0 ", "2", "yes"] {
+            assert!(!resolve_f16_kernel(true, Some(v)), "{v}");
+        }
+        assert!(!resolve_f16_kernel(false, None));
         // no environment value can compile an f16 module on a device that
         // never advertised the feature
-        for v in ["1", "true", "on", "auto"] {
-            assert!(!resolve_f16_kernel(false, Some(v)), "{v}");
+        for v in [None, Some("1"), Some("true"), Some("on"), Some("auto")] {
+            assert!(!resolve_f16_kernel(false, v), "{v:?}");
         }
     }
 

@@ -6,6 +6,7 @@
 //! projection, depthwise positional conv, 24 pre-LN encoder layers with the
 //! attention scores materialised as 16 per-head GEMMs, LM head, log_softmax.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::Wav2Vec2Config;
 use crate::gpu::{BulkUpload, Gpu};
 use crate::shaders;
-use crate::weights::get_f32;
+use crate::weights::{get_f32, get_f32_bytes, RawTensor};
 use rayon::prelude::*;
 
 const WG: u32 = 256;
@@ -90,24 +91,28 @@ fn transpose_pos(w: &[f32], out_c: usize, in_pg: usize, taps: usize) -> Vec<f32>
 /// samples of 16 kHz audio per output frame.
 const FRAMES_PER_SEC: u64 = 50;
 
-/// The largest whole-second window whose `scores` and `logits` both fit the
-/// adapter's binding limit.
+/// The largest whole-second window whose `scores`, `logits` and gathered
+/// block all fit the adapter's binding limit.
 ///
 /// `scores` is `heads · t²` f32 and so falls with the square of the window,
-/// `logits` is `t · vocab` f32 and falls linearly; each gives its own ceiling
-/// and the smaller wins. Kept at 1 so the advice is always actionable.
+/// `logits` is `t · vocab` f32 and the gathered block `t · S` f32; both fall
+/// linearly, so the larger of the two is the linear ceiling. Each gives its
+/// own ceiling and the smallest wins. Kept at 1 so the advice is always
+/// actionable.
 fn recommended_window_secs(
     t: usize,
     scores_bytes: u64,
     logits_bytes: u64,
+    gather_bytes: u64,
     max_binding: u64,
 ) -> u64 {
     let t = t.max(1) as f64;
     let max = max_binding as f64;
-    let linear = if logits_bytes == 0 {
+    let linear_bytes = logits_bytes.max(gather_bytes);
+    let linear = if linear_bytes == 0 {
         t
     } else {
-        t * (max / logits_bytes as f64).min(1.0)
+        t * (max / linear_bytes as f64).min(1.0)
     };
     let quadratic = if scores_bytes == 0 {
         t
@@ -118,24 +123,30 @@ fn recommended_window_secs(
     ((frames / FRAMES_PER_SEC as f64) as u64).max(1)
 }
 
-/// Refuse a window whose attention scores or logits cannot be bound before a
-/// single buffer is allocated.
+/// Refuse a window whose attention scores, logits or gathered alignment block
+/// cannot be bound before a single buffer is allocated.
 ///
-/// A buffer bigger than `max_storage_buffer_binding_size` cannot be bound at
-/// all, so the failure would otherwise surface as a validation error from
-/// inside the first dispatch, with nothing pointing at the window length.
+/// A buffer bigger than the adapter's storage-buffer binding limit cannot be
+/// bound at all, so the failure would otherwise surface as a validation error
+/// from inside the first dispatch, with nothing pointing at the window length
+/// — or, for the gathered block, at the transcript.
 fn check_binding_limits(
     t: usize,
     scores_bytes: u64,
     logits_bytes: u64,
+    gather_bytes: u64,
     max_binding: u64,
 ) -> Result<()> {
-    let window = recommended_window_secs(t, scores_bytes, logits_bytes, max_binding);
-    for (what, need) in [("attention scores", scores_bytes), ("logits", logits_bytes)] {
+    let window = recommended_window_secs(t, scores_bytes, logits_bytes, gather_bytes, max_binding);
+    for (what, need) in [
+        ("attention scores", scores_bytes),
+        ("logits", logits_bytes),
+        ("gathered transcript block", gather_bytes),
+    ] {
         if need > max_binding {
             anyhow::bail!(
                 "a {t}-frame window needs {need} B for the {what}, over this adapter's \
-                 max_storage_buffer_binding_size of {max_binding} B; use --window {window} \
+                 storage-buffer binding limit of {max_binding} B; use --window {window} \
                  (seconds) or less"
             );
         }
@@ -217,7 +228,9 @@ struct TransposeCfg {
     a_stride: u32,
     a_off: u32,
     o_stride: u32,
-    _p0: u32,
+    /// First column of the destination the source rows land in. 0 for `K^T`;
+    /// `hs` and `2·hs` for the fused `qkv` projections.
+    o_off: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -251,56 +264,172 @@ struct Job {
     gz: u32,
 }
 
-/// One encoder layer's prepared weights, in upload order.
+/// One load-time `transpose` dispatch: a `[rows, cols]` source matrix in the
+/// checkpoint, written transposed into `dst` starting at column `o_off`.
+struct TransposeJob<'a> {
+    name: &'a str,
+    dst: &'a wgpu::Buffer,
+    /// Source rows, which are the destination's `N`.
+    rows: u32,
+    /// Source columns, which are the destination's `K`.
+    cols: u32,
+    a_stride: u32,
+    o_stride: u32,
+    o_off: u32,
+}
+
+/// Upload every job's source through `raw_w` and transpose it on the GPU.
 ///
-/// The biases travel with their weights: unpacking a `(Vec<f32>, Vec<f32>)`
-/// tuple to keep only the bias is what made the loader read `k_proj`,
-/// `v_proj` and `final_layer_norm` twice per layer.
-struct LayerWeights {
-    qkv_wt: Vec<f32>,
-    qkv_b: Vec<f32>,
-    out_wt: Vec<f32>,
-    out_b: Vec<f32>,
-    ff1_wt: Vec<f32>,
-    ff1_b: Vec<f32>,
-    ff2_wt: Vec<f32>,
-    ff2_b: Vec<f32>,
-    ln1_w: Vec<f32>,
-    ln1_b: Vec<f32>,
-    ln2_w: Vec<f32>,
-    ln2_b: Vec<f32>,
+/// The bytes come straight from the mmap, so a weight costs one
+/// `write_buffer` and one dispatch instead of a host-side `Vec<f32>` of the
+/// same size. Jobs are packed into `raw_cap` greedily and one that does not
+/// fit is split on source rows, which the shader's `a_off` / `o_off` already
+/// express: a tighter binding limit buys more batches, never a different
+/// result.
+fn stream_transpose(
+    gpu: &Gpu,
+    pipe: &wgpu::ComputePipeline,
+    raw_w: &wgpu::Buffer,
+    raw_cap: u64,
+    tensors: &HashMap<String, RawTensor>,
+    jobs: &[TransposeJob<'_>],
+) -> Result<()> {
+    // (job index, byte offset in `raw_w`, first source row, rows in this chunk)
+    let mut ops: Vec<(usize, u64, u32, u32)> = Vec::new();
+    let mut filled = 0u64;
+    for (i, job) in jobs.iter().enumerate() {
+        let t = tensors
+            .get(job.name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {}", job.name))?;
+        anyhow::ensure!(
+            t.shape == [job.rows as usize, job.cols as usize],
+            "{}: shape {:?} is not the {rows}x{cols} transpose the kernels expect",
+            job.name,
+            t.shape,
+            rows = job.rows,
+            cols = job.cols
+        );
+        let row_bytes = job.a_stride as u64 * 4;
+        anyhow::ensure!(
+            row_bytes <= raw_cap,
+            "{}: one {}-element source row is {row_bytes} B, over the {raw_cap} B staging \
+             buffer",
+            job.name,
+            job.a_stride
+        );
+        let per_pass = (raw_cap / row_bytes) as u32;
+        let mut r0 = 0u32;
+        while r0 < job.rows {
+            let rows = (job.rows - r0).min(per_pass);
+            let piece = rows as u64 * row_bytes;
+            if filled + piece > raw_cap {
+                run_transpose_batch(gpu, pipe, raw_w, tensors, jobs, &ops)?;
+                ops.clear();
+                filled = 0;
+            }
+            ops.push((i, filled, r0, rows));
+            filled += piece;
+            r0 += rows;
+        }
+    }
+    run_transpose_batch(gpu, pipe, raw_w, tensors, jobs, &ops)
+}
+
+/// One command encoder's worth of transposes: every source chunk is written
+/// into `raw_w` first, then one dispatch per chunk against one bind group.
+fn run_transpose_batch(
+    gpu: &Gpu,
+    pipe: &wgpu::ComputePipeline,
+    raw_w: &wgpu::Buffer,
+    tensors: &HashMap<String, RawTensor>,
+    jobs: &[TransposeJob<'_>],
+    ops: &[(usize, u64, u32, u32)],
+) -> Result<()> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let layout = pipe.get_bind_group_layout(0);
+    // Uploads and uniforms first: `write_buffer` while a compute pass is open
+    // races the uniform buffer on this wgpu version.
+    for &(i, at, r0, rows) in ops {
+        let job = &jobs[i];
+        let (bytes, _) = get_f32_bytes(tensors, job.name)?;
+        let start = r0 as usize * job.a_stride as usize * 4;
+        let len = rows as usize * job.a_stride as usize * 4;
+        gpu.queue
+            .write_buffer(raw_w, at, &bytes[start..start + len]);
+    }
+    let mut unis = Vec::with_capacity(ops.len());
+    let mut bgs = Vec::with_capacity(ops.len());
+    for &(i, at, r0, rows) in ops {
+        let job = &jobs[i];
+        let cfg = TransposeCfg {
+            rows,
+            cols: job.cols,
+            a_stride: job.a_stride,
+            a_off: (at / 4) as u32,
+            o_stride: job.o_stride,
+            o_off: job.o_off + r0,
+            _p1: 0,
+            _p2: 0,
+        };
+        let uni = gpu.uniform("t-u", std::mem::size_of::<TransposeCfg>() as u64);
+        gpu.upload(&uni, bytemuck::bytes_of(&cfg));
+        bgs.push(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: raw_w.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: job.dst.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uni.as_entire_binding(),
+                },
+            ],
+        }));
+        unis.push(uni);
+    }
+    let mut enc = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("weight transpose"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipe);
+        for (n, &(i, _, _, rows)) in ops.iter().enumerate() {
+            pass.set_bind_group(0, &bgs[n], &[]);
+            pass.dispatch_workgroups(rows.div_ceil(16), jobs[i].cols.div_ceil(16), 1);
+        }
+    }
+    gpu.queue.submit([enc.finish()]);
+    Ok(())
 }
 
 /// What `CTC_TILE64` says about the short-window `64×64×32` tile.
 ///
 /// It only means anything when the base tile is wider than 64 rows (a 64-row
 /// main tile leaves nothing to gain) and the `M64s` pipeline fits the
-/// adapter's workgroup storage. `on`/`1`/`true` asks for it explicitly, which
-/// is how it gets benchmarked on a device without `SHADER_F16`; `auto` — the
-/// default — enables it only where `f16` tiles make the extra pipeline cheap,
-/// so a Pascal card compiles exactly what it had before.
-fn resolve_tile64(
-    has_f16: bool,
-    main_mt: u32,
-    max_storage: u32,
-    use_f16: bool,
-    env_val: Option<&str>,
-) -> bool {
+/// adapter's workgroup storage. `1`/`true`/`on` asks for it explicitly, which
+/// is how it gets measured; `auto` — the default — keeps it off, so a Pascal
+/// card compiles exactly what it had before.
+fn resolve_tile64(main_mt: u32, max_storage: u32, use_f16: bool, env_val: Option<&str>) -> bool {
     let possible =
         main_mt > 64 && shaders::GemmVariant::M64s.shared_bytes_with(use_f16) <= max_storage;
-    if !possible {
-        return false;
-    }
-    match env_val
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "0" | "false" | "off" => false,
-        "1" | "true" | "on" => true,
-        _ => has_f16,
-    }
+    possible
+        && matches!(
+            env_val
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "on"
+        )
 }
 
 /// Pick the `f32`-shared-tile GEMM variant used by materialised attention
@@ -326,15 +455,15 @@ fn resolve_f32_gemm_variant(
 /// `head_dim` is a hard gate: the kernel is written for the 64-wide head every
 /// Wav2Vec2 checkpoint uses. `auto` keeps the tuned materialised path where it
 /// fits and performs (this P104 at 30 s) and engages wherever it cannot: a
-/// `scores` tensor past the binding limit, a window past the size cap, or a
-/// modern adapter with `f16` shared tiles.
+/// `scores` tensor past the binding limit, or a window past the size cap. The
+/// decision stays on those physical constraints — an adapter that merely
+/// advertises `f16` says nothing about how fast it runs the fused kernel.
 fn resolve_flash_attn(
     env_val: Option<&str>,
     head_dim: usize,
     scores_bytes: u64,
     max_binding: u64,
     scores_exceeds_cap: bool,
-    has_f16: bool,
 ) -> bool {
     if head_dim != shaders::FLASH_HEAD_DIM as usize {
         return false;
@@ -347,7 +476,7 @@ fn resolve_flash_attn(
     {
         "0" | "false" | "off" => false,
         "1" | "true" | "on" => true,
-        _ => scores_bytes > max_binding || scores_exceeds_cap || has_f16,
+        _ => scores_bytes > max_binding || scores_exceeds_cap,
     }
 }
 
@@ -527,229 +656,10 @@ impl GpuModel {
         );
         let pos_wt = transpose_pos(&pos_w, out_c, in_pg, k);
 
-        // ---- weight prep: transposes and fused qkv, in parallel
-        let transpose = |w: &[f32], out: usize, inp: usize| -> Vec<f32> {
-            (0..inp * out)
-                .into_par_iter()
-                .map(|i| {
-                    let kk = i / out;
-                    let n = i % out;
-                    w[n * inp + kk]
-                })
-                .collect()
-        };
-        let conv_wt: Vec<Vec<f32>> = (1..7)
-            .map(|i| {
-                let (out, cin, kk) = (512usize, 512usize, cfg.conv_kernel[i]);
-                let w = get_f32(
-                    &tensors,
-                    &format!("wav2vec2.feature_extractor.conv_layers.{i}.conv.weight"),
-                )
-                .unwrap()
-                .0;
-                let mut wt = vec![0.0f32; kk * cin * out];
-                wt.par_chunks_mut(out).enumerate().for_each(|(idx, row)| {
-                    let t = idx / cin;
-                    let ci = idx % cin;
-                    for (o, slot) in row.iter_mut().enumerate() {
-                        *slot = w[(o * cin + ci) * kk + t];
-                    }
-                });
-                wt
-            })
-            .collect();
-        let lm_wt = transpose(
-            &get_f32(&tensors, "lm_head.weight")?.0,
-            cfg.vocab_size,
-            cfg.hidden_size,
-        );
-        let fp_wt = transpose(
-            &get_f32(&tensors, "wav2vec2.feature_projection.projection.weight")?.0,
-            cfg.hidden_size,
-            512,
-        );
-
-        let lin = |name: String| -> Result<(Vec<f32>, Vec<f32>)> {
-            let w = get_f32(&tensors, &format!("{name}.weight"))?.0;
-            let b = get_f32(&tensors, &format!("{name}.bias"))?.0;
-            Ok((w, b))
-        };
-
-        let layers: Vec<LayerWeights> = (0..cfg.num_hidden_layers)
-            .into_par_iter()
-            .map(|i| {
-                let base = |sub: &str| format!("wav2vec2.encoder.layers.{i}.{sub}");
-                let tr = |w: &[f32], out: usize, inp: usize| transpose(w, out, inp);
-                let hs = cfg.hidden_size;
-                // one read per tensor: the weight is 4 MiB a layer, so asking
-                // for it twice cost ~1.1 GB of pure copies over 24 layers
-                let (qw, qb) = lin(base("attention.q_proj")).unwrap();
-                let (kw, kb) = lin(base("attention.k_proj")).unwrap();
-                let (vw, vb) = lin(base("attention.v_proj")).unwrap();
-                let (ow, ob) = lin(base("attention.out_proj")).unwrap();
-                let (f1w, f1b) = lin(base("feed_forward.intermediate_dense")).unwrap();
-                let (f2w, f2b) = lin(base("feed_forward.output_dense")).unwrap();
-                let (l1w, l1b) = lin(base("layer_norm")).unwrap();
-                let (l2w, l2b) = lin(base("final_layer_norm")).unwrap();
-                // fused (K, 3K): row k = [Wq[:,k] | Wk[:,k] | Wv[:,k]]
-                let qt = tr(&qw, hs, hs);
-                let kt = tr(&kw, hs, hs);
-                let vt = tr(&vw, hs, hs);
-                let mut qkv = vec![0.0f32; hs * 3 * hs];
-                for r in 0..hs {
-                    qkv[r * 3 * hs..r * 3 * hs + hs].copy_from_slice(&qt[r * hs..(r + 1) * hs]);
-                    qkv[r * 3 * hs + hs..r * 3 * hs + 2 * hs]
-                        .copy_from_slice(&kt[r * hs..(r + 1) * hs]);
-                    qkv[r * 3 * hs + 2 * hs..r * 3 * hs + 3 * hs]
-                        .copy_from_slice(&vt[r * hs..(r + 1) * hs]);
-                }
-                let mut qkvb = qb;
-                qkvb.extend_from_slice(&kb);
-                qkvb.extend_from_slice(&vb);
-                LayerWeights {
-                    qkv_wt: qkv,
-                    qkv_b: qkvb,
-                    out_wt: tr(&ow, hs, hs),
-                    out_b: ob,
-                    ff1_wt: tr(&f1w, cfg.intermediate_size, hs),
-                    ff1_b: f1b,
-                    ff2_wt: tr(&f2w, hs, cfg.intermediate_size),
-                    ff2_b: f2b,
-                    ln1_w: l1w,
-                    ln1_b: l1b,
-                    ln2_w: l2w,
-                    ln2_b: l2b,
-                }
-            })
-            .collect();
-
-        // ---- upload
-        let mut up = gpu.uploader();
-        let put = |up: &mut BulkUpload, data: &[f32], label: &str| -> wgpu::Buffer {
-            let bytes = le_bytes(data);
-            let buf = up.storage(label, bytes.len() as u64);
-            up.upload(&buf, &bytes).unwrap();
-            buf
-        };
-
-        let conv0_w = put(
-            &mut up,
-            &get_f32(
-                &tensors,
-                "wav2vec2.feature_extractor.conv_layers.0.conv.weight",
-            )?
-            .0,
-            "conv0.w",
-        );
-        let conv_wt_b: Vec<_> = conv_wt
-            .iter()
-            .enumerate()
-            .map(|(i, wt)| put(&mut up, wt, &format!("conv{}.wt", i + 1)))
-            .collect();
-        let conv_b: Vec<_> = (0..7)
-            .map(|i| {
-                put(
-                    &mut up,
-                    &get_f32(
-                        &tensors,
-                        &format!("wav2vec2.feature_extractor.conv_layers.{i}.conv.bias"),
-                    )
-                    .unwrap()
-                    .0,
-                    &format!("conv{i}.b"),
-                )
-            })
-            .collect();
-        let (mut conv_ln_w, mut conv_ln_b) = (Vec::new(), Vec::new());
-        for i in 0..7 {
-            conv_ln_w.push(put(
-                &mut up,
-                &get_f32(
-                    &tensors,
-                    &format!("wav2vec2.feature_extractor.conv_layers.{i}.layer_norm.weight"),
-                )?
-                .0,
-                &format!("conv{i}.lnw"),
-            ));
-            conv_ln_b.push(put(
-                &mut up,
-                &get_f32(
-                    &tensors,
-                    &format!("wav2vec2.feature_extractor.conv_layers.{i}.layer_norm.bias"),
-                )?
-                .0,
-                &format!("conv{i}.lnb"),
-            ));
-        }
-        let fp_ln_w = put(
-            &mut up,
-            &get_f32(&tensors, "wav2vec2.feature_projection.layer_norm.weight")?.0,
-            "fp.lnw",
-        );
-        let fp_ln_b = put(
-            &mut up,
-            &get_f32(&tensors, "wav2vec2.feature_projection.layer_norm.bias")?.0,
-            "fp.lnb",
-        );
-        let fp_wt_b = put(&mut up, &fp_wt, "fp.wt");
-        let fp_b = put(
-            &mut up,
-            &get_f32(&tensors, "wav2vec2.feature_projection.projection.bias")?.0,
-            "fp.b",
-        );
-        let pos_w_b = put(&mut up, &pos_wt, "pos.w");
-        let pos_b_b = put(
-            &mut up,
-            &get_f32(&tensors, "wav2vec2.encoder.pos_conv_embed.conv.bias")?.0,
-            "pos.b",
-        );
-
-        let mut qkv_wt_b = Vec::new();
-        let mut qkv_b_b = Vec::new();
-        let mut out_wt_b = Vec::new();
-        let mut out_b_b = Vec::new();
-        let mut ff1_wt_b = Vec::new();
-        let mut ff1_b_b = Vec::new();
-        let mut ff2_wt_b = Vec::new();
-        let mut ff2_b_b = Vec::new();
-        let mut ln1_w_b = Vec::new();
-        let mut ln1_b_b = Vec::new();
-        let mut ln2_w_b = Vec::new();
-        for (i, l) in layers.iter().enumerate() {
-            qkv_wt_b.push(put(&mut up, &l.qkv_wt, &format!("l{i}.qkvt")));
-            qkv_b_b.push(put(&mut up, &l.qkv_b, &format!("l{i}.qkvb")));
-            out_wt_b.push(put(&mut up, &l.out_wt, &format!("l{i}.outwt")));
-            out_b_b.push(put(&mut up, &l.out_b, &format!("l{i}.outb")));
-            ff1_wt_b.push(put(&mut up, &l.ff1_wt, &format!("l{i}.ff1wt")));
-            ff1_b_b.push(put(&mut up, &l.ff1_b, &format!("l{i}.ff1b")));
-            ff2_wt_b.push(put(&mut up, &l.ff2_wt, &format!("l{i}.ff2wt")));
-            ff2_b_b.push(put(&mut up, &l.ff2_b, &format!("l{i}.ff2b")));
-            ln1_w_b.push(put(&mut up, &l.ln1_w, &format!("l{i}.ln1w")));
-            ln1_b_b.push(put(&mut up, &l.ln1_b, &format!("l{i}.ln1b")));
-            ln2_w_b.push(put(&mut up, &l.ln2_w, &format!("l{i}.ln2w")));
-        }
-        let ln2_b_buf: Vec<_> = layers
-            .iter()
-            .enumerate()
-            .map(|(i, l)| put(&mut up, &l.ln2_b, &format!("l{i}.ln2b")))
-            .collect();
-        let final_ln_w = put(
-            &mut up,
-            &get_f32(&tensors, "wav2vec2.encoder.layer_norm.weight")?.0,
-            "final.lnw",
-        );
-        let final_ln_b = put(
-            &mut up,
-            &get_f32(&tensors, "wav2vec2.encoder.layer_norm.bias")?.0,
-            "final.lnb",
-        );
-        let lm_wt_b = put(&mut up, &lm_wt, "lm.wt");
-        let lm_b_b = put(&mut up, &get_f32(&tensors, "lm_head.bias")?.0, "lm.b");
-        let zeros = put(&mut up, &vec![0.0f32; 4096], "zeros");
-        up.finish()?;
-
-        let labels_buf = gpu.storage("trellis-labels", 65536 * 4);
-        let star_flags = gpu.storage("star-flags", 65536 * 4);
+        // ---- pipelines first: the streaming weight transpose below needs
+        // `pipes.transpose`, and the cache is written before a GiB of uploads
+        // goes through the queue.
+        let hs = cfg.hidden_size;
         let mk = |src: &str, entry: &str| -> Result<wgpu::ComputePipeline> {
             gpu.pipeline(entry, src, "main", None)
         };
@@ -799,7 +709,6 @@ impl GpuModel {
         // The short-window 64x64 tile: a separate pipeline, because the tile
         // geometry is baked into the shader.
         let tile64 = resolve_tile64(
-            gpu.has_f16(),
             gemm_mt,
             max_storage,
             use_f16,
@@ -857,6 +766,316 @@ impl GpuModel {
         // directory must not fail a model load.
         let _ = gpu.save_pipeline_cache();
 
+        let labels_buf = gpu.storage("trellis-labels", 65536 * 4);
+        let star_flags = gpu.storage("star-flags", 65536 * 4);
+
+        // ---- checkpoint upload
+        //
+        // Every 1-D tensor goes up straight from the mmap: on an f32
+        // checkpoint that is a zero-copy borrow, so the only host-side copies
+        // left are the conv stack's im2col re-layout and the weight-normed pos
+        // conv. The 2-D linear weights stream through the GPU transpose below.
+        let mut up = gpu.uploader();
+        let f32s = |n: usize| (n * 4) as u64;
+        // a tensor's little-endian f32 bytes, borrowed from the mmap
+        let put_tensor = |up: &mut BulkUpload, name: &str, label: &str| -> Result<wgpu::Buffer> {
+            let (bytes, _) = get_f32_bytes(&tensors, name)?;
+            let buf = up.storage(label, bytes.len() as u64);
+            up.upload(&buf, &bytes)?;
+            Ok(buf)
+        };
+        // host-built f32 data: the conv re-layout and the pos conv
+        let put = |up: &mut BulkUpload, data: &[f32], label: &str| -> Result<wgpu::Buffer> {
+            let bytes = le_bytes(data);
+            let buf = up.storage(label, bytes.len() as u64);
+            up.upload(&buf, &bytes)?;
+            Ok(buf)
+        };
+
+        let conv0_w = put_tensor(
+            &mut up,
+            "wav2vec2.feature_extractor.conv_layers.0.conv.weight",
+            "conv0.w",
+        )?;
+        // One layer at a time: each `Vec<f32>` is dropped right after its
+        // upload instead of all six being held at once.
+        let mut conv_wt = Vec::with_capacity(6);
+        for i in 1..7 {
+            let name = format!("wav2vec2.feature_extractor.conv_layers.{i}.conv.weight");
+            let (out, cin, kk) = (512usize, 512usize, cfg.conv_kernel[i]);
+            let (w, _) = get_f32(&tensors, &name)?;
+            // [oc, ci, tap] -> [tap * 512 + ci, oc]: the conv GEMM reads one
+            // tap's whole input plane as a contiguous row of B
+            let mut wt = vec![0.0f32; kk * cin * out];
+            wt.par_chunks_mut(out).enumerate().for_each(|(idx, row)| {
+                let t = idx / cin;
+                let ci = idx % cin;
+                for (o, slot) in row.iter_mut().enumerate() {
+                    *slot = w[(o * cin + ci) * kk + t];
+                }
+            });
+            conv_wt.push(put(&mut up, &wt, &format!("conv{i}.wt"))?);
+        }
+
+        let mut conv_b = Vec::with_capacity(7);
+        let mut conv_ln_w = Vec::with_capacity(7);
+        let mut conv_ln_b = Vec::with_capacity(7);
+        for i in 0..7 {
+            let p = format!("wav2vec2.feature_extractor.conv_layers.{i}");
+            conv_b.push(put_tensor(
+                &mut up,
+                &format!("{p}.conv.bias"),
+                &format!("conv{i}.b"),
+            )?);
+            conv_ln_w.push(put_tensor(
+                &mut up,
+                &format!("{p}.layer_norm.weight"),
+                &format!("conv{i}.lnw"),
+            )?);
+            conv_ln_b.push(put_tensor(
+                &mut up,
+                &format!("{p}.layer_norm.bias"),
+                &format!("conv{i}.lnb"),
+            )?);
+        }
+        let fp_ln_w = put_tensor(
+            &mut up,
+            "wav2vec2.feature_projection.layer_norm.weight",
+            "fp.lnw",
+        )?;
+        let fp_ln_b = put_tensor(
+            &mut up,
+            "wav2vec2.feature_projection.layer_norm.bias",
+            "fp.lnb",
+        )?;
+        let fp_b = put_tensor(
+            &mut up,
+            "wav2vec2.feature_projection.projection.bias",
+            "fp.b",
+        )?;
+        let pos_w_b = put(&mut up, &pos_wt, "pos.w")?;
+        let pos_b_b = put_tensor(
+            &mut up,
+            "wav2vec2.encoder.pos_conv_embed.conv.bias",
+            "pos.b",
+        )?;
+
+        let n_layer = cfg.num_hidden_layers;
+        let mut qkv_b = Vec::with_capacity(n_layer);
+        let mut out_b = Vec::with_capacity(n_layer);
+        let mut ff1_b = Vec::with_capacity(n_layer);
+        let mut ff2_b = Vec::with_capacity(n_layer);
+        let mut ln1_w = Vec::with_capacity(n_layer);
+        let mut ln1_b = Vec::with_capacity(n_layer);
+        let mut ln2_w = Vec::with_capacity(n_layer);
+        let mut ln2_b = Vec::with_capacity(n_layer);
+        for i in 0..n_layer {
+            let base = format!("wav2vec2.encoder.layers.{i}");
+            // the qkv GEMM adds one bias over 3·hs columns: [bq | bk | bv]
+            let mut fused = Vec::with_capacity(3 * hs);
+            for p in ["attention.q_proj", "attention.k_proj", "attention.v_proj"] {
+                let (b, _) = get_f32(&tensors, &format!("{base}.{p}.bias"))?;
+                fused.extend_from_slice(&b);
+            }
+            qkv_b.push(put(&mut up, &fused, &format!("l{i}.qkvb"))?);
+            out_b.push(put_tensor(
+                &mut up,
+                &format!("{base}.attention.out_proj.bias"),
+                &format!("l{i}.outb"),
+            )?);
+            ff1_b.push(put_tensor(
+                &mut up,
+                &format!("{base}.feed_forward.intermediate_dense.bias"),
+                &format!("l{i}.ff1b"),
+            )?);
+            ff2_b.push(put_tensor(
+                &mut up,
+                &format!("{base}.feed_forward.output_dense.bias"),
+                &format!("l{i}.ff2b"),
+            )?);
+            ln1_w.push(put_tensor(
+                &mut up,
+                &format!("{base}.layer_norm.weight"),
+                &format!("l{i}.ln1w"),
+            )?);
+            ln1_b.push(put_tensor(
+                &mut up,
+                &format!("{base}.layer_norm.bias"),
+                &format!("l{i}.ln1b"),
+            )?);
+            ln2_w.push(put_tensor(
+                &mut up,
+                &format!("{base}.final_layer_norm.weight"),
+                &format!("l{i}.ln2w"),
+            )?);
+            ln2_b.push(put_tensor(
+                &mut up,
+                &format!("{base}.final_layer_norm.bias"),
+                &format!("l{i}.ln2b"),
+            )?);
+        }
+        let final_ln_w = put_tensor(&mut up, "wav2vec2.encoder.layer_norm.weight", "final.lnw")?;
+        let final_ln_b = put_tensor(&mut up, "wav2vec2.encoder.layer_norm.bias", "final.lnb")?;
+        let lm_b = put_tensor(&mut up, "lm_head.bias", "lm.b")?;
+        // the skip-add identity the GEMM epilogues bind
+        let zeros = put(&mut up, &[0.0f32; 4096], "zeros")?;
+        up.finish()?;
+
+        // ---- the 2-D linear weights, transposed on the GPU as they stream in
+        //
+        // `fp_wt`, `lm_wt` and six matrices a layer are ~1.2 GB of (K, N)
+        // tiles. There is one reusable staging buffer instead of one host
+        // `Vec<f32>` per matrix: upload the mmap bytes, dispatch `transpose`,
+        // drop the source. `raw_w` holds the largest single batch — `lm_head`
+        // (40 MiB) or one layer's six matrices (48 MiB) — capped under the
+        // binding limit; a smaller cap only splits a batch on source rows.
+        let inter = cfg.intermediate_size;
+        let max_binding = gpu.effective_max_binding();
+        let lm_bytes = f32s(cfg.vocab_size * hs);
+        let layer_bytes = f32s(3 * hs * hs) + f32s(hs * hs) + f32s(inter * hs) + f32s(hs * inter);
+        let raw_cap = lm_bytes.max(layer_bytes).min(max_binding & !15);
+        let raw_w = gpu.storage("w.raw", raw_cap);
+
+        let fp_wt = gpu.storage("fp.wt", f32s(hs * 512));
+        let lm_wt = gpu.storage("lm.wt", lm_bytes);
+        let mut qkv_wt = Vec::with_capacity(n_layer);
+        let mut out_wt = Vec::with_capacity(n_layer);
+        let mut ff1_wt = Vec::with_capacity(n_layer);
+        let mut ff2_wt = Vec::with_capacity(n_layer);
+        for i in 0..n_layer {
+            qkv_wt.push(gpu.storage(&format!("l{i}.qkvt"), f32s(3 * hs * hs)));
+            out_wt.push(gpu.storage(&format!("l{i}.outwt"), f32s(hs * hs)));
+            ff1_wt.push(gpu.storage(&format!("l{i}.ff1wt"), f32s(inter * hs)));
+            ff2_wt.push(gpu.storage(&format!("l{i}.ff2wt"), f32s(hs * inter)));
+        }
+
+        // A dispatch that fails validation is reported here rather than
+        // surfacing as a wrong number three windows into the alignment.
+        let guard = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        stream_transpose(
+            &gpu,
+            &pipes.transpose,
+            &raw_w,
+            raw_cap,
+            &tensors,
+            &[TransposeJob {
+                name: "wav2vec2.feature_projection.projection.weight",
+                dst: &fp_wt,
+                rows: hs as u32,
+                cols: 512,
+                a_stride: 512,
+                o_stride: hs as u32,
+                o_off: 0,
+            }],
+        )?;
+        // `[out=vocab, inp=hs]` -> `[K=hs, N=vocab]`: `o[c * vocab + r] =
+        // a[r * hs + c]`, the tile the LM-head GEMM reads as B.
+        stream_transpose(
+            &gpu,
+            &pipes.transpose,
+            &raw_w,
+            raw_cap,
+            &tensors,
+            &[TransposeJob {
+                name: "lm_head.weight",
+                dst: &lm_wt,
+                rows: cfg.vocab_size as u32,
+                cols: hs as u32,
+                a_stride: hs as u32,
+                o_stride: cfg.vocab_size as u32,
+                o_off: 0,
+            }],
+        )?;
+        for i in 0..n_layer {
+            let base = format!("wav2vec2.encoder.layers.{i}");
+            let q = format!("{base}.attention.q_proj.weight");
+            let k = format!("{base}.attention.k_proj.weight");
+            let v = format!("{base}.attention.v_proj.weight");
+            let o = format!("{base}.attention.out_proj.weight");
+            let f1 = format!("{base}.feed_forward.intermediate_dense.weight");
+            let f2 = format!("{base}.feed_forward.output_dense.weight");
+            // The fused qkv destination is (hs, 3·hs) and the three
+            // projections land in column thirds: `o[c * 3hs + hs + r] =
+            // k[r * hs + c]`, exactly the tile split the qkv GEMM's N dim
+            // expects.
+            stream_transpose(
+                &gpu,
+                &pipes.transpose,
+                &raw_w,
+                raw_cap,
+                &tensors,
+                &[
+                    TransposeJob {
+                        name: &q,
+                        dst: &qkv_wt[i],
+                        rows: hs as u32,
+                        cols: hs as u32,
+                        a_stride: hs as u32,
+                        o_stride: 3 * hs as u32,
+                        o_off: 0,
+                    },
+                    TransposeJob {
+                        name: &k,
+                        dst: &qkv_wt[i],
+                        rows: hs as u32,
+                        cols: hs as u32,
+                        a_stride: hs as u32,
+                        o_stride: 3 * hs as u32,
+                        o_off: hs as u32,
+                    },
+                    TransposeJob {
+                        name: &v,
+                        dst: &qkv_wt[i],
+                        rows: hs as u32,
+                        cols: hs as u32,
+                        a_stride: hs as u32,
+                        o_stride: 3 * hs as u32,
+                        o_off: 2 * hs as u32,
+                    },
+                    TransposeJob {
+                        name: &o,
+                        dst: &out_wt[i],
+                        rows: hs as u32,
+                        cols: hs as u32,
+                        a_stride: hs as u32,
+                        o_stride: hs as u32,
+                        o_off: 0,
+                    },
+                    TransposeJob {
+                        name: &f1,
+                        dst: &ff1_wt[i],
+                        rows: inter as u32,
+                        cols: hs as u32,
+                        a_stride: hs as u32,
+                        o_stride: inter as u32,
+                        o_off: 0,
+                    },
+                    TransposeJob {
+                        name: &f2,
+                        dst: &ff2_wt[i],
+                        rows: hs as u32,
+                        cols: inter as u32,
+                        a_stride: inter as u32,
+                        o_stride: hs as u32,
+                        o_off: 0,
+                    },
+                ],
+            )?;
+            // WDDM grows its staging allocation until it is waited on; four
+            // layers is ~190 MB, which keeps the peak flat without a stall
+            // per layer.
+            if i % 4 == 3 {
+                gpu.flush()?;
+            }
+        }
+        let flushed = gpu.flush();
+        if let Some(e) = pollster::block_on(guard.pop()) {
+            anyhow::bail!("gpu validation during model load: {e}");
+        }
+        flushed?;
+        // 48 MiB of staging, spent.
+        drop(raw_w);
+
         Ok(Self {
             gpu,
             cfg,
@@ -869,32 +1088,32 @@ impl GpuModel {
             readback: std::sync::Mutex::new(Vec::new()),
             xfer: std::sync::OnceLock::new(),
             conv0_w,
-            conv_wt: conv_wt_b,
+            conv_wt,
             conv_b,
             conv_ln_w,
             conv_ln_b,
             fp_ln_w,
             fp_ln_b,
-            fp_wt: fp_wt_b,
+            fp_wt,
             fp_b,
             pos_w: pos_w_b,
             pos_b: pos_b_b,
-            qkv_wt: qkv_wt_b,
-            qkv_b: qkv_b_b,
-            out_wt: out_wt_b,
-            out_b: out_b_b,
-            ff1_wt: ff1_wt_b,
-            ff1_b: ff1_b_b,
-            ff2_wt: ff2_wt_b,
-            ff2_b: ff2_b_b,
-            ln1_w: ln1_w_b,
-            ln1_b: ln1_b_b,
-            ln2_w: ln2_w_b,
-            ln2_b: ln2_b_buf,
+            qkv_wt,
+            qkv_b,
+            out_wt,
+            out_b,
+            ff1_wt,
+            ff1_b,
+            ff2_wt,
+            ff2_b,
+            ln1_w,
+            ln1_b,
+            ln2_w,
+            ln2_b,
             final_ln_w,
             final_ln_b,
-            lm_wt: lm_wt_b,
-            lm_b: lm_b_b,
+            lm_wt,
+            lm_b,
             zeros,
             labels: labels_buf,
             star_flags,
@@ -1200,7 +1419,7 @@ impl GpuModel {
         raw[256..256 + ls_bytes.len()].copy_from_slice(ls_bytes);
         let uni = self.gpu.uniform("dp-replay-uni", 512);
         self.gpu.queue.write_buffer(&uni, 0, &raw);
-        let gemm_layout = self.pipes.gemm.get_bind_group_layout(0);
+        let gemm_layout = self.pipes.gemm_f32.get_bind_group_layout(0);
         let ls_layout = self.pipes.log_softmax.get_bind_group_layout(0);
         let stage = dp.stage().clone();
         let gemm_bg = self
@@ -1242,11 +1461,11 @@ impl GpuModel {
                 label: Some("dp-replay-gemm"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipes.gemm);
+            pass.set_pipeline(&self.pipes.gemm_f32);
             pass.set_bind_group(0, &gemm_bg, &[]);
             pass.dispatch_workgroups(
-                (m as u32).div_ceil(self.gemm_mt),
-                vocab.div_ceil(self.gemm_nt),
+                (m as u32).div_ceil(self.gemm_f32_mt),
+                vocab.div_ceil(self.gemm_f32_nt),
                 1,
             );
         }
@@ -1319,7 +1538,7 @@ impl GpuModel {
         let hidden = self.cfg.hidden_size;
         let vocab = u32::try_from(self.cfg.vocab_size).context("vocab")?;
         let hidden_u = u32::try_from(hidden).context("hidden")?;
-        let gemm_layout = self.pipes.gemm.get_bind_group_layout(0);
+        let gemm_layout = self.pipes.gemm_f32.get_bind_group_layout(0);
         let ls_layout = self.pipes.log_softmax.get_bind_group_layout(0);
         let uni = self.gpu.uniform("dp-score-uni", 768);
         let guard = self
@@ -1406,11 +1625,11 @@ impl GpuModel {
                     label: Some("dp-score-gemm"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pipes.gemm);
+                pass.set_pipeline(&self.pipes.gemm_f32);
                 pass.set_bind_group(0, &gemm_bg, &[]);
                 pass.dispatch_workgroups(
-                    (m as u32).div_ceil(self.gemm_mt),
-                    vocab.div_ceil(self.gemm_nt),
+                    (m as u32).div_ceil(self.gemm_f32_mt),
+                    vocab.div_ceil(self.gemm_f32_nt),
                     1,
                 );
             }
@@ -1534,7 +1753,17 @@ impl GpuModel {
         let logits_bytes = ((if read_hidden { t * hidden } else { t * vocab }) as u64)
             .checked_mul(4)
             .context("logits size overflow")?;
-        let max_binding = gpu.limits().max_storage_buffer_binding_size;
+        // The gathered alignment block is (t, S) f32 and grows with the
+        // transcript, so a long transcript can blow the binding limit on a
+        // window whose scores and logits both fit.
+        let gather_bytes = match gather {
+            Some(e) => (t as u64)
+                .checked_mul(e.len() as u64)
+                .and_then(|n| n.checked_mul(4))
+                .context("gather buffer size overflow")?,
+            None => 0,
+        };
+        let max_binding = gpu.effective_max_binding();
         // Fused attention is decided before either check: it is what removes
         // the `scores` tensor, and with it the window limit those checks are
         // about. `auto` therefore engages exactly where the materialised path
@@ -1546,7 +1775,6 @@ impl GpuModel {
                 scores_bytes,
                 max_binding,
                 scores_n > 200_000_000,
-                gpu.has_f16(),
             );
         if !use_flash && scores_n > 200_000_000 {
             anyhow::bail!(
@@ -1557,6 +1785,7 @@ impl GpuModel {
             t,
             if use_flash { 0 } else { scores_bytes },
             logits_bytes,
+            gather_bytes,
             max_binding,
         )?;
         // Short windows go through the 64x64 tile when the load-time selector
@@ -2275,8 +2504,12 @@ impl GpuModel {
                 bind!(2, &self.final_ln_b),
             );
             if !read_hidden {
+                // The head feeds `log_softmax` directly and is 1 of 98 GEMMs,
+                // so it stays on the `f32`-shared-tile pipeline even when
+                // `CTC_F16_KERNEL=on` narrowed every other linear GEMM: a
+                // rounded logit moves the emission the DP is matching.
                 dispatch!(
-                    gemm_pipe,
+                    attn_pipe,
                     GemmDims {
                         m: t as u32,
                         n: vocab as u32,
@@ -2296,8 +2529,8 @@ impl GpuModel {
                         b_vec: vec4_ok(0, vocab as u32, 0),
                         _p0: 0,
                     },
-                    (t as u32).div_ceil(main_mt),
-                    (vocab as u32).div_ceil(main_nt),
+                    (t as u32).div_ceil(attn_mt),
+                    (vocab as u32).div_ceil(attn_nt),
                     bind!(0, &act.x),
                     bind!(1, &self.lm_wt),
                     bind!(2, &self.lm_b),
@@ -3033,10 +3266,10 @@ mod tests {
         let (scores, logits) = bytes(1500, false, 1024);
         assert_eq!(scores, 144_000_000);
         assert!(logits < BINDING);
-        assert!(check_binding_limits(1500, scores, logits, BINDING).is_ok());
+        assert!(check_binding_limits(1500, scores, logits, 0, BINDING).is_ok());
         // even a 60 s window still fits this adapter
         let (scores, logits) = bytes(3000, false, 1024);
-        assert!(check_binding_limits(3000, scores, logits, BINDING).is_ok());
+        assert!(check_binding_limits(3000, scores, logits, 0, BINDING).is_ok());
     }
 
     #[test]
@@ -3045,7 +3278,7 @@ mod tests {
         let cap = 1024 << 20;
         let (scores, logits) = bytes(4500, false, 1024);
         assert!(scores > cap && logits < cap);
-        let err = check_binding_limits(4500, scores, logits, cap).unwrap_err();
+        let err = check_binding_limits(4500, scores, logits, 0, cap).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("attention scores"), "{msg}");
         assert!(msg.contains(&scores.to_string()), "{msg}");
@@ -3070,12 +3303,40 @@ mod tests {
         let cap = 1 << 20;
         let (scores, logits) = bytes(100, false, 1024);
         assert!(scores < cap && logits > cap, "{scores} {logits}");
-        let err = check_binding_limits(100, scores, logits, cap).unwrap_err();
+        let err = check_binding_limits(100, scores, logits, 0, cap).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("logits"), "{msg}");
         assert!(msg.contains(&logits.to_string()), "{msg}");
         assert!(msg.contains(&cap.to_string()), "{msg}");
         assert!(msg.contains("--window"), "{msg}");
+    }
+
+    #[test]
+    fn binding_limits_reject_an_oversized_gathered_block() {
+        // The materialised gather writes (t, S) f32 for a transcript of S
+        // states, so a long transcript — not a long window — is what makes it
+        // unboundable. Here the scores (640 KB) and logits (4.1 MB) of a
+        // 2-second window fit a 6 MiB cap and the 8 MB gather block does not.
+        let cap = 6 << 20;
+        let (scores, logits) = bytes(100, false, 1024);
+        let gather = 100 * 20_000 * 4;
+        assert!(scores < cap && logits < cap && gather > cap, "{gather}");
+        // The same window is fine without a gathered readback.
+        assert!(check_binding_limits(100, scores, logits, 0, cap).is_ok());
+        let err = check_binding_limits(100, scores, logits, gather, cap).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("gathered transcript block"), "{msg}");
+        assert!(msg.contains(&gather.to_string()), "{msg}");
+        assert!(msg.contains(&cap.to_string()), "{msg}");
+        assert!(msg.contains("--window"), "{msg}");
+        let secs: u64 = msg
+            .split("--window ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
+            .expect("a concrete --window value");
+        assert!(secs >= 1 && secs < 2, "{secs}s: {msg}");
+        assert!(secs * 50 * 20_000 * 4 <= cap, "{secs}s still too big");
     }
 
     #[test]
@@ -3086,8 +3347,8 @@ mod tests {
         let (scores, full) = bytes(300, false, 1024);
         let (_, hidden) = bytes(300, true, 1024);
         assert!(hidden < full);
-        assert!(check_binding_limits(300, scores, hidden, cap).is_ok());
-        assert!(check_binding_limits(300, scores, full, cap).is_err());
+        assert!(check_binding_limits(300, scores, hidden, 0, cap).is_ok());
+        assert!(check_binding_limits(300, scores, full, 0, cap).is_err());
     }
 
     /// 48 KiB, what this machine's Vulkan adapter reports.
@@ -3097,29 +3358,27 @@ mod tests {
     fn the_short_window_tile_follows_its_selector() {
         // A 128-row main tile has something to gain; `M64s` needs 17,408 B
         // as f32 and 8,704 B as f16.
-        assert!(resolve_tile64(false, 128, STORAGE, false, None) == false);
-        assert!(resolve_tile64(true, 128, STORAGE, false, None));
-        assert!(resolve_tile64(true, 128, STORAGE, true, None));
-        // `on` is how it gets measured on a device without f16.
+        //
+        // `auto`, unset or empty keep it off, whatever the adapter advertises:
+        // `SHADER_F16` says nothing about SM count, and a low-EU iGPU has it.
+        for auto in [None, Some("auto"), Some(""), Some(" "), Some("yes")] {
+            assert!(!resolve_tile64(128, STORAGE, false, auto), "{auto:?}");
+            assert!(!resolve_tile64(128, STORAGE, true, auto), "{auto:?}");
+        }
+        // `on` is how it gets measured, on either shared-tile precision.
         for on in ["1", "true", "TRUE", "on", " On "] {
-            assert!(resolve_tile64(false, 128, STORAGE, false, Some(on)), "{on}");
+            assert!(resolve_tile64(128, STORAGE, false, Some(on)), "{on}");
+            assert!(resolve_tile64(128, STORAGE, true, Some(on)), "{on}");
         }
         for off in ["0", "false", "off", "OFF"] {
-            assert!(
-                !resolve_tile64(true, 128, STORAGE, true, Some(off)),
-                "{off}"
-            );
+            assert!(!resolve_tile64(128, STORAGE, true, Some(off)), "{off}");
         }
-        // Off for `auto` where f16 does not make the extra pipeline cheap,
-        // which is the zero-regression case on this P104.
-        assert!(!resolve_tile64(false, 128, STORAGE, false, Some("auto")));
-        assert!(!resolve_tile64(false, 128, STORAGE, false, Some("")));
         // Nothing to gain when the main tile is already 64 rows.
-        assert!(!resolve_tile64(true, 64, STORAGE, true, Some("on")));
+        assert!(!resolve_tile64(64, STORAGE, true, Some("on")));
         // Nor where the tile does not fit: f32 M64s is 17,408 B, f16 8,704 B.
-        assert!(!resolve_tile64(false, 128, 8_704, false, Some("on")));
-        assert!(resolve_tile64(false, 128, 8_704, true, Some("on")));
-        assert!(!resolve_tile64(false, 128, 8_703, true, Some("on")));
+        assert!(!resolve_tile64(128, 8_704, false, Some("on")));
+        assert!(resolve_tile64(128, 8_704, true, Some("on")));
+        assert!(!resolve_tile64(128, 8_703, true, Some("on")));
         // The chosen variant is the one the dispatch grid assumes.
         assert_eq!(
             GemmVariant::M64s.shared_bytes_with(false),
@@ -3139,36 +3398,24 @@ mod tests {
             head_dim,
             normal,
             2047 * mib,
-            false,
             false
         ));
         // The same window on a device whose binding limit is below it.
-        assert!(resolve_flash_attn(
-            None,
-            head_dim,
-            normal,
-            64 * mib,
-            false,
-            false
-        ));
+        assert!(resolve_flash_attn(None, head_dim, normal, 64 * mib, false));
         // A window past the hard size cap.
-        assert!(resolve_flash_attn(
-            None,
-            head_dim,
-            normal,
-            2047 * mib,
-            true,
-            false
-        ));
-        // A modern adapter: f16 tiles make the fused path the better one.
-        assert!(resolve_flash_attn(
-            None,
-            head_dim,
-            normal,
-            2047 * mib,
-            false,
-            true
-        ));
+        assert!(resolve_flash_attn(None, head_dim, normal, 2047 * mib, true));
+        // An f16-capable adapter changes nothing on `auto`: the fused path is
+        // selected by what cannot be bound, never by a feature probe.
+        for auto in [None, Some("auto"), Some(""), Some("f16")] {
+            assert!(!resolve_flash_attn(
+                auto,
+                head_dim,
+                normal,
+                2047 * mib,
+                false
+            ));
+            assert!(resolve_flash_attn(auto, head_dim, normal, 64 * mib, false));
+        }
         // Explicit switches win in both directions.
         for on in ["1", "true", "on"] {
             assert!(resolve_flash_attn(
@@ -3176,19 +3423,11 @@ mod tests {
                 head_dim,
                 normal,
                 2047 * mib,
-                false,
                 false
             ));
         }
         for off in ["0", "false", "off"] {
-            assert!(!resolve_flash_attn(
-                Some(off),
-                head_dim,
-                1 << 40,
-                1,
-                true,
-                true
-            ));
+            assert!(!resolve_flash_attn(Some(off), head_dim, 1 << 40, 1, true));
         }
         // The kernel is written for the 64-wide head of every Wav2Vec2
         // checkpoint; anything else keeps the materialised path.
@@ -3197,7 +3436,6 @@ mod tests {
             80,
             normal,
             2047 * mib,
-            false,
             false
         ));
         assert!(!resolve_flash_attn(
@@ -3205,7 +3443,6 @@ mod tests {
             32,
             normal,
             2047 * mib,
-            false,
             false
         ));
     }
@@ -3290,6 +3527,105 @@ mod tests {
                         * tw[(g * k_total + kval) * in_pg + oc];
                 }
                 assert!((acc - acc2).abs() < 1e-3, "j={j} o={o} {acc} vs {acc2}");
+            }
+        }
+    }
+
+    #[test]
+    fn stream_transpose_splits_rows_and_packs_fused_qkv() {
+        use super::{stream_transpose, TransposeJob};
+        use crate::gpu::{DeviceSelector, Gpu};
+        use crate::weights::RawTensor;
+        use safetensors::Dtype;
+        use std::collections::HashMap;
+
+        let _gpu_lock = crate::shaders::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(gpu) = pollster::block_on(Gpu::new_with(DeviceSelector::Runtime {
+            api: wgpu::Backend::Vulkan,
+            index: 0,
+        })) else {
+            return;
+        };
+        let pipe = gpu
+            .pipeline("transpose-test", &crate::shaders::transpose(), "main", None)
+            .expect("compile transpose");
+
+        let (rows, cols) = (19usize, 13usize);
+        let mk_raw = |seed: f32| -> (Vec<f32>, RawTensor) {
+            let vals: Vec<f32> = (0..rows * cols)
+                .map(|k| seed + (k as f32) * 0.25)
+                .collect();
+            let bytes: Vec<u8> = vals.iter().flat_map(|f| f.to_le_bytes()).collect();
+            (
+                vals,
+                RawTensor {
+                    data: bytes::Bytes::from(bytes),
+                    shape: vec![rows, cols],
+                    dtype: Dtype::F32,
+                },
+            )
+        };
+        let (q_vals, q_t) = mk_raw(1.0);
+        let (k_vals, k_t) = mk_raw(1000.0);
+        let mut tensors = HashMap::new();
+        tensors.insert("q".to_string(), q_t);
+        tensors.insert("k".to_string(), k_t);
+
+        // Cap staging to 3 source rows so both jobs MUST split across multiple
+        // row chunks and reuse `raw_w` across batches.
+        let raw_cap = (3 * cols * 4) as u64;
+        let raw_w = gpu.storage("w.raw.test", raw_cap);
+        let dst = gpu.storage("dst.test", (cols * (2 * rows) * 4) as u64);
+
+        stream_transpose(
+            &gpu,
+            &pipe,
+            &raw_w,
+            raw_cap,
+            &tensors,
+            &[
+                TransposeJob {
+                    name: "q",
+                    dst: &dst,
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    a_stride: cols as u32,
+                    o_stride: (2 * rows) as u32,
+                    o_off: 0,
+                },
+                TransposeJob {
+                    name: "k",
+                    dst: &dst,
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    a_stride: cols as u32,
+                    o_stride: (2 * rows) as u32,
+                    o_off: rows as u32,
+                },
+            ],
+        )
+        .expect("stream_transpose");
+        gpu.flush().expect("flush");
+
+        let bytes = gpu
+            .readback(&dst, (cols * (2 * rows) * 4) as u64)
+            .expect("readback");
+        let got: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        for c in 0..cols {
+            for r in 0..rows {
+                assert_eq!(got[c * (2 * rows) + r], q_vals[r * cols + c], "q ({r},{c})");
+                assert_eq!(
+                    got[c * (2 * rows) + rows + r],
+                    k_vals[r * cols + c],
+                    "k ({r},{c})"
+                );
             }
         }
     }

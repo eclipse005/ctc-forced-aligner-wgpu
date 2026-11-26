@@ -562,6 +562,42 @@ fn main() {
 }
 "#;
 
+/// Refuse a DP whose device buffers cannot be bound, before allocating them.
+///
+/// `max_binding` is [`Gpu::effective_max_binding`]: the smaller of the
+/// adapter's `max_storage_buffer_binding_size` and `max_buffer_size`, because
+/// a buffer is created against the one and bound against the other. The six
+/// sizes are the six storage buffers the DP binds; `alpha`, `ckpt`, `states`
+/// and `scores` are derived here from the state and frame counts, so a caller
+/// cannot forget one.
+fn check_dp_buffer_limits(
+    max_binding: u64,
+    s: usize,
+    n_frames: usize,
+    back_bytes: u64,
+    stage_bytes: u64,
+    ckpt_bytes: u64,
+) -> Result<()> {
+    let frames = n_frames as u64;
+    for (what, need) in [
+        ("dp-alpha", (s as u64) * 8),
+        ("dp-back", back_bytes),
+        ("dp-stage", stage_bytes),
+        ("dp-ckpt", ckpt_bytes),
+        ("dp-states", frames * 4),
+        ("dp-scores", frames * 4),
+    ] {
+        if need > max_binding {
+            anyhow::bail!(
+                "{what} needs {need} B for {n_frames} frames x {s} states, over this adapter's \
+                 storage-buffer binding limit of {max_binding} B; set CTC_GPU_DP=0 to run the DP \
+                 on the host, or use a smaller --window"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Device state for one file.
 ///
 /// The choice table is Θ(frames × states). An hour is about 5.5 GB, and
@@ -686,6 +722,38 @@ impl GpuDp {
             }
         }
 
+        // Every buffer the DP binds is sized and validated before the first
+        // allocation: one past the binding limit otherwise surfaces as a
+        // validation error inside the first window, with nothing pointing at
+        // the transcript or the window length.
+        let (seg, linear) = dp_plan(n_frames, s, rb);
+        // Non-linear: the whole table is read back per window, so the device
+        // buffer holds one window. Linear: the choices are traced back ON the
+        // device one segment at a time, so it holds one segment instead —
+        // bounded by the same budget that picked `seg`.
+        let back_rows = if linear { seg } else { BACK_CAP };
+        let back_bytes = (back_rows as u64)
+            .checked_mul(rb_u32 as u64)
+            .and_then(|n| n.checked_mul(4))
+            .context("back buffer size")?;
+        let stage_bytes = (BACK_CAP as u64)
+            .checked_mul(hidden as u64)
+            .and_then(|n| n.checked_mul(4))
+            .context("hidden stage size")?;
+        let ncheck = if linear { (n_frames - 1) / seg + 1 } else { 0 };
+        let ckpt_bytes = (ncheck as u64)
+            .saturating_mul(s as u64)
+            .saturating_mul(8)
+            .max(16);
+        check_dp_buffer_limits(
+            gpu.effective_max_binding(),
+            s,
+            n_frames,
+            back_bytes,
+            stage_bytes,
+            ckpt_bytes,
+        )?;
+
         let alpha = [
             gpu.storage("dp-alpha-0", (s * 8) as u64),
             gpu.storage("dp-alpha-1", (s * 8) as u64),
@@ -705,21 +773,7 @@ impl GpuDp {
 
         let slot = (gpu.device.limits().min_uniform_buffer_offset_alignment as u64).max(UNI_SIZE);
         let cfg = gpu.uniform("dp-cfg", slot * BACK_CAP as u64);
-        let (seg, linear) = dp_plan(n_frames, s, rb);
-        // Non-linear: the whole table is read back per window, so the device
-        // buffer holds one window. Linear: the choices are traced back ON the
-        // device one segment at a time, so it holds one segment instead —
-        // bounded by the same budget that picked `seg`.
-        let back_rows = if linear { seg } else { BACK_CAP };
-        let back_bytes = (back_rows as u64)
-            .checked_mul(rb_u32 as u64)
-            .and_then(|n| n.checked_mul(4))
-            .context("back buffer size")?;
         let back = gpu.storage("dp-back", back_bytes);
-        let stage_bytes = (BACK_CAP as u64)
-            .checked_mul(hidden as u64)
-            .and_then(|n| n.checked_mul(4))
-            .context("hidden stage size")?;
         let stage = gpu.storage("dp-stage", stage_bytes);
         // The per-window readback maps hold one window of hidden rows and one
         // window of choice rows. The linear plan traces choices back on the
@@ -796,11 +850,6 @@ impl GpuDp {
         let _ = gpu.save_pipeline_cache();
         let trace_uni = gpu.uniform("dp-trace-uni", 32);
 
-        let ncheck = if linear { (n_frames - 1) / seg + 1 } else { 0 };
-        let ckpt_bytes = (ncheck as u64)
-            .saturating_mul(s as u64)
-            .saturating_mul(8)
-            .max(16);
         let ckpt = gpu.storage("dp-ckpt", ckpt_bytes);
         // The table fits: keep it in RAM. It does not: keep nothing of it.
         // A zero ceiling makes every push spill, and the linear path never pushes.
@@ -2494,5 +2543,34 @@ mod tests {
         assert_eq!(s.spilled_rows(), 2);
         assert_eq!(s.choice(0, 0).unwrap(), 1 & 0b11);
         assert_eq!(s.choice(1, 1).unwrap(), (5 >> 2) & 0b11);
+    }
+
+    #[test]
+    fn dp_buffer_limits_accept_a_normal_run_and_reject_oversized_buffers() {
+        // 2047 MiB, what this machine's Vulkan adapter reports; a minute of
+        // audio is 3000 frames and a 43-state trellis needs tens of MiB.
+        let cap = 2047u64 << 20;
+        let (s, n) = (43usize, 3000usize);
+        assert!(check_dp_buffer_limits(cap, s, n, 16 << 20, 64 << 20, 8 << 20).is_ok());
+        // The two the caller does not size itself are covered too: 8 bytes a
+        // state and 4 bytes a frame.
+        assert!(check_dp_buffer_limits(cap, (cap / 8 + 1) as usize, n, 16, 16, 16).is_err());
+        assert!(check_dp_buffer_limits(cap, s, (cap / 4 + 1) as usize, 16, 16, 16).is_err());
+
+        // Each named buffer is reported with what it needs, the adapter limit
+        // and both ways out.
+        for (what, back, stage, ckpt) in [
+            ("dp-back", cap + 1, 16, 16),
+            ("dp-stage", 16, cap + 1, 16),
+            ("dp-ckpt", 16, 16, cap + 1),
+        ] {
+            let err = check_dp_buffer_limits(cap, s, n, back, stage, ckpt).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains(what), "{msg}");
+            assert!(msg.contains(&(cap + 1).to_string()), "{msg}");
+            assert!(msg.contains(&cap.to_string()), "{msg}");
+            assert!(msg.contains("CTC_GPU_DP=0"), "{msg}");
+            assert!(msg.contains("--window"), "{msg}");
+        }
     }
 }

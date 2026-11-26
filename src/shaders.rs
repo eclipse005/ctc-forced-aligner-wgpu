@@ -598,17 +598,20 @@ fn main(
     .to_string()
 }
 
-/// (rows, cols) -> (cols, rows), into rows of `o_stride` elements.
+/// (rows, cols) -> (cols, rows), into rows of `o_stride` elements starting
+/// at column `o_off`.
 ///
 /// The output pitch is the caller's: the attention GEMM reads `K^T` with
 /// `vec4` loads, which needs every output row 16-byte aligned, so the host
 /// pads the pitch to a multiple of 4 and the columns `rows..o_stride` keep
-/// nothing the model reads.
+/// nothing the model reads. The offsets are what let the loader stream a
+/// checkpoint through one staging buffer: `a_off` picks a row of the source
+/// and `o_off` the columns the three fused `qkv` projections land in.
 pub(crate) fn transpose() -> String {
     r#"
 struct Cfg {
     rows: u32, cols: u32, a_stride: u32, a_off: u32,
-    o_stride: u32, _p0: u32, _p1: u32, _p2: u32,
+    o_stride: u32, o_off: u32, _p1: u32, _p2: u32,
 }
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read_write> o: array<f32>;
@@ -619,7 +622,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = gid.x;
     let c = gid.y;
     if (r < cfg.rows && c < cfg.cols) {
-        o[c * cfg.o_stride + r] = a[cfg.a_off + r * cfg.a_stride + c];
+        o[cfg.o_off + c * cfg.o_stride + r] = a[cfg.a_off + r * cfg.a_stride + c];
     }
 }
 "#
@@ -1261,7 +1264,7 @@ mod tests {
             }
         }
 
-        // ---- transpose writes into the padded output pitch
+        // ---- transpose writes into the padded output pitch at `o_off`
         {
             let tpipe = pipeline(&gpu, "t-transpose", &transpose());
             let (rows, cols, a_stride, a_off, o_stride) = (5usize, 3usize, 7usize, 2usize, 8usize);
@@ -1269,45 +1272,52 @@ mod tests {
                 .map(|i| i as f32 + 0.5)
                 .collect();
             let a_buf = storage_f32(&gpu, "t-tr-a", &a);
-            let o_buf = storage_f32(&gpu, "t-tr-o", &vec![-1.0f32; cols * o_stride]);
-            let uni = uniform_u32(
-                &gpu,
-                "t-tr-u",
-                &[
-                    rows as u32,
-                    cols as u32,
-                    a_stride as u32,
-                    a_off as u32,
-                    o_stride as u32,
-                    0,
-                    0,
-                    0,
-                ],
-            );
-            run(
-                &gpu,
-                &tpipe,
-                &[bind(0, &a_buf), bind(1, &o_buf), bind(2, &uni)],
-                (rows as u32).div_ceil(16),
-                (cols as u32).div_ceil(16),
-            );
-            let o = read(&gpu, &o_buf, cols * o_stride);
-            for r in 0..rows {
-                for c in 0..cols {
-                    assert_eq!(
-                        o[c * o_stride + r],
-                        a[a_off + r * a_stride + c],
-                        "transpose [{r},{c}]"
-                    );
+            // 0 is the `K^T` case; a non-zero one is the second of the three
+            // fused `qkv` projections, which the loader writes into one
+            // buffer at column offsets. A dropped offset overwrites `q`
+            // with `k` and still passes an all-zero test.
+            for o_off in [0usize, rows] {
+                let n = o_off + cols * o_stride;
+                let o_buf = storage_f32(&gpu, "t-tr-o", &vec![-1.0f32; n]);
+                let uni = uniform_u32(
+                    &gpu,
+                    "t-tr-u",
+                    &[
+                        rows as u32,
+                        cols as u32,
+                        a_stride as u32,
+                        a_off as u32,
+                        o_stride as u32,
+                        o_off as u32,
+                        0,
+                        0,
+                    ],
+                );
+                run(
+                    &gpu,
+                    &tpipe,
+                    &[bind(0, &a_buf), bind(1, &o_buf), bind(2, &uni)],
+                    (rows as u32).div_ceil(16),
+                    (cols as u32).div_ceil(16),
+                );
+                let o = read(&gpu, &o_buf, n);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        assert_eq!(
+                            o[o_off + c * o_stride + r],
+                            a[a_off + r * a_stride + c],
+                            "transpose [{r},{c}] at o_off {o_off}"
+                        );
+                    }
                 }
-            }
-            for c in 0..cols {
-                for r in rows..o_stride {
-                    assert_eq!(
-                        o[c * o_stride + r],
-                        -1.0,
-                        "transpose wrote padding [{c},{r}]"
-                    );
+                for c in 0..cols {
+                    for r in rows..o_stride {
+                        assert_eq!(
+                            o[o_off + c * o_stride + r],
+                            -1.0,
+                            "transpose wrote padding [{c},{r}] at o_off {o_off}"
+                        );
+                    }
                 }
             }
         }
