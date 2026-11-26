@@ -519,6 +519,15 @@ impl Gpu {
         self.features.contains(wgpu::Features::SUBGROUP)
     }
 
+    /// Whether a kernel may fold 8 consecutive lanes with `subgroupShuffleXor`.
+    ///
+    /// That needs the feature *and* a minimum subgroup width of 8, and it
+    /// honours `CTC_SUBGROUPS=0` through [`subgroup_mode`](Self::subgroup_mode),
+    /// so the no-subgroup build can be exercised on a device that has them.
+    pub fn has_subgroup_8(&self) -> bool {
+        self.subgroup_mode() != SubgroupMode::None && self.info.subgroup_min_size >= 8
+    }
+
     /// The largest storage buffer this device can both allocate and bind.
     ///
     /// WebGPU lets `max_buffer_size` and `max_storage_buffer_binding_size`

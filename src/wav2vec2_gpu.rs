@@ -453,17 +453,19 @@ fn resolve_f32_gemm_variant(
 /// What `CTC_FLASH_ATTN` says about the fused attention path.
 ///
 /// `head_dim` is a hard gate: the kernel is written for the 64-wide head every
-/// Wav2Vec2 checkpoint uses. `auto` keeps the tuned materialised path where it
-/// fits and performs (this P104 at 30 s) and engages wherever it cannot: a
-/// `scores` tensor past the binding limit, or a window past the size cap. The
-/// decision stays on those physical constraints — an adapter that merely
-/// advertises `f16` says nothing about how fast it runs the fused kernel.
+/// Wav2Vec2 checkpoint uses. `auto` selects the fused kernel whenever the
+/// adapter built the fast 64x32 subgroup schedule (`flash_fast` — 105 ms vs
+/// 145 ms materialised on P104-100 while saving 176–625 MiB of VRAM), or
+/// whenever the materialised `scores` tensor would exceed the binding limit or
+/// size cap. Adapters falling back to the 16 KiB tile or the subgroup-less
+/// fold keep the materialised path while `scores` fits.
 fn resolve_flash_attn(
     env_val: Option<&str>,
     head_dim: usize,
     scores_bytes: u64,
     max_binding: u64,
     scores_exceeds_cap: bool,
+    flash_fast: bool,
 ) -> bool {
     if head_dim != shaders::FLASH_HEAD_DIM as usize {
         return false;
@@ -476,7 +478,7 @@ fn resolve_flash_attn(
     {
         "0" | "false" | "off" => false,
         "1" | "true" | "on" => true,
-        _ => scores_bytes > max_binding || scores_exceeds_cap,
+        _ => flash_fast || scores_bytes > max_binding || scores_exceeds_cap,
     }
 }
 
@@ -562,6 +564,10 @@ pub(crate) struct GpuModel {
     /// The positional conv's M tile, likewise read off the compiled kernel:
     /// an adapter under 26 KiB of workgroup storage runs the 64-frame tile.
     pos_mt: u32,
+    /// Query rows the fused attention kernel owns per workgroup: 64 on an
+    /// adapter with 32 KiB of workgroup storage, else 32. Read off the source
+    /// [`shaders::flash_attn`] built, so the grid always matches the tile.
+    flash_bq: u32,
     /// Staging recycled across windows. Two sets: the one being copied and
     /// the one being collected. A window above 16 MB uses the transfer queue
     /// when the device has one. The hidden readback (~7 MB) stays on wgpu's
@@ -734,13 +740,16 @@ impl GpuModel {
         } else {
             gemm64.clone()
         };
-        // 16 KiB of shared memory is exactly WebGPU's floor, so this only
-        // drops out on an adapter below the spec — and then the materialised
-        // path is what runs, not a failed model load.
-        let flash_attn = if max_storage >= 16 * 1024 {
-            Some(mk(&shaders::flash_attn(), "flash_attn")?)
+        // The fused attention tile is sized to the adapter: 32 KiB of
+        // workgroup storage where it exists, 14,336 B down to WebGPU's 16 KiB
+        // floor. Below that the materialised path is what runs, not a failed
+        // model load. Every shared slot it reads is written first, so the
+        // WebGPU workgroup zero is skipped like the GEMM's.
+        let (flash_attn, flash_bq) = if max_storage >= 16 * 1024 {
+            let (src, bq) = shaders::flash_attn(max_storage, gpu.has_subgroup_8());
+            (Some(mk_gemm(&src, "flash_attn")?), bq)
         } else {
-            None
+            (None, shaders::FLASH_BQ_SMALL)
         };
         let pipes = Pipe {
             gemm,
@@ -1085,6 +1094,7 @@ impl GpuModel {
             gemm_f32_mt,
             gemm_f32_nt,
             pos_mt,
+            flash_bq,
             readback: std::sync::Mutex::new(Vec::new()),
             xfer: std::sync::OnceLock::new(),
             conv0_w,
@@ -1768,6 +1778,7 @@ impl GpuModel {
         // the `scores` tensor, and with it the window limit those checks are
         // about. `auto` therefore engages exactly where the materialised path
         // would have refused or underperformed.
+        let flash_fast = self.flash_bq == shaders::FLASH_BQ_LARGE && gpu.has_subgroup_8();
         let use_flash = self.pipes.flash_attn.is_some()
             && resolve_flash_attn(
                 std::env::var("CTC_FLASH_ATTN").ok().as_deref(),
@@ -1775,6 +1786,7 @@ impl GpuModel {
                 scores_bytes,
                 max_binding,
                 scores_n > 200_000_000,
+                flash_fast,
             );
         if !use_flash && scores_n > 200_000_000 {
             anyhow::bail!(
@@ -2262,7 +2274,7 @@ impl GpuModel {
                             scale: attn_scale,
                             ..Default::default()
                         },
-                        t_rows.div_ceil(shaders::FLASH_BQ),
+                        t_rows.div_ceil(self.flash_bq),
                         heads as u32,
                         bind!(0, &act.qkv),
                         bind!(1, &act.attn_o),
@@ -3388,33 +3400,64 @@ mod tests {
     }
 
     #[test]
-    fn fused_attention_engages_where_the_scores_tensor_cannot() {
+    fn fused_attention_engages_on_fast_schedule_or_binding_overflow() {
         let head_dim = FLASH_HEAD_DIM as usize;
         let mib = 1u64 << 20;
         // 30 s: 144 MB of scores, well inside this adapter's 2047 MB binding.
         let normal = 144_000_000u64;
+        // Without the fast 64x32 subgroup schedule, `auto` keeps materialised
+        // while scores fit, and engages whenever they cannot.
         assert!(!resolve_flash_attn(
             None,
             head_dim,
             normal,
             2047 * mib,
-            false
+            false,
+            false,
         ));
-        // The same window on a device whose binding limit is below it.
-        assert!(resolve_flash_attn(None, head_dim, normal, 64 * mib, false));
-        // A window past the hard size cap.
-        assert!(resolve_flash_attn(None, head_dim, normal, 2047 * mib, true));
-        // An f16-capable adapter changes nothing on `auto`: the fused path is
-        // selected by what cannot be bound, never by a feature probe.
+        assert!(resolve_flash_attn(
+            None,
+            head_dim,
+            normal,
+            64 * mib,
+            false,
+            false,
+        ));
+        assert!(resolve_flash_attn(
+            None,
+            head_dim,
+            normal,
+            2047 * mib,
+            true,
+            false,
+        ));
+        // With the fast 64x32 subgroup schedule, `auto` prefers fused attention
+        // on normal windows too.
         for auto in [None, Some("auto"), Some(""), Some("f16")] {
             assert!(!resolve_flash_attn(
                 auto,
                 head_dim,
                 normal,
                 2047 * mib,
-                false
+                false,
+                false,
             ));
-            assert!(resolve_flash_attn(auto, head_dim, normal, 64 * mib, false));
+            assert!(resolve_flash_attn(
+                auto,
+                head_dim,
+                normal,
+                2047 * mib,
+                false,
+                true,
+            ));
+            assert!(resolve_flash_attn(
+                auto,
+                head_dim,
+                normal,
+                64 * mib,
+                false,
+                false,
+            ));
         }
         // Explicit switches win in both directions.
         for on in ["1", "true", "on"] {
@@ -3423,11 +3466,19 @@ mod tests {
                 head_dim,
                 normal,
                 2047 * mib,
-                false
+                false,
+                false,
             ));
         }
         for off in ["0", "false", "off"] {
-            assert!(!resolve_flash_attn(Some(off), head_dim, 1 << 40, 1, true));
+            assert!(!resolve_flash_attn(
+                Some(off),
+                head_dim,
+                1 << 40,
+                1,
+                true,
+                true,
+            ));
         }
         // The kernel is written for the 64-wide head of every Wav2Vec2
         // checkpoint; anything else keeps the materialised path.
@@ -3436,14 +3487,16 @@ mod tests {
             80,
             normal,
             2047 * mib,
-            false
+            false,
+            true,
         ));
         assert!(!resolve_flash_attn(
             Some("on"),
             32,
             normal,
             2047 * mib,
-            false
+            false,
+            true,
         ));
     }
 
@@ -3554,9 +3607,7 @@ mod tests {
 
         let (rows, cols) = (19usize, 13usize);
         let mk_raw = |seed: f32| -> (Vec<f32>, RawTensor) {
-            let vals: Vec<f32> = (0..rows * cols)
-                .map(|k| seed + (k as f32) * 0.25)
-                .collect();
+            let vals: Vec<f32> = (0..rows * cols).map(|k| seed + (k as f32) * 0.25).collect();
             let bytes: Vec<u8> = vals.iter().flat_map(|f| f.to_le_bytes()).collect();
             (
                 vals,

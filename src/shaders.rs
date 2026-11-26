@@ -655,43 +655,147 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     .to_string()
 }
 
-/// Query rows one FlashAttention workgroup owns. 32 queries × 16 keys ×
-/// 64 head dimensions is the largest tile that keeps every shared array
-/// inside WebGPU's 16 KiB floor.
-pub(crate) const FLASH_BQ: u32 = 32;
+/// Query rows one FlashAttention workgroup owns. The 32 KiB build (64 queries,
+/// 32 keys) is the fastest and runs wherever the adapter has the storage; the
+/// 16 KiB build (32 queries, 16 keys) is what keeps the fused path alive down
+/// to WebGPU's floor.
+pub(crate) const FLASH_BQ_SMALL: u32 = 32;
+pub(crate) const FLASH_BQ_LARGE: u32 = 64;
 pub(crate) const FLASH_HEAD_DIM: u32 = 64;
 
-/// Fused bidirectional attention: `softmax(q k^T * scale) v` per head,
-/// straight from the packed `qkv` buffer and straight into the output.
+/// Workgroup storage [`flash_attn`] asks for at `max_storage`: 32,768 B for
+/// the 64x32 tile (`sq4` 16,384 + `skv4` 8,192 + `sp4` 8,192) and 14,336 B for
+/// the 32x16 one (`sq4` 8,192 + `skv4` 4,096 + `sp2` 2,048). Both are exact:
+/// every tile is padded only by the XOR swizzle, never by dead columns.
+pub(crate) fn flash_attn_shared_bytes(max_storage: u32) -> u32 {
+    if max_storage >= 32 * 1024 {
+        64 * 16 * 16 + 32 * 16 * 16 + 64 * 8 * 16
+    } else {
+        32 * 16 * 16 + 16 * 16 * 16 + 32 * 8 * 8
+    }
+}
+
+/// The cross-lane fold Phase B needs over the 8 `lx` lanes that share a query
+/// row. With 8-wide subgroups it is three butterfly `subgroupShuffleXor`
+/// steps; without them the P tile's own row is the scratch pad (zero extra
+/// workgroup storage), which costs two barriers per fold.
 ///
-/// The materialised path this replaces wrote a (heads, t, t_pad) scores
-/// tensor, transposed K into a second buffer, read the scores back through a
-/// softmax kernel and then through the PV GEMM: 176–625 MiB of `scores` and
-/// 16.8 GB of traffic per 30 s window. Here the scores never leave shared
-/// memory and neither K nor V is ever transposed — the tile is loaded as
-/// `vec4`s along the 64-wide head dimension, which is the layout `qkv`
-/// already has.
+/// `vars` are the per-row registers (`bm0..`, `bl0..`) and `sp` the P array:
+/// the store, the read after it and the read's own barrier are what keep the
+/// array from being both at once.
+fn flash_fold(vars: &[&str], sp: &str, subgroup: bool, max: bool) -> String {
+    let row = |m: usize| {
+        if m == 0 {
+            "ly".to_string()
+        } else {
+            format!("ly + {}u", 16 * m)
+        }
+    };
+    let mut s = String::new();
+    if subgroup {
+        for v in vars {
+            for mask in [4u32, 2, 1] {
+                if max {
+                    s.push_str(&format!(
+                        "        {v} = max({v}, subgroupShuffleXor({v}, {mask}u));\n"
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "        {v} = {v} + subgroupShuffleXor({v}, {mask}u);\n"
+                    ));
+                }
+            }
+        }
+        return s;
+    }
+    for (m, v) in vars.iter().enumerate() {
+        s.push_str(&format!("        {sp}[({}) * 8u + lx].x = {v};\n", row(m)));
+    }
+    s.push_str("        workgroupBarrier();\n");
+    for (m, v) in vars.iter().enumerate() {
+        let (init, step) = if max {
+            (
+                "-3.4e38",
+                format!("max({v}, {sp}[({}) * 8u + j].x)", row(m)),
+            )
+        } else {
+            ("0.0", format!("{v} + {sp}[({}) * 8u + j].x", row(m)))
+        };
+        s.push_str(&format!("        {v} = {init};\n"));
+        s.push_str("        for (var j = 0u; j < 8u; j = j + 1u) {\n");
+        s.push_str(&format!("            {v} = {step};\n"));
+        s.push_str("        }\n");
+    }
+    s.push_str("        workgroupBarrier();\n");
+    s
+}
+
+/// Fused bidirectional attention: `softmax(q k^T * scale) v` per head, straight
+/// from the packed `qkv` buffer and straight into the output.
 ///
-/// One workgroup is 16×16 threads handling 32 queries of one head: thread
-/// `lid.y` owns query rows `lid.y` and `lid.y + 16`, thread `lid.x` owns
-/// dimension `vec4` `lid.x` of the output and key `lid.x` of the score tile.
+/// The materialised path this replaces wrote a (heads, t, t_pad) scores tensor,
+/// transposed K into a second buffer, read the scores back through a softmax
+/// kernel and then through the PV GEMM. Here the scores never leave the
+/// workgroup: a block of queries stays in shared memory across every key tile,
+/// so `q` is read once from global and every `vec4` load feeds eight to eleven
+/// FMAs.
 ///
-/// Shared memory is exactly 16,384 B:
+/// Sizing is the adapter's call. `bq` is 64 queries x 32 keys (32,768 B of
+/// workgroup storage) wherever the adapter has that much, and 32 x 16
+/// (14,336 B) down to WebGPU's 16 KiB floor. The rest of this comment describes
+/// the 64x32 build; the 32x16 one is the same kernel with half the rows, half
+/// the keys per thread and `vec2` key groups.
 ///
-/// * `sq`  32 × 16 `vec4` = 8,192 B, this block's queries;
-/// * `skv` 16 × 16 `vec4` = 4,096 B, the key tile, reused for the values;
-/// * `sp`  32 × 16 `f32`   = 2,048 B, raw `q·k * scale`;
-/// * `sp_p` 32 × 16 `f32`  = 2,048 B, `exp(s - m_new)`.
+/// ## Thread mapping
 ///
-/// `sp` and `sp_p` are separate arrays on purpose: the row max reads every
-/// entry of `sp` while the same pass writes `sp_p`, so one array would need a
-/// further barrier between the two.
+/// `@workgroup_size(128)` is deliberately 1-D: `lid.x` then maps linearly into
+/// subgroups on every backend, so the 8 lanes `lx = lid.x & 7` that share a
+/// query row (`ly = lid.x >> 3`) are one aligned 8-lane group whenever
+/// `subgroup_min_size >= 8`, and the row reductions are three `shuffleXor`
+/// steps with no barrier. Each thread owns 4 query rows (`ly + 16m`), 4
+/// contiguous keys (`lx * 4 + n`) and 2 output `vec4` columns (`lx`, `lx + 8`),
+/// i.e. 16 score accumulators and 8 output accumulators in registers.
 ///
-/// Masked keys score `-3.4e38`, never `-inf`: `exp(-3.4e38)` is 0 while
-/// `exp(-inf - -inf)` is a NaN. A row whose `m` is still the sentinel has no
-/// prior block, and `select` gives it `alpha = 0`.
-pub(crate) fn flash_attn() -> String {
-    r#"
+/// ## Shared memory (32,768 B, no padding columns)
+///
+/// * `sq4[q * 16 + (d4 ^ (q & 7))]`: the 64 queries, transposed so a `vec4` is
+///   4 head dimensions. Phase A reads it as an 8-lane broadcast (the 8 lanes
+///   of a row group all want the same `vec4`), which is conflict-free with or
+///   without the XOR: the swizzle is kept so all three tiles share one
+///   indexing rule, and costs one XOR hoisted out of the `d4` loop.
+/// * `skv4[k * 16 + (d4 ^ (k >> 2))]`: the 32-key tile, K first and then the
+///   same slots refilled with V. `k >> 2` is 0..7 over the tile, so in phase A
+///   (`k = lx * 4 + n`) the swizzle is `d4 ^ lx` for all four of a thread's
+///   keys, and in phase C (`k = k4 * 4 + c`) it is `k4`, both hoisted out of
+///   the inner loop. The 8 lanes of a row group then read 8 distinct 16-byte
+///   banks and the other three quarters of the warp read the same 8 for their
+///   own rows: conflict-free either way.
+/// * `sp4[q * 8 + (k4 ^ (q & 3))]`: `exp(s - m)` as `vec4`s, one per 4 keys.
+///   `(q & 3)` is `ly & 3` for all four rows, so the read side hoists it too.
+///
+/// ## Barriers
+///
+/// Four per 32 keys: K staged, phase A done (so V may overwrite it), V staged
+/// with phase B folded in, phase C done (so the next K may overwrite it). V
+/// loading overlaps the softmax, and the P tile is written in the same window
+/// as the V tile, so both are covered by the one barrier between them. The
+/// subgroup-less fold adds a barrier on each side of its two reads.
+pub(crate) fn flash_attn(max_storage: u32, use_subgroup_8: bool) -> (String, u32) {
+    let shared = flash_attn_shared_bytes(max_storage);
+    assert!(
+        shared <= max_storage,
+        "flash attention needs {shared} B of workgroup storage, adapter has {max_storage}"
+    );
+    if max_storage >= 32 * 1024 {
+        (flash_attn_large(use_subgroup_8), FLASH_BQ_LARGE)
+    } else {
+        (flash_attn_small(use_subgroup_8), FLASH_BQ_SMALL)
+    }
+}
+
+/// The 64-query, 32-key build: 32,768 B of workgroup storage.
+fn flash_attn_large(subgroup: bool) -> String {
+    const BODY: &str = r#"
 struct FlashAttnCfg {
     t: u32,
     heads: u32,
@@ -709,130 +813,542 @@ struct FlashAttnCfg {
 @group(0) @binding(1) var<storage, read_write> out4: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> cfg: FlashAttnCfg;
 
-var<workgroup> sq: array<vec4<f32>, 512u>;
-var<workgroup> skv: array<vec4<f32>, 256u>;
-var<workgroup> sp: array<f32, 512u>;
-var<workgroup> sp_p: array<f32, 512u>;
+var<workgroup> sq4: array<vec4<f32>, 1024u>;    // 64 x 16, 16,384 B
+var<workgroup> skv4: array<vec4<f32>, 512u>;    // 32 x 16,  8,192 B
+var<workgroup> sp4: array<vec4<f32>, 512u>;     // 64 x 8,   8,192 B
 
-@compute @workgroup_size(16, 16)
+@compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
+    let lx = lid.x & 7u;
+    let ly = lid.x >> 3u;
+    // tile loader: 8 rows x 16 vec4 columns per pass
+    let r0 = lid.x >> 4u;
+    let c4 = lid.x & 15u;
     let head = wid.y;
-    let q0 = wid.x * 32u + lid.y;
-    let q1 = q0 + 16u;
+    let q_base = wid.x * 64u;
+    let row = 3u * cfg.hidden4;
+    let q_off = head * 16u;
+    let k_off = cfg.hidden4 + head * 16u;
+    let v_off = 2u * cfg.hidden4 + head * 16u;
+
+    // ---- prologue: this block's 64 queries, zero-padded past t
+    for (var u = 0u; u < 8u; u = u + 1u) {
+        let qr = r0 + u * 8u;
+        let gq = q_base + qr;
+        var qv = vec4<f32>(0.0);
+        if (gq < cfg.t) {
+            qv = qkv4[gq * row + q_off + c4];
+        }
+        sq4[qr * 16u + (c4 ^ (qr & 7u))] = qv;
+    }
+
+    var o00 = vec4<f32>(0.0);
+    var o01 = vec4<f32>(0.0);
+    var o10 = vec4<f32>(0.0);
+    var o11 = vec4<f32>(0.0);
+    var o20 = vec4<f32>(0.0);
+    var o21 = vec4<f32>(0.0);
+    var o30 = vec4<f32>(0.0);
+    var o31 = vec4<f32>(0.0);
+    var m0 = -3.4e38;
+    var l0 = 0.0;
+    var m1 = -3.4e38;
+    var l1 = 0.0;
+    var m2 = -3.4e38;
+    var l2 = 0.0;
+    var m3 = -3.4e38;
+    var l3 = 0.0;
+
+    // no barrier here: the K stage below is the first thing phase A reads
+    // after, and it carries its own.
+    let ktiles = (cfg.t + 31u) / 32u;
+    for (var kt = 0u; kt < ktiles; kt = kt + 1u) {
+        let k0 = kt * 32u;
+
+        // ---- K tile, key-major and swizzled by key group
+        for (var u = 0u; u < 4u; u = u + 1u) {
+            let kr = r0 + u * 8u;
+            let gk = k0 + kr;
+            var kv = vec4<f32>(0.0);
+            if (gk < cfg.t) {
+                kv = qkv4[gk * row + k_off + c4];
+            }
+            skv4[kr * 16u + (c4 ^ (kr >> 2u))] = kv;
+        }
+        workgroupBarrier();
+
+        // ---- A: 4 queries x 4 keys = 16 scores. `qs` is shared by the four
+        //      rows ((q & 7) == (ly & 7)) and `ks` by the four keys
+        //      ((k >> 2) == lx), so each d4 costs two XORs and 8 loads.
+        //      The dots are spelled out one component at a time rather than
+        //      written `dot(q, k)`: both reach the driver as `OpDot`, but the
+        //      mul-add chain is what contracts into four FFMAs without the
+        //      driver having to take `OpDot` apart (1.7% on a P104-100).
+        var s00 = 0.0;
+        var s01 = 0.0;
+        var s02 = 0.0;
+        var s03 = 0.0;
+        var s10 = 0.0;
+        var s11 = 0.0;
+        var s12 = 0.0;
+        var s13 = 0.0;
+        var s20 = 0.0;
+        var s21 = 0.0;
+        var s22 = 0.0;
+        var s23 = 0.0;
+        var s30 = 0.0;
+        var s31 = 0.0;
+        var s32 = 0.0;
+        var s33 = 0.0;
+        for (var d4 = 0u; d4 < 16u; d4 = d4 + 1u) {
+            let qs = d4 ^ (ly & 7u);
+            let ks = d4 ^ lx;
+            let kv0 = skv4[lx * 64u + ks];
+            let kv1 = skv4[lx * 64u + 16u + ks];
+            let kv2 = skv4[lx * 64u + 32u + ks];
+            let kv3 = skv4[lx * 64u + 48u + ks];
+            let qv0 = sq4[ly * 16u + qs];
+            s00 = s00 + qv0.x * kv0.x;
+            s00 = s00 + qv0.y * kv0.y;
+            s00 = s00 + qv0.z * kv0.z;
+            s00 = s00 + qv0.w * kv0.w;
+            s01 = s01 + qv0.x * kv1.x;
+            s01 = s01 + qv0.y * kv1.y;
+            s01 = s01 + qv0.z * kv1.z;
+            s01 = s01 + qv0.w * kv1.w;
+            s02 = s02 + qv0.x * kv2.x;
+            s02 = s02 + qv0.y * kv2.y;
+            s02 = s02 + qv0.z * kv2.z;
+            s02 = s02 + qv0.w * kv2.w;
+            s03 = s03 + qv0.x * kv3.x;
+            s03 = s03 + qv0.y * kv3.y;
+            s03 = s03 + qv0.z * kv3.z;
+            s03 = s03 + qv0.w * kv3.w;
+            let qv1 = sq4[(ly + 16u) * 16u + qs];
+            s10 = s10 + qv1.x * kv0.x;
+            s10 = s10 + qv1.y * kv0.y;
+            s10 = s10 + qv1.z * kv0.z;
+            s10 = s10 + qv1.w * kv0.w;
+            s11 = s11 + qv1.x * kv1.x;
+            s11 = s11 + qv1.y * kv1.y;
+            s11 = s11 + qv1.z * kv1.z;
+            s11 = s11 + qv1.w * kv1.w;
+            s12 = s12 + qv1.x * kv2.x;
+            s12 = s12 + qv1.y * kv2.y;
+            s12 = s12 + qv1.z * kv2.z;
+            s12 = s12 + qv1.w * kv2.w;
+            s13 = s13 + qv1.x * kv3.x;
+            s13 = s13 + qv1.y * kv3.y;
+            s13 = s13 + qv1.z * kv3.z;
+            s13 = s13 + qv1.w * kv3.w;
+            let qv2 = sq4[(ly + 32u) * 16u + qs];
+            s20 = s20 + qv2.x * kv0.x;
+            s20 = s20 + qv2.y * kv0.y;
+            s20 = s20 + qv2.z * kv0.z;
+            s20 = s20 + qv2.w * kv0.w;
+            s21 = s21 + qv2.x * kv1.x;
+            s21 = s21 + qv2.y * kv1.y;
+            s21 = s21 + qv2.z * kv1.z;
+            s21 = s21 + qv2.w * kv1.w;
+            s22 = s22 + qv2.x * kv2.x;
+            s22 = s22 + qv2.y * kv2.y;
+            s22 = s22 + qv2.z * kv2.z;
+            s22 = s22 + qv2.w * kv2.w;
+            s23 = s23 + qv2.x * kv3.x;
+            s23 = s23 + qv2.y * kv3.y;
+            s23 = s23 + qv2.z * kv3.z;
+            s23 = s23 + qv2.w * kv3.w;
+            let qv3 = sq4[(ly + 48u) * 16u + qs];
+            s30 = s30 + qv3.x * kv0.x;
+            s30 = s30 + qv3.y * kv0.y;
+            s30 = s30 + qv3.z * kv0.z;
+            s30 = s30 + qv3.w * kv0.w;
+            s31 = s31 + qv3.x * kv1.x;
+            s31 = s31 + qv3.y * kv1.y;
+            s31 = s31 + qv3.z * kv1.z;
+            s31 = s31 + qv3.w * kv1.w;
+            s32 = s32 + qv3.x * kv2.x;
+            s32 = s32 + qv3.y * kv2.y;
+            s32 = s32 + qv3.z * kv2.z;
+            s32 = s32 + qv3.w * kv2.w;
+            s33 = s33 + qv3.x * kv3.x;
+            s33 = s33 + qv3.y * kv3.y;
+            s33 = s33 + qv3.z * kv3.z;
+            s33 = s33 + qv3.w * kv3.w;
+        }
+        workgroupBarrier();
+
+        // ---- B: rescale, mask, row max over the 8 lanes, exp, row sum. The
+        //      V tile streams in while this runs: it is the only barrier
+        //      between the K reads of phase A and the V overwrite.
+        for (var u = 0u; u < 4u; u = u + 1u) {
+            let kr = r0 + u * 8u;
+            let gk = k0 + kr;
+            var vv = vec4<f32>(0.0);
+            if (gk < cfg.t) {
+                vv = qkv4[gk * row + v_off + c4];
+            }
+            skv4[kr * 16u + (c4 ^ (kr >> 2u))] = vv;
+        }
+        let kb = k0 + lx * 4u;
+        let k0ok = kb < cfg.t;
+        let k1ok = kb + 1u < cfg.t;
+        let k2ok = kb + 2u < cfg.t;
+        let k3ok = kb + 3u < cfg.t;
+        s00 = select(-3.4e38, s00 * cfg.scale, k0ok);
+        s01 = select(-3.4e38, s01 * cfg.scale, k1ok);
+        s02 = select(-3.4e38, s02 * cfg.scale, k2ok);
+        s03 = select(-3.4e38, s03 * cfg.scale, k3ok);
+        s10 = select(-3.4e38, s10 * cfg.scale, k0ok);
+        s11 = select(-3.4e38, s11 * cfg.scale, k1ok);
+        s12 = select(-3.4e38, s12 * cfg.scale, k2ok);
+        s13 = select(-3.4e38, s13 * cfg.scale, k3ok);
+        s20 = select(-3.4e38, s20 * cfg.scale, k0ok);
+        s21 = select(-3.4e38, s21 * cfg.scale, k1ok);
+        s22 = select(-3.4e38, s22 * cfg.scale, k2ok);
+        s23 = select(-3.4e38, s23 * cfg.scale, k3ok);
+        s30 = select(-3.4e38, s30 * cfg.scale, k0ok);
+        s31 = select(-3.4e38, s31 * cfg.scale, k1ok);
+        s32 = select(-3.4e38, s32 * cfg.scale, k2ok);
+        s33 = select(-3.4e38, s33 * cfg.scale, k3ok);
+        var bm0 = max(max(s00, s01), max(s02, s03));
+        var bm1 = max(max(s10, s11), max(s12, s13));
+        var bm2 = max(max(s20, s21), max(s22, s23));
+        var bm3 = max(max(s30, s31), max(s32, s33));
+/*FOLD_MAX*/
+        let mn0 = max(m0, bm0);
+        let mn1 = max(m1, bm1);
+        let mn2 = max(m2, bm2);
+        let mn3 = max(m3, bm3);
+        // a row with no prior key has no `exp` to carry: `select` gives it 0
+        let a0 = select(0.0, exp(m0 - mn0), m0 > -1.0e37);
+        let a1 = select(0.0, exp(m1 - mn1), m1 > -1.0e37);
+        let a2 = select(0.0, exp(m2 - mn2), m2 > -1.0e37);
+        let a3 = select(0.0, exp(m3 - mn3), m3 > -1.0e37);
+        let p00 = select(0.0, exp(s00 - mn0), k0ok);
+        let p01 = select(0.0, exp(s01 - mn0), k1ok);
+        let p02 = select(0.0, exp(s02 - mn0), k2ok);
+        let p03 = select(0.0, exp(s03 - mn0), k3ok);
+        let p10 = select(0.0, exp(s10 - mn1), k0ok);
+        let p11 = select(0.0, exp(s11 - mn1), k1ok);
+        let p12 = select(0.0, exp(s12 - mn1), k2ok);
+        let p13 = select(0.0, exp(s13 - mn1), k3ok);
+        let p20 = select(0.0, exp(s20 - mn2), k0ok);
+        let p21 = select(0.0, exp(s21 - mn2), k1ok);
+        let p22 = select(0.0, exp(s22 - mn2), k2ok);
+        let p23 = select(0.0, exp(s23 - mn2), k3ok);
+        let p30 = select(0.0, exp(s30 - mn3), k0ok);
+        let p31 = select(0.0, exp(s31 - mn3), k1ok);
+        let p32 = select(0.0, exp(s32 - mn3), k2ok);
+        let p33 = select(0.0, exp(s33 - mn3), k3ok);
+        var bl0 = p00 + p01 + p02 + p03;
+        var bl1 = p10 + p11 + p12 + p13;
+        var bl2 = p20 + p21 + p22 + p23;
+        var bl3 = p30 + p31 + p32 + p33;
+/*FOLD_SUM*/
+        l0 = l0 * a0 + bl0;
+        l1 = l1 * a1 + bl1;
+        l2 = l2 * a2 + bl2;
+        l3 = l3 * a3 + bl3;
+        m0 = mn0;
+        m1 = mn1;
+        m2 = mn2;
+        m3 = mn3;
+        o00 = o00 * a0;
+        o01 = o01 * a0;
+        o10 = o10 * a1;
+        o11 = o11 * a1;
+        o20 = o20 * a2;
+        o21 = o21 * a2;
+        o30 = o30 * a3;
+        o31 = o31 * a3;
+        let ps = lx ^ (ly & 3u);
+        sp4[ly * 8u + ps] = vec4<f32>(p00, p01, p02, p03);
+        sp4[(ly + 16u) * 8u + ps] = vec4<f32>(p10, p11, p12, p13);
+        sp4[(ly + 32u) * 8u + ps] = vec4<f32>(p20, p21, p22, p23);
+        sp4[(ly + 48u) * 8u + ps] = vec4<f32>(p30, p31, p32, p33);
+        workgroupBarrier();
+
+        // ---- C: O += P V over the 8 key groups. One `vec4` of weights per
+        //      row and 8 `vec4` of V per group: 128 FMAs per 12 loads.
+        for (var kg = 0u; kg < 8u; kg = kg + 1u) {
+            let pg = kg ^ (ly & 3u);
+            let p0 = sp4[ly * 8u + pg];
+            let p1 = sp4[(ly + 16u) * 8u + pg];
+            let p2 = sp4[(ly + 32u) * 8u + pg];
+            let p3 = sp4[(ly + 48u) * 8u + pg];
+            let vs0 = lx ^ kg;
+            let vs1 = (lx + 8u) ^ kg;
+            let base = kg * 64u;
+            let v00 = skv4[base + vs0];
+            let v01 = skv4[base + vs1];
+            o00 = o00 + p0.x * v00;
+            o01 = o01 + p0.x * v01;
+            o10 = o10 + p1.x * v00;
+            o11 = o11 + p1.x * v01;
+            o20 = o20 + p2.x * v00;
+            o21 = o21 + p2.x * v01;
+            o30 = o30 + p3.x * v00;
+            o31 = o31 + p3.x * v01;
+            let v10 = skv4[base + 16u + vs0];
+            let v11 = skv4[base + 16u + vs1];
+            o00 = o00 + p0.y * v10;
+            o01 = o01 + p0.y * v11;
+            o10 = o10 + p1.y * v10;
+            o11 = o11 + p1.y * v11;
+            o20 = o20 + p2.y * v10;
+            o21 = o21 + p2.y * v11;
+            o30 = o30 + p3.y * v10;
+            o31 = o31 + p3.y * v11;
+            let v20 = skv4[base + 32u + vs0];
+            let v21 = skv4[base + 32u + vs1];
+            o00 = o00 + p0.z * v20;
+            o01 = o01 + p0.z * v21;
+            o10 = o10 + p1.z * v20;
+            o11 = o11 + p1.z * v21;
+            o20 = o20 + p2.z * v20;
+            o21 = o21 + p2.z * v21;
+            o30 = o30 + p3.z * v20;
+            o31 = o31 + p3.z * v21;
+            let v30 = skv4[base + 48u + vs0];
+            let v31 = skv4[base + 48u + vs1];
+            o00 = o00 + p0.w * v30;
+            o01 = o01 + p0.w * v31;
+            o10 = o10 + p1.w * v30;
+            o11 = o11 + p1.w * v31;
+            o20 = o20 + p2.w * v30;
+            o21 = o21 + p2.w * v31;
+            o30 = o30 + p3.w * v30;
+            o31 = o31 + p3.w * v31;
+        }
+        workgroupBarrier();
+    }
+
+    // ---- epilogue: the normalised rows of the block that exist
+    let o_off = head * 16u + lx;
+    if (q_base + ly < cfg.t) {
+        out4[(q_base + ly) * cfg.hidden4 + o_off] = o00 / l0;
+        out4[(q_base + ly) * cfg.hidden4 + o_off + 8u] = o01 / l0;
+    }
+    if (q_base + ly + 16u < cfg.t) {
+        out4[(q_base + ly + 16u) * cfg.hidden4 + o_off] = o10 / l1;
+        out4[(q_base + ly + 16u) * cfg.hidden4 + o_off + 8u] = o11 / l1;
+    }
+    if (q_base + ly + 32u < cfg.t) {
+        out4[(q_base + ly + 32u) * cfg.hidden4 + o_off] = o20 / l2;
+        out4[(q_base + ly + 32u) * cfg.hidden4 + o_off + 8u] = o21 / l2;
+    }
+    if (q_base + ly + 48u < cfg.t) {
+        out4[(q_base + ly + 48u) * cfg.hidden4 + o_off] = o30 / l3;
+        out4[(q_base + ly + 48u) * cfg.hidden4 + o_off + 8u] = o31 / l3;
+    }
+}
+"#;
+    BODY.replace(
+        "/*FOLD_MAX*/",
+        &flash_fold(&["bm0", "bm1", "bm2", "bm3"], "sp4", subgroup, true),
+    )
+    .replace(
+        "/*FOLD_SUM*/",
+        &flash_fold(&["bl0", "bl1", "bl2", "bl3"], "sp4", subgroup, false),
+    )
+}
+
+/// The 32-query, 16-key build: 14,336 B of workgroup storage, under WebGPU's
+/// 16 KiB floor. Same schedule as [`flash_attn_large`] with half the rows, two
+/// keys per thread and `vec2` key groups.
+fn flash_attn_small(subgroup: bool) -> String {
+    const BODY: &str = r#"
+struct FlashAttnCfg {
+    t: u32,
+    heads: u32,
+    hidden4: u32,
+    _p0: u32,
+    scale: f32,
+    _p1: u32,
+    _p2: u32,
+    _p3: u32,
+}
+
+@group(0) @binding(0) var<storage, read> qkv4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> out4: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> cfg: FlashAttnCfg;
+
+var<workgroup> sq4: array<vec4<f32>, 512u>;     // 32 x 16, 8,192 B
+var<workgroup> skv4: array<vec4<f32>, 256u>;    // 16 x 16, 4,096 B
+var<workgroup> sp2: array<vec2<f32>, 256u>;     // 32 x 8,  2,048 B
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let lx = lid.x & 7u;
+    let ly = lid.x >> 3u;
+    let r0 = lid.x >> 4u;
+    let c4 = lid.x & 15u;
+    let head = wid.y;
+    let q_base = wid.x * 32u;
     let row = 3u * cfg.hidden4;
     let q_off = head * 16u;
     let k_off = cfg.hidden4 + head * 16u;
     let v_off = 2u * cfg.hidden4 + head * 16u;
 
     // ---- prologue: this block's 32 queries, zero-padded past t
-    if (q0 < cfg.t) {
-        sq[lid.y * 16u + lid.x] = qkv4[q0 * row + q_off + lid.x];
-    } else {
-        sq[lid.y * 16u + lid.x] = vec4<f32>(0.0);
-    }
-    if (q1 < cfg.t) {
-        sq[(lid.y + 16u) * 16u + lid.x] = qkv4[q1 * row + q_off + lid.x];
-    } else {
-        sq[(lid.y + 16u) * 16u + lid.x] = vec4<f32>(0.0);
+    for (var u = 0u; u < 4u; u = u + 1u) {
+        let qr = r0 + u * 8u;
+        let gq = q_base + qr;
+        var qv = vec4<f32>(0.0);
+        if (gq < cfg.t) {
+            qv = qkv4[gq * row + q_off + c4];
+        }
+        sq4[qr * 16u + (c4 ^ (qr & 7u))] = qv;
     }
 
-    var o0 = vec4<f32>(0.0);
-    var o1 = vec4<f32>(0.0);
+    var o00 = vec4<f32>(0.0);
+    var o01 = vec4<f32>(0.0);
+    var o10 = vec4<f32>(0.0);
+    var o11 = vec4<f32>(0.0);
     var m0 = -3.4e38;
     var l0 = 0.0;
     var m1 = -3.4e38;
     var l1 = 0.0;
-    workgroupBarrier();
 
     let ktiles = (cfg.t + 15u) / 16u;
     for (var kt = 0u; kt < ktiles; kt = kt + 1u) {
         let k0 = kt * 16u;
-        let krow = k0 + lid.y;
 
-        // ---- K tile (column-major in `skv`: key, then dimension)
-        if (krow < cfg.t) {
-            skv[lid.y * 16u + lid.x] = qkv4[krow * row + k_off + lid.x];
-        } else {
-            skv[lid.y * 16u + lid.x] = vec4<f32>(0.0);
+        // ---- K tile
+        for (var u = 0u; u < 2u; u = u + 1u) {
+            let kr = r0 + u * 8u;
+            let gk = k0 + kr;
+            var kv = vec4<f32>(0.0);
+            if (gk < cfg.t) {
+                kv = qkv4[gk * row + k_off + c4];
+            }
+            skv4[kr * 16u + (c4 ^ (kr >> 1u))] = kv;
         }
         workgroupBarrier();
 
-        // ---- A: s = q . k, thread (lid.x, lid.y) fills key lid.x of rows
-        //      lid.y and lid.y + 16
-        var s0 = 0.0;
-        var s1 = 0.0;
-        for (var d = 0u; d < 16u; d = d + 1u) {
-            let kv = skv[lid.x * 16u + d];
-            s0 = s0 + dot(sq[lid.y * 16u + d], kv);
-            s1 = s1 + dot(sq[(lid.y + 16u) * 16u + d], kv);
+        // ---- A: 2 queries x 2 keys = 4 scores, spelled out like the 64x32
+        //      build's so both compile to the same four FFMAs per dot
+        var s00 = 0.0;
+        var s01 = 0.0;
+        var s10 = 0.0;
+        var s11 = 0.0;
+        for (var d4 = 0u; d4 < 16u; d4 = d4 + 1u) {
+            let qs = d4 ^ (ly & 7u);
+            let ks = d4 ^ lx;
+            let kv0 = skv4[lx * 32u + ks];
+            let kv1 = skv4[lx * 32u + 16u + ks];
+            let qv0 = sq4[ly * 16u + qs];
+            s00 = s00 + qv0.x * kv0.x;
+            s00 = s00 + qv0.y * kv0.y;
+            s00 = s00 + qv0.z * kv0.z;
+            s00 = s00 + qv0.w * kv0.w;
+            s01 = s01 + qv0.x * kv1.x;
+            s01 = s01 + qv0.y * kv1.y;
+            s01 = s01 + qv0.z * kv1.z;
+            s01 = s01 + qv0.w * kv1.w;
+            let qv1 = sq4[(ly + 16u) * 16u + qs];
+            s10 = s10 + qv1.x * kv0.x;
+            s10 = s10 + qv1.y * kv0.y;
+            s10 = s10 + qv1.z * kv0.z;
+            s10 = s10 + qv1.w * kv0.w;
+            s11 = s11 + qv1.x * kv1.x;
+            s11 = s11 + qv1.y * kv1.y;
+            s11 = s11 + qv1.z * kv1.z;
+            s11 = s11 + qv1.w * kv1.w;
         }
-        s0 = s0 * cfg.scale;
-        s1 = s1 * cfg.scale;
-        if (k0 + lid.x >= cfg.t) {
-            s0 = -3.4e38;
-            s1 = -3.4e38;
-        }
-        sp[lid.y * 16u + lid.x] = s0;
-        sp[(lid.y + 16u) * 16u + lid.x] = s1;
         workgroupBarrier();
 
-        // ---- B: V tile and the online softmax. `sp` is read here and `sp_p`
-        //      written, so no entry is both.
-        if (krow < cfg.t) {
-            skv[lid.y * 16u + lid.x] = qkv4[krow * row + v_off + lid.x];
-        } else {
-            skv[lid.y * 16u + lid.x] = vec4<f32>(0.0);
+        // ---- B: V tile, rescale, mask, row max, exp, row sum
+        for (var u = 0u; u < 2u; u = u + 1u) {
+            let kr = r0 + u * 8u;
+            let gk = k0 + kr;
+            var vv = vec4<f32>(0.0);
+            if (gk < cfg.t) {
+                vv = qkv4[gk * row + v_off + c4];
+            }
+            skv4[kr * 16u + (c4 ^ (kr >> 1u))] = vv;
         }
-        var bm0 = -3.4e38;
-        var bm1 = -3.4e38;
-        for (var j = 0u; j < 16u; j = j + 1u) {
-            bm0 = max(bm0, sp[lid.y * 16u + j]);
-            bm1 = max(bm1, sp[(lid.y + 16u) * 16u + j]);
-        }
-        let m0_new = max(m0, bm0);
-        let m1_new = max(m1, bm1);
-        let alpha0 = select(0.0, exp(m0 - m0_new), m0 > -1.0e37);
-        let alpha1 = select(0.0, exp(m1 - m1_new), m1 > -1.0e37);
-        let kvalid = k0 + lid.x < cfg.t;
-        sp_p[lid.y * 16u + lid.x] =
-            select(0.0, exp(sp[lid.y * 16u + lid.x] - m0_new), kvalid);
-        sp_p[(lid.y + 16u) * 16u + lid.x] =
-            select(0.0, exp(sp[(lid.y + 16u) * 16u + lid.x] - m1_new), kvalid);
+        let kb = k0 + lx * 2u;
+        let k0ok = kb < cfg.t;
+        let k1ok = kb + 1u < cfg.t;
+        s00 = select(-3.4e38, s00 * cfg.scale, k0ok);
+        s01 = select(-3.4e38, s01 * cfg.scale, k1ok);
+        s10 = select(-3.4e38, s10 * cfg.scale, k0ok);
+        s11 = select(-3.4e38, s11 * cfg.scale, k1ok);
+        var bm0 = max(s00, s01);
+        var bm1 = max(s10, s11);
+/*FOLD_MAX*/
+        let mn0 = max(m0, bm0);
+        let mn1 = max(m1, bm1);
+        let a0 = select(0.0, exp(m0 - mn0), m0 > -1.0e37);
+        let a1 = select(0.0, exp(m1 - mn1), m1 > -1.0e37);
+        let p00 = select(0.0, exp(s00 - mn0), k0ok);
+        let p01 = select(0.0, exp(s01 - mn0), k1ok);
+        let p10 = select(0.0, exp(s10 - mn1), k0ok);
+        let p11 = select(0.0, exp(s11 - mn1), k1ok);
+        var bl0 = p00 + p01;
+        var bl1 = p10 + p11;
+/*FOLD_SUM*/
+        l0 = l0 * a0 + bl0;
+        l1 = l1 * a1 + bl1;
+        m0 = mn0;
+        m1 = mn1;
+        o00 = o00 * a0;
+        o01 = o01 * a0;
+        o10 = o10 * a1;
+        o11 = o11 * a1;
+        let ps = lx ^ (ly & 3u);
+        sp2[ly * 8u + ps] = vec2<f32>(p00, p01);
+        sp2[(ly + 16u) * 8u + ps] = vec2<f32>(p10, p11);
         workgroupBarrier();
 
-        // ---- C: O = alpha * O + P V, with the row sums folded in
-        o0 = o0 * alpha0;
-        o1 = o1 * alpha1;
-        var bl0 = 0.0;
-        var bl1 = 0.0;
-        for (var j = 0u; j < 16u; j = j + 1u) {
-            let vv = skv[j * 16u + lid.x];
-            let p0 = sp_p[lid.y * 16u + j];
-            let p1 = sp_p[(lid.y + 16u) * 16u + j];
-            o0 = o0 + p0 * vv;
-            o1 = o1 + p1 * vv;
-            bl0 = bl0 + p0;
-            bl1 = bl1 + p1;
+        // ---- C: O += P V over the 8 key groups of 2 keys
+        for (var kg = 0u; kg < 8u; kg = kg + 1u) {
+            let pg = kg ^ (ly & 3u);
+            let p0 = sp2[ly * 8u + pg];
+            let p1 = sp2[(ly + 16u) * 8u + pg];
+            let vs0 = lx ^ kg;
+            let vs1 = (lx + 8u) ^ kg;
+            let base = kg * 32u;
+            let v00 = skv4[base + vs0];
+            let v01 = skv4[base + vs1];
+            o00 = o00 + p0.x * v00;
+            o01 = o01 + p0.x * v01;
+            o10 = o10 + p1.x * v00;
+            o11 = o11 + p1.x * v01;
+            let v10 = skv4[base + 16u + vs0];
+            let v11 = skv4[base + 16u + vs1];
+            o00 = o00 + p0.y * v10;
+            o01 = o01 + p0.y * v11;
+            o10 = o10 + p1.y * v10;
+            o11 = o11 + p1.y * v11;
         }
-        l0 = l0 * alpha0 + bl0;
-        m0 = m0_new;
-        l1 = l1 * alpha1 + bl1;
-        m1 = m1_new;
         workgroupBarrier();
     }
 
-    // ---- epilogue: the normalised rows of the block that exist
-    let o_off = head * 16u + lid.x;
-    if (q0 < cfg.t) {
-        out4[q0 * cfg.hidden4 + o_off] = o0 / l0;
+    // ---- epilogue
+    let o_off = head * 16u + lx;
+    if (q_base + ly < cfg.t) {
+        out4[(q_base + ly) * cfg.hidden4 + o_off] = o00 / l0;
+        out4[(q_base + ly) * cfg.hidden4 + o_off + 8u] = o01 / l0;
     }
-    if (q1 < cfg.t) {
-        out4[q1 * cfg.hidden4 + o_off] = o1 / l1;
+    if (q_base + ly + 16u < cfg.t) {
+        out4[(q_base + ly + 16u) * cfg.hidden4 + o_off] = o10 / l1;
+        out4[(q_base + ly + 16u) * cfg.hidden4 + o_off + 8u] = o11 / l1;
     }
 }
-"#
-    .to_string()
+"#;
+    BODY.replace(
+        "/*FOLD_MAX*/",
+        &flash_fold(&["bm0", "bm1"], "sp2", subgroup, true),
+    )
+    .replace(
+        "/*FOLD_SUM*/",
+        &flash_fold(&["bl0", "bl1"], "sp2", subgroup, false),
+    )
 }
 
 /// Parse and validate a module the way a device would, without opening one.
@@ -988,6 +1504,82 @@ mod tests {
                     src.contains("let varian = max(sr.y / f32(cfg.cols) - mean * mean, 0.0);"),
                     "{what}({sg:?}): {src}"
                 );
+            }
+        }
+    }
+
+    /// The two FlashAttention tiles, keyed by the adapter storage they need.
+    const FLASH_TILES: [(u32, u32, u32); 2] = [
+        // (max_storage, bq, workgroup bytes)
+        (16 * 1024, 32, 14_336),
+        (32 * 1024, 64, 32_768),
+    ];
+
+    #[test]
+    fn flash_attn_tiles_fit_the_storage_they_are_built_for() {
+        // The declarations are the layout: 16 B per `vec4`, 8 B per `vec2`,
+        // with no padding columns anywhere (the swizzle needs none).
+        let layout = |bq: u32| {
+            if bq == 64 {
+                [
+                    ("var<workgroup> sq4: array<vec4<f32>, 1024u>;", 1024 * 16),
+                    ("var<workgroup> skv4: array<vec4<f32>, 512u>;", 512 * 16),
+                    ("var<workgroup> sp4: array<vec4<f32>, 512u>;", 512 * 16),
+                ]
+            } else {
+                [
+                    ("var<workgroup> sq4: array<vec4<f32>, 512u>;", 512 * 16),
+                    ("var<workgroup> skv4: array<vec4<f32>, 256u>;", 256 * 16),
+                    ("var<workgroup> sp2: array<vec2<f32>, 256u>;", 256 * 8),
+                ]
+            }
+        };
+        for (storage, bq, bytes) in FLASH_TILES {
+            assert_eq!(flash_attn_shared_bytes(storage), bytes, "{storage} B");
+            // the tile must not use more than the floor it is built for
+            assert!(bytes <= storage, "{storage} B");
+            let (decls, sum) = (layout(bq), layout(bq).iter().map(|d| d.1).sum::<u32>());
+            assert_eq!(sum, bytes, "{storage} B");
+            for subgroup in [false, true] {
+                let (src, want_bq) = flash_attn(storage, subgroup);
+                assert_eq!(want_bq, bq, "{storage} B");
+                for (decl, _) in decls {
+                    assert!(src.contains(decl), "{storage} B {subgroup}: {decl}");
+                }
+                // 1-D workgroup: `lid.x` maps linearly into subgroups, which
+                // is what makes the 8 `lx` lanes one aligned group.
+                assert!(src.contains("@workgroup_size(128)"), "{storage} B");
+                assert!(!src.contains("enable"), "{storage} B");
+                assert!(!src.contains("@workgroup_size(16, 16)"), "{storage} B");
+                // Four barriers per key tile in the subgroup build (K staged,
+                // phase A done, V staged with phase B, phase C done); the
+                // shared-memory fold brackets both of its reads.
+                let barriers = src.matches("workgroupBarrier()").count();
+                assert_eq!(barriers, if subgroup { 4 } else { 8 }, "{storage} B");
+                let folds = if subgroup {
+                    // 2 folds x rows x 3 masks
+                    2 * (if bq == 64 { 4 } else { 2 }) * 3
+                } else {
+                    0
+                };
+                assert_eq!(
+                    src.matches("subgroupShuffleXor").count(),
+                    folds,
+                    "{storage} B"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flash_attn_validates_for_every_tile_and_fold() {
+        for storage in [16 * 1024, 32 * 1024, 48 * 1024] {
+            for subgroup in [false, true] {
+                let (src, bq) = flash_attn(storage, subgroup);
+                naga_validate(&src, &format!("flash_attn({storage}, {subgroup})"));
+                // bq | 32 query rows per workgroup, 16 head dimensions each
+                let slots = bq * 16;
+                assert!(src.contains(&format!("var<workgroup> sq4: array<vec4<f32>, {slots}u>")));
             }
         }
     }
@@ -1482,79 +2074,99 @@ mod tests {
         }
 
         // ---- flash attention: fused softmax(Q K^T * scale) V, straight from
-        //      the packed qkv buffer, against an f64 reference
+        //      the packed qkv buffer, against an f64 reference. Every tile this
+        //      adapter can run is checked in both fold shapes, so the
+        //      subgroup-less build the model falls back to on other hardware
+        //      is exercised here as code, not only as a naga parse.
         {
-            let pipe = pipeline(&gpu, "t-flash", &flash_attn());
             let (heads, hidden) = (4usize, 256usize);
             let head_dim = hidden / heads;
             assert_eq!(head_dim as u32, FLASH_HEAD_DIM, "the kernel's head width");
             let hidden4 = (hidden / 4) as u32;
             let scale = 0.125f64;
-            // 17 is one partial query block, 67 is two whole blocks and a
-            // partial one: both leave the zero-padded rows of `sq` in play.
-            for t_len in [17usize, 67] {
-                let qkv: Vec<f32> = (0..t_len * 3 * hidden).map(noise).collect();
-                let qb = storage_f32(&gpu, "t-flash-qkv", &qkv);
-                let ob = storage_f32(&gpu, "t-flash-out", &vec![-9.0f32; t_len * hidden]);
-                let uni = uniform_u32(
-                    &gpu,
-                    "t-flash-u",
-                    &[
-                        t_len as u32,
-                        heads as u32,
-                        hidden4,
-                        0,
-                        (scale as f32).to_bits(),
-                        0,
-                        0,
-                        0,
-                    ],
-                );
-                run(
-                    &gpu,
-                    &pipe,
-                    &[bind(0, &qb), bind(1, &ob), bind(2, &uni)],
-                    (t_len as u32).div_ceil(FLASH_BQ),
-                    heads as u32,
-                );
-                let got = read(&gpu, &ob, t_len * hidden);
-                for q in 0..t_len {
-                    for h in 0..heads {
-                        // f64 reference: full softmax, no online update
-                        let mut logits = vec![0f64; t_len];
-                        for (k, slot) in logits.iter_mut().enumerate() {
-                            let mut acc = 0f64;
-                            for d in 0..head_dim {
-                                acc += qkv[q * 3 * hidden + h * head_dim + d] as f64
-                                    * qkv[k * 3 * hidden + hidden + h * head_dim + d] as f64;
+            // not tile-aligned in any direction: 1 is one row of one tile, 17
+            // and 67 straddle a 16- and a 64-row block, 131 leaves 3 rows of
+            // a 32-key tile live.
+            for storage in [16 * 1024, 32 * 1024] {
+                if storage > max_storage {
+                    continue;
+                }
+                for subgroup in [false, true] {
+                    if subgroup && !gpu.has_subgroup_8() {
+                        continue;
+                    }
+                    let (src, bq) = flash_attn(storage, subgroup);
+                    let label = format!("t-flash-{storage}-{subgroup}");
+                    let pipe = pipeline(&gpu, &label, &src);
+                    for t_len in [1usize, 17, 67, 131] {
+                        let qkv: Vec<f32> = (0..t_len * 3 * hidden).map(noise).collect();
+                        let qb = storage_f32(&gpu, &format!("{label}-qkv"), &qkv);
+                        let ob = storage_f32(
+                            &gpu,
+                            &format!("{label}-out"),
+                            &vec![-9.0f32; t_len * hidden],
+                        );
+                        let uni = uniform_u32(
+                            &gpu,
+                            &format!("{label}-u"),
+                            &[
+                                t_len as u32,
+                                heads as u32,
+                                hidden4,
+                                0,
+                                (scale as f32).to_bits(),
+                                0,
+                                0,
+                                0,
+                            ],
+                        );
+                        run(
+                            &gpu,
+                            &pipe,
+                            &[bind(0, &qb), bind(1, &ob), bind(2, &uni)],
+                            (t_len as u32).div_ceil(bq),
+                            heads as u32,
+                        );
+                        let got = read(&gpu, &ob, t_len * hidden);
+                        for q in 0..t_len {
+                            for h in 0..heads {
+                                // f64 reference: full softmax, no online update
+                                let mut logits = vec![0f64; t_len];
+                                for (k, slot) in logits.iter_mut().enumerate() {
+                                    let mut acc = 0f64;
+                                    for d in 0..head_dim {
+                                        acc += qkv[q * 3 * hidden + h * head_dim + d] as f64
+                                            * qkv[k * 3 * hidden + hidden + h * head_dim + d]
+                                                as f64;
+                                    }
+                                    *slot = acc * scale;
+                                }
+                                let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                                let p: Vec<f64> = logits.iter().map(|s| (s - m).exp()).collect();
+                                let den: f64 = p.iter().sum();
+                                for d in 0..head_dim {
+                                    let mut acc = 0f64;
+                                    for (k, &pk) in p.iter().enumerate() {
+                                        acc += pk
+                                            * qkv[k * 3 * hidden + 2 * hidden + h * head_dim + d]
+                                                as f64;
+                                    }
+                                    let want = acc / den;
+                                    let have = got[q * hidden + h * head_dim + d];
+                                    assert!(
+                                        have.is_finite(),
+                                        "flash {label} T={t_len} head {h} q {q} d {d} = {have}"
+                                    );
+                                    assert!(
+                                        (want - have as f64).abs() < 1e-5,
+                                        "flash {label} T={t_len} head {h} q {q} d {d}: \
+                                         {want} vs {have}"
+                                    );
+                                }
                             }
-                            *slot = acc * scale;
-                        }
-                        let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                        let p: Vec<f64> = logits.iter().map(|s| (s - m).exp()).collect();
-                        let den: f64 = p.iter().sum();
-                        for d in 0..head_dim {
-                            let mut acc = 0f64;
-                            for (k, &pk) in p.iter().enumerate() {
-                                acc +=
-                                    pk * qkv[k * 3 * hidden + 2 * hidden + h * head_dim + d] as f64;
-                            }
-                            let want = acc / den;
-                            let have = got[q * hidden + h * head_dim + d];
-                            assert!(
-                                have.is_finite(),
-                                "flash T={t_len} head {h} q {q} d {d} = {have}"
-                            );
-                            assert!(
-                                (want - have as f64).abs() < 1e-5,
-                                "flash T={t_len} head {h} q {q} d {d}: {want} vs {have}"
-                            );
                         }
                     }
                 }
-                // 16 KiB of workgroup storage: WebGPU's floor, and the whole
-                // reason the tile is 32 queries wide.
-                assert_eq!(16 * 512 + 16 * 256 + 4 * 512 + 4 * 512, 16_384);
             }
         }
 
