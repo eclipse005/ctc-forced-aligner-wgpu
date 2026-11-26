@@ -222,6 +222,23 @@ struct TransposeCfg {
     _p2: u32,
 }
 
+/// [`shaders::flash_attn`]'s uniform: the frame count, the head count, the
+/// `vec4` width of one hidden row and the attention scale.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+struct FlashAttnCfg {
+    t: u32,
+    heads: u32,
+    hidden4: u32,
+    _p0: u32,
+    scale: f32,
+    _p1: u32,
+    _p2: u32,
+    _p3: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<FlashAttnCfg>() == 32);
+
 /// One recorded dispatch. Uniform bytes live in a side buffer; the bind group
 /// already points at its slot, so replay is just set/dispatch.
 /// Cloned across chunks of the same length: the buffers and the grid don't change.
@@ -254,8 +271,92 @@ struct LayerWeights {
     ln2_b: Vec<f32>,
 }
 
+/// What `CTC_TILE64` says about the short-window `64×64×32` tile.
+///
+/// It only means anything when the base tile is wider than 64 rows (a 64-row
+/// main tile leaves nothing to gain) and the `M64s` pipeline fits the
+/// adapter's workgroup storage. `on`/`1`/`true` asks for it explicitly, which
+/// is how it gets benchmarked on a device without `SHADER_F16`; `auto` — the
+/// default — enables it only where `f16` tiles make the extra pipeline cheap,
+/// so a Pascal card compiles exactly what it had before.
+fn resolve_tile64(
+    has_f16: bool,
+    main_mt: u32,
+    max_storage: u32,
+    use_f16: bool,
+    env_val: Option<&str>,
+) -> bool {
+    let possible =
+        main_mt > 64 && shaders::GemmVariant::M64s.shared_bytes_with(use_f16) <= max_storage;
+    if !possible {
+        return false;
+    }
+    match env_val
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "0" | "false" | "off" => false,
+        "1" | "true" | "on" => true,
+        _ => has_f16,
+    }
+}
+
+/// Pick the `f32`-shared-tile GEMM variant used by materialised attention
+/// (`scores` / `pv`) when the primary linear GEMM narrowed its tiles to `f16`.
+///
+/// An `f16` adapter with 16 KiB of workgroup storage can pick `Base` (13,312 B
+/// in f16) and a 32 KiB adapter can pick `Db16` (22,528 B in f16), neither of
+/// which fits as `f32`. Falling back to the fastest `f32` tile that fits keeps
+/// model load from panicking on those adapters.
+fn resolve_f32_gemm_variant(
+    primary: shaders::GemmVariant,
+    max_storage: u32,
+) -> shaders::GemmVariant {
+    if primary.shared_bytes_with(false) <= max_storage {
+        primary
+    } else {
+        shaders::pick_gemm_variant_for_with(max_storage, false, None)
+    }
+}
+
+/// What `CTC_FLASH_ATTN` says about the fused attention path.
+///
+/// `head_dim` is a hard gate: the kernel is written for the 64-wide head every
+/// Wav2Vec2 checkpoint uses. `auto` keeps the tuned materialised path where it
+/// fits and performs (this P104 at 30 s) and engages wherever it cannot: a
+/// `scores` tensor past the binding limit, a window past the size cap, or a
+/// modern adapter with `f16` shared tiles.
+fn resolve_flash_attn(
+    env_val: Option<&str>,
+    head_dim: usize,
+    scores_bytes: u64,
+    max_binding: u64,
+    scores_exceeds_cap: bool,
+    has_f16: bool,
+) -> bool {
+    if head_dim != shaders::FLASH_HEAD_DIM as usize {
+        return false;
+    }
+    match env_val
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "0" | "false" | "off" => false,
+        "1" | "true" | "on" => true,
+        _ => scores_bytes > max_binding || scores_exceeds_cap || has_f16,
+    }
+}
+
 struct Pipe {
     gemm: wgpu::ComputePipeline,
+    /// The same schedule with `f32` shared tiles. Equal to `gemm` when the
+    /// device has no `f16`: attention scores are read back into an `f32`
+    /// epilogue and an `f16` rounded score would move softmax weights.
+    gemm_f32: wgpu::ComputePipeline,
     conv_gemm: wgpu::ComputePipeline,
     conv0: wgpu::ComputePipeline,
     pos_conv: wgpu::ComputePipeline,
@@ -266,6 +367,12 @@ struct Pipe {
     log_softmax: wgpu::ComputePipeline,
     transpose: wgpu::ComputePipeline,
     gather: wgpu::ComputePipeline,
+    /// `None` unless `resolve_tile64` asked for the short-window tile.
+    gemm64: Option<wgpu::ComputePipeline>,
+    gemm64_f32: Option<wgpu::ComputePipeline>,
+    /// `None` on an adapter whose workgroup storage cannot hold the kernel's
+    /// 16 KiB tile; the materialised attention path stays in use there.
+    flash_attn: Option<wgpu::ComputePipeline>,
 }
 
 const P_GEMM: usize = 0;
@@ -279,15 +386,31 @@ const P_SOFTMAX: usize = 7;
 const P_LOGSOFTMAX: usize = 8;
 const P_TRANSPOSE: usize = 9;
 const P_GATHER: usize = 10;
+const P_GEMM64: usize = 11;
+const P_GEMM_F32: usize = 12;
+const P_GEMM64_F32: usize = 13;
+const P_FLASH_ATTN: usize = 14;
+
+/// `CTC_PROFILE=2` buckets that are not one pipeline. The main GEMM schedule
+/// serves the projections, `scores` and `pv`, and the profile splits those by
+/// dispatch shape.
+const BUCKET_SCORES: usize = 15;
+const BUCKET_PV: usize = 16;
+const BUCKET_MAIN: usize = 17;
+/// One profile slot per pipeline id plus the synthetic buckets; the
+/// `CTC_PROFILE=2` name table must have exactly this many entries.
+const PROFILE_SLOTS: usize = BUCKET_MAIN + 1;
 
 /// The uniform binding index of each pipeline, and whether its uniform buffer
 /// is shared (one big buffer + per-dispatch offsets).
 fn uni_binding(p: usize) -> u32 {
     match p {
-        P_GEMM | P_CONV_GEMM | P_CONV0 | P_POS | P_LN_SD => 4,
+        P_GEMM | P_CONV_GEMM | P_CONV0 | P_POS | P_LN_SD | P_GEMM64 | P_GEMM_F32 | P_GEMM64_F32 => {
+            4
+        }
         P_LN | P_ADD => 3,
         P_SOFTMAX | P_LOGSOFTMAX => 1,
-        P_TRANSPOSE => 2,
+        P_TRANSPOSE | P_FLASH_ATTN => 2,
         P_GATHER => 3,
         _ => unreachable!(),
     }
@@ -302,6 +425,11 @@ pub(crate) struct GpuModel {
     /// covers the same output with a different grid.
     gemm_mt: u32,
     gemm_nt: u32,
+    /// Tile of the `f32`-shared attention GEMM (`scores` / `pv`). Matches
+    /// `(gemm_mt, gemm_nt)` whenever the primary variant also fits as `f32`;
+    /// narrower when an `f16` tile (e.g. `Base` at 16 KiB) would overflow `f32`.
+    gemm_f32_mt: u32,
+    gemm_f32_nt: u32,
     /// The positional conv's M tile, likewise read off the compiled kernel:
     /// an adapter under 26 KiB of workgroup storage runs the 64-frame tile.
     pos_mt: u32,
@@ -636,16 +764,80 @@ impl GpuModel {
         // choice and the shader generation, so a tile that cannot compile on
         // this backend is refused before any pipeline is created.
         let max_storage = gpu.limits().max_compute_workgroup_storage_size;
-        let variant = shaders::pick_gemm_variant(max_storage);
+        // `f16` shared tiles halve the footprint of every staged tile; the
+        // weights and activations stay f32 either way. It needs SHADER_F16,
+        // which `use_f16_kernel` gates on the negotiated device.
+        let use_f16 = gpu.use_f16_kernel();
+        let variant = shaders::pick_gemm_variant_with(max_storage, use_f16);
         let (gemm_mt, gemm_nt) = shaders::gemm_tile(variant);
         let (pos_src, pos_mt) = shaders::pos_conv(max_storage);
         // The row kernels fold a row with the device's subgroup shape when it
         // has one: two barriers per reduction instead of eighteen tree steps.
         let sg = gpu.subgroup_mode();
+        let gemm = mk_gemm(
+            &shaders::gemm_variant_with(variant, max_storage, use_f16),
+            "gemm",
+        )?;
+        // Attention scores and `pv` run on f32 tiles whether or not the linear
+        // GEMMs narrowed: the softmax weights are computed straight from the
+        // score tile, and a rounded score moves a weight. Without `f16` this
+        // is the same pipeline, so nothing extra is compiled on Pascal.
+        let variant_f32 = if use_f16 {
+            resolve_f32_gemm_variant(variant, max_storage)
+        } else {
+            variant
+        };
+        let (gemm_f32_mt, gemm_f32_nt) = shaders::gemm_tile(variant_f32);
+        let gemm_f32 = if use_f16 {
+            mk_gemm(
+                &shaders::gemm_variant_with(variant_f32, max_storage, false),
+                "gemm_f32",
+            )?
+        } else {
+            gemm.clone()
+        };
+        // The short-window 64x64 tile: a separate pipeline, because the tile
+        // geometry is baked into the shader.
+        let tile64 = resolve_tile64(
+            gpu.has_f16(),
+            gemm_mt,
+            max_storage,
+            use_f16,
+            std::env::var("CTC_TILE64").ok().as_deref(),
+        );
+        let gemm64 = if tile64 {
+            Some(mk_gemm(
+                &shaders::gemm_variant_with(shaders::GemmVariant::M64s, max_storage, use_f16),
+                "gemm64",
+            )?)
+        } else {
+            None
+        };
+        let gemm64_f32 = if tile64 && use_f16 {
+            if shaders::GemmVariant::M64s.shared_bytes_with(false) <= max_storage {
+                Some(mk_gemm(
+                    &shaders::gemm_variant_with(shaders::GemmVariant::M64s, max_storage, false),
+                    "gemm64_f32",
+                )?)
+            } else {
+                None
+            }
+        } else {
+            gemm64.clone()
+        };
+        // 16 KiB of shared memory is exactly WebGPU's floor, so this only
+        // drops out on an adapter below the spec — and then the materialised
+        // path is what runs, not a failed model load.
+        let flash_attn = if max_storage >= 16 * 1024 {
+            Some(mk(&shaders::flash_attn(), "flash_attn")?)
+        } else {
+            None
+        };
         let pipes = Pipe {
-            gemm: mk_gemm(&shaders::gemm_variant(variant, max_storage), "gemm")?,
+            gemm,
+            gemm_f32,
             conv_gemm: mk_gemm(
-                &shaders::conv_gemm_variant(variant, max_storage),
+                &shaders::conv_gemm_variant_with(variant, max_storage, use_f16),
                 "conv_gemm",
             )?,
             conv0: mk(&shaders::conv0(), "conv0")?,
@@ -657,6 +849,9 @@ impl GpuModel {
             log_softmax: mk(&shaders::log_softmax(sg), "log_softmax")?,
             transpose: mk(&shaders::transpose(), "transpose")?,
             gather: mk(&shaders::gather(), "gather")?,
+            gemm64,
+            gemm64_f32,
+            flash_attn,
         };
         // The cache is a warm-start optimisation: an unwritable cache
         // directory must not fail a model load.
@@ -668,6 +863,8 @@ impl GpuModel {
             pipes,
             gemm_mt,
             gemm_nt,
+            gemm_f32_mt,
+            gemm_f32_nt,
             pos_mt,
             readback: std::sync::Mutex::new(Vec::new()),
             xfer: std::sync::OnceLock::new(),
@@ -785,10 +982,6 @@ impl GpuModel {
         prev: Option<&mut GpuPending>,
     ) -> Result<GpuPending> {
         self.forward_begin(input, None, false, None, &[], prev, true)
-    }
-
-    pub(crate) fn supports_f64(&self) -> bool {
-        self.gpu.has_f64()
     }
 
     /// Compile the f64 Viterbi pipelines and allocate the per-file buffers.
@@ -1326,7 +1519,7 @@ impl GpuModel {
             .checked_mul(t)
             .and_then(|n| n.checked_mul(t_pad))
             .context("frame count overflow")?;
-        if t > 12000 || scores_n > 200_000_000 {
+        if t > 12000 {
             anyhow::bail!(
                 "sequence of {t} frames is too long for one GPU forward; use --window 30"
             );
@@ -1341,12 +1534,60 @@ impl GpuModel {
         let logits_bytes = ((if read_hidden { t * hidden } else { t * vocab }) as u64)
             .checked_mul(4)
             .context("logits size overflow")?;
+        let max_binding = gpu.limits().max_storage_buffer_binding_size;
+        // Fused attention is decided before either check: it is what removes
+        // the `scores` tensor, and with it the window limit those checks are
+        // about. `auto` therefore engages exactly where the materialised path
+        // would have refused or underperformed.
+        let use_flash = self.pipes.flash_attn.is_some()
+            && resolve_flash_attn(
+                std::env::var("CTC_FLASH_ATTN").ok().as_deref(),
+                head_dim,
+                scores_bytes,
+                max_binding,
+                scores_n > 200_000_000,
+                gpu.has_f16(),
+            );
+        if !use_flash && scores_n > 200_000_000 {
+            anyhow::bail!(
+                "sequence of {t} frames is too long for one GPU forward; use --window 30"
+            );
+        }
         check_binding_limits(
             t,
-            scores_bytes,
+            if use_flash { 0 } else { scores_bytes },
             logits_bytes,
-            gpu.limits().max_storage_buffer_binding_size,
+            max_binding,
         )?;
+        // Short windows go through the 64x64 tile when the load-time selector
+        // built it: it is a pure function of the window length, so a replayed
+        // graph and the run that recorded it always agree.
+        let use_tile64 = self.pipes.gemm64.is_some() && t <= 512;
+        let use_attn_tile64 = self.pipes.gemm64_f32.is_some() && t <= 512;
+        // The linear GEMMs may narrow their shared tiles; attention's `scores`
+        // and `pv` may not, so they own a second copy of the same schedule (or
+        // an f32-fitting fallback when an f16 primary tile overflows f32).
+        let gemm_pipe = if use_tile64 { P_GEMM64 } else { P_GEMM };
+        let attn_pipe = if use_attn_tile64 {
+            P_GEMM64_F32
+        } else {
+            P_GEMM_F32
+        };
+        let (main_mt, main_nt) = if use_tile64 {
+            (64u32, 64u32)
+        } else {
+            (gemm_mt, gemm_nt)
+        };
+        let (attn_mt, attn_nt) = if use_attn_tile64 {
+            (64u32, 64u32)
+        } else {
+            (self.gemm_f32_mt, self.gemm_f32_nt)
+        };
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+        // `CTC_PROFILE=2` splits the GEMM schedule by dispatch shape; these
+        // are the `scores` grids, per tile.
+        let scores_gy_main = (t as u32).div_ceil(self.gemm_f32_nt);
+        let scores_gy_64 = (t as u32).div_ceil(64);
         let (x_in, convs, cached, mut act, ubuf, gather_buf) = {
             let mut guard = self.scratch.lock().unwrap();
             let gathered = gather.is_some();
@@ -1357,6 +1598,8 @@ impl GpuModel {
                         && s.t == t
                         && s.gathered == gathered
                         && s.hidden == read_hidden
+                        && s.flash == use_flash
+                        && s.tile64 == use_tile64
                 })
                 .unwrap_or(false);
             if !reuse {
@@ -1374,6 +1617,8 @@ impl GpuModel {
                     t,
                     gathered,
                     hidden: read_hidden,
+                    flash: use_flash,
+                    tile64: use_tile64,
                     x_in: st("x_in", input.len()),
                     convs,
                     x: xbuf.clone(),
@@ -1382,8 +1627,11 @@ impl GpuModel {
                     t2: st("t2", t * hidden.max(self.cfg.intermediate_size)),
                     t3: st("t3", t * hidden),
                     qkv: st("qkv", t * 3 * hidden),
-                    kt: st("kt", hidden * t_pad),
-                    scores: st("scores", scores_n),
+                    // Fused attention reads `qkv` and writes `attn_o`: there is
+                    // no K^T and no scores tensor, so those two handles are
+                    // 4-byte placeholders instead of 176-625 MiB of VRAM.
+                    kt: st("kt", if use_flash { 4 } else { hidden * t_pad }),
+                    scores: st("scores", if use_flash { 4 } else { scores_n }),
                     attn_o: st("attn_o", t * hidden),
                     // the hidden readback never runs the head, so its logits
                     // buffer doubles as a (t, hidden) scratch
@@ -1429,7 +1677,7 @@ impl GpuModel {
         // on this wgpu version, and a per-dispatch pass + poll blows the
         // Windows TDR budget in the other direction. One pass per 8 encoder
         // layers stays under ~2 s on Pascal and still retires in order.
-        let pipes: [&wgpu::ComputePipeline; 11] = [
+        let pipes: [&wgpu::ComputePipeline; 15] = [
             &self.pipes.gemm,
             &self.pipes.conv_gemm,
             &self.pipes.conv0,
@@ -1441,6 +1689,13 @@ impl GpuModel {
             &self.pipes.log_softmax,
             &self.pipes.transpose,
             &self.pipes.gather,
+            // The three optional pipelines are indexed by their recorded
+            // `Job::pipe`, which only ever names one of them when it exists;
+            // the fallback keeps the array total for the profile's sake.
+            self.pipes.gemm64.as_ref().unwrap_or(&self.pipes.gemm),
+            &self.pipes.gemm_f32,
+            self.pipes.gemm64_f32.as_ref().unwrap_or(&self.pipes.gemm),
+            self.pipes.flash_attn.as_ref().unwrap_or(&self.pipes.gemm),
         ];
         let layouts: Vec<wgpu::BindGroupLayout> =
             pipes.iter().map(|p| p.get_bind_group_layout(0)).collect();
@@ -1632,7 +1887,7 @@ impl GpuModel {
                 bind!(2, &self.fp_ln_b),
             );
             dispatch!(
-                P_GEMM,
+                gemm_pipe,
                 GemmDims {
                     m: rows as u32,
                     n: hidden as u32,
@@ -1652,8 +1907,8 @@ impl GpuModel {
                     b_vec: vec4_ok(0, hidden as u32, 0),
                     _p0: 0,
                 },
-                (rows as u32).div_ceil(gemm_mt),
-                (hidden as u32).div_ceil(gemm_nt),
+                (rows as u32).div_ceil(main_mt),
+                (hidden as u32).div_ceil(main_nt),
                 bind!(0, &cur),
                 bind!(1, &self.fp_wt),
                 bind!(2, &self.fp_b),
@@ -1735,7 +1990,7 @@ impl GpuModel {
                 );
                 // qkv
                 dispatch!(
-                    P_GEMM,
+                    gemm_pipe,
                     GemmDims {
                         m: t_rows,
                         n: 3 * cols,
@@ -1755,8 +2010,8 @@ impl GpuModel {
                         b_vec: vec4_ok(0, 3 * cols, 0),
                         _p0: 0,
                     },
-                    t_rows.div_ceil(gemm_mt),
-                    (3 * cols).div_ceil(gemm_nt),
+                    t_rows.div_ceil(main_mt),
+                    (3 * cols).div_ceil(main_nt),
                     bind!(0, &act.t1),
                     bind!(1, &self.qkv_wt[li]),
                     bind!(2, &self.qkv_b[li]),
@@ -1765,111 +2020,131 @@ impl GpuModel {
                     bind!(6, &act.t1),
                     bind!(7, &self.qkv_wt[li]),
                 );
-                // K^T: rows hidden, cols t, from qkv rows offset T*1024, stride 3072
-                dispatch!(
-                    P_TRANSPOSE,
-                    // K block starts `hidden` elements into each (T, 3*hidden) row;
-                    // the output rows are `t_pad` wide, so the scores GEMM below
-                    // can read them with vec4 loads
-                    TransposeCfg {
-                        rows: t as u32,
-                        cols: hidden as u32,
-                        a_stride: (3 * hidden) as u32,
-                        a_off: hidden as u32,
-                        o_stride: t_pad_u,
-                        ..Default::default()
-                    },
-                    (t as u32).div_ceil(16),
-                    (hidden as u32).div_ceil(16),
-                    bind!(0, &act.qkv),
-                    bind!(1, &act.kt),
-                );
-                // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z.
-                // Both operands are vec4-able now: kt rows start every t_pad
-                // elements, so b_vec is 1 for every window
-                dispatch_z!(
-                    P_GEMM,
-                    GemmDims {
-                        m: t_rows,
-                        n: t_rows,
-                        k: head_dim as u32,
-                        a_stride: 3 * cols,
-                        b_stride: t_pad_u,
-                        c_stride: t_pad_u,
-                        a_off: 0,
-                        a_z: head_dim as u32,
-                        b_off: 0,
-                        b_z: head_dim as u32 * t_pad_u,
-                        c_off: 0,
-                        c_z: t_rows * t_pad_u,
-                        epilogue: 0,
-                        scale: 0.125, // head_dim^-0.5: the attention scaling
-                        a_vec: vec4_ok(0, 3 * cols, head_dim as u32),
-                        b_vec: vec4_ok(0, t_pad_u, head_dim as u32 * t_pad_u),
-                        _p0: 0,
-                    },
-                    t_rows.div_ceil(gemm_mt),
-                    t_rows.div_ceil(gemm_nt),
-                    heads as u32,
-                    bind!(0, &act.qkv),
-                    bind!(1, &act.kt),
-                    bind!(2, &self.zeros),
-                    bind!(3, &act.scores),
-                    bind!(5, &self.zeros),
-                    bind!(6, &act.qkv),
-                    bind!(7, &act.kt),
-                );
-                // softmax over each (head, query) row; the row pitch is t_pad
-                dispatch!(
-                    P_SOFTMAX,
-                    Cfg4 {
-                        a: (heads as u32 * t_rows),
-                        b: t_rows,
-                        c: t_pad_u,
-                        d: 0
-                    },
-                    row_grid(heads as u32 * t_rows).0,
-                    row_grid(heads as u32 * t_rows).1,
-                    bind!(0, &act.scores),
-                );
-                // per-head weighted V, z-batched: attn_h = scores_h @ v_h.
-                // B is a vec4-able slice of qkv and A (scores) now has an
-                // aligned row pitch, so a_vec is 1 for every window too
-                dispatch_z!(
-                    P_GEMM,
-                    GemmDims {
-                        m: t_rows,
-                        n: head_dim as u32,
-                        k: t_rows,
-                        a_stride: t_pad_u,
-                        b_stride: 3 * cols,
-                        c_stride: cols,
-                        a_off: 0,
-                        a_z: t_rows * t_pad_u,
-                        b_off: (2 * hidden) as u32,
-                        b_z: head_dim as u32,
-                        c_off: 0,
-                        c_z: head_dim as u32,
-                        epilogue: 0,
-                        scale: 1.0,
-                        a_vec: vec4_ok(0, t_pad_u, t_rows * t_pad_u),
-                        b_vec: vec4_ok((2 * hidden) as u32, 3 * cols, head_dim as u32),
-                        _p0: 0,
-                    },
-                    t_rows.div_ceil(gemm_mt),
-                    (head_dim as u32).div_ceil(gemm_nt),
-                    heads as u32,
-                    bind!(0, &act.scores),
-                    bind!(1, &act.qkv),
-                    bind!(2, &self.zeros),
-                    bind!(3, &act.attn_o),
-                    bind!(5, &self.zeros),
-                    bind!(6, &act.scores),
-                    bind!(7, &act.qkv),
-                );
+                if use_flash {
+                    // Fused attention: one dispatch reads Q, K and V straight
+                    // out of `qkv` and writes `attn_o`. No K^T transpose, no
+                    // (heads, t, t_pad) scores tensor, no separate softmax.
+                    dispatch!(
+                        P_FLASH_ATTN,
+                        FlashAttnCfg {
+                            t: t_rows,
+                            heads: heads as u32,
+                            hidden4: (hidden / 4) as u32,
+                            scale: attn_scale,
+                            ..Default::default()
+                        },
+                        t_rows.div_ceil(shaders::FLASH_BQ),
+                        heads as u32,
+                        bind!(0, &act.qkv),
+                        bind!(1, &act.attn_o),
+                    );
+                } else {
+                    // K^T: rows hidden, cols t, from qkv rows offset T*1024, stride 3072
+                    dispatch!(
+                        P_TRANSPOSE,
+                        // K block starts `hidden` elements into each (T, 3*hidden) row;
+                        // the output rows are `t_pad` wide, so the scores GEMM below
+                        // can read them with vec4 loads
+                        TransposeCfg {
+                            rows: t as u32,
+                            cols: hidden as u32,
+                            a_stride: (3 * hidden) as u32,
+                            a_off: hidden as u32,
+                            o_stride: t_pad_u,
+                            ..Default::default()
+                        },
+                        (t as u32).div_ceil(16),
+                        (hidden as u32).div_ceil(16),
+                        bind!(0, &act.qkv),
+                        bind!(1, &act.kt),
+                    );
+                    // per-head scores, z-batched: scores_h = q_h @ kt_h over wid.z.
+                    // Both operands are vec4-able now: kt rows start every t_pad
+                    // elements, so b_vec is 1 for every window
+                    dispatch_z!(
+                        attn_pipe,
+                        GemmDims {
+                            m: t_rows,
+                            n: t_rows,
+                            k: head_dim as u32,
+                            a_stride: 3 * cols,
+                            b_stride: t_pad_u,
+                            c_stride: t_pad_u,
+                            a_off: 0,
+                            a_z: head_dim as u32,
+                            b_off: 0,
+                            b_z: head_dim as u32 * t_pad_u,
+                            c_off: 0,
+                            c_z: t_rows * t_pad_u,
+                            epilogue: 0,
+                            scale: attn_scale,
+                            a_vec: vec4_ok(0, 3 * cols, head_dim as u32),
+                            b_vec: vec4_ok(0, t_pad_u, head_dim as u32 * t_pad_u),
+                            _p0: 0,
+                        },
+                        t_rows.div_ceil(attn_mt),
+                        t_rows.div_ceil(attn_nt),
+                        heads as u32,
+                        bind!(0, &act.qkv),
+                        bind!(1, &act.kt),
+                        bind!(2, &self.zeros),
+                        bind!(3, &act.scores),
+                        bind!(5, &self.zeros),
+                        bind!(6, &act.qkv),
+                        bind!(7, &act.kt),
+                    );
+                    // softmax over each (head, query) row; the row pitch is t_pad
+                    dispatch!(
+                        P_SOFTMAX,
+                        Cfg4 {
+                            a: (heads as u32 * t_rows),
+                            b: t_rows,
+                            c: t_pad_u,
+                            d: 0
+                        },
+                        row_grid(heads as u32 * t_rows).0,
+                        row_grid(heads as u32 * t_rows).1,
+                        bind!(0, &act.scores),
+                    );
+                    // per-head weighted V, z-batched: attn_h = scores_h @ v_h.
+                    // B is a vec4-able slice of qkv and A (scores) now has an
+                    // aligned row pitch, so a_vec is 1 for every window too
+                    dispatch_z!(
+                        attn_pipe,
+                        GemmDims {
+                            m: t_rows,
+                            n: head_dim as u32,
+                            k: t_rows,
+                            a_stride: t_pad_u,
+                            b_stride: 3 * cols,
+                            c_stride: cols,
+                            a_off: 0,
+                            a_z: t_rows * t_pad_u,
+                            b_off: (2 * hidden) as u32,
+                            b_z: head_dim as u32,
+                            c_off: 0,
+                            c_z: head_dim as u32,
+                            epilogue: 0,
+                            scale: 1.0,
+                            a_vec: vec4_ok(0, t_pad_u, t_rows * t_pad_u),
+                            b_vec: vec4_ok((2 * hidden) as u32, 3 * cols, head_dim as u32),
+                            _p0: 0,
+                        },
+                        t_rows.div_ceil(attn_mt),
+                        (head_dim as u32).div_ceil(attn_nt),
+                        heads as u32,
+                        bind!(0, &act.scores),
+                        bind!(1, &act.qkv),
+                        bind!(2, &self.zeros),
+                        bind!(3, &act.attn_o),
+                        bind!(5, &self.zeros),
+                        bind!(6, &act.scores),
+                        bind!(7, &act.qkv),
+                    );
+                }
                 // out proj + residual
                 dispatch!(
-                    P_GEMM,
+                    gemm_pipe,
                     GemmDims {
                         m: t_rows,
                         n: cols,
@@ -1889,8 +2164,8 @@ impl GpuModel {
                         b_vec: vec4_ok(0, cols, 0),
                         _p0: 0,
                     },
-                    t_rows.div_ceil(gemm_mt),
-                    cols.div_ceil(gemm_nt),
+                    t_rows.div_ceil(main_mt),
+                    cols.div_ceil(main_nt),
                     bind!(0, &act.attn_o),
                     bind!(1, &self.out_wt[li]),
                     bind!(2, &self.out_b[li]),
@@ -1918,7 +2193,7 @@ impl GpuModel {
                     bind!(3, &self.ln2_b[li]),
                 );
                 dispatch!(
-                    P_GEMM,
+                    gemm_pipe,
                     GemmDims {
                         m: t_rows,
                         n: self.cfg.intermediate_size as u32,
@@ -1938,8 +2213,8 @@ impl GpuModel {
                         b_vec: vec4_ok(0, self.cfg.intermediate_size as u32, 0),
                         _p0: 0,
                     },
-                    t_rows.div_ceil(gemm_mt),
-                    (self.cfg.intermediate_size as u32).div_ceil(gemm_nt),
+                    t_rows.div_ceil(main_mt),
+                    (self.cfg.intermediate_size as u32).div_ceil(main_nt),
                     bind!(0, &act.t1),
                     bind!(1, &self.ff1_wt[li]),
                     bind!(2, &self.ff1_b[li]),
@@ -1949,7 +2224,7 @@ impl GpuModel {
                     bind!(7, &self.ff1_wt[li]),
                 );
                 dispatch!(
-                    P_GEMM,
+                    gemm_pipe,
                     GemmDims {
                         m: t_rows,
                         n: cols,
@@ -1969,8 +2244,8 @@ impl GpuModel {
                         b_vec: vec4_ok(0, cols, 0),
                         _p0: 0,
                     },
-                    t_rows.div_ceil(gemm_mt),
-                    cols.div_ceil(gemm_nt),
+                    t_rows.div_ceil(main_mt),
+                    cols.div_ceil(main_nt),
                     bind!(0, &act.t2),
                     bind!(1, &self.ff2_wt[li]),
                     bind!(2, &self.ff2_b[li]),
@@ -2001,7 +2276,7 @@ impl GpuModel {
             );
             if !read_hidden {
                 dispatch!(
-                    P_GEMM,
+                    gemm_pipe,
                     GemmDims {
                         m: t as u32,
                         n: vocab as u32,
@@ -2021,8 +2296,8 @@ impl GpuModel {
                         b_vec: vec4_ok(0, vocab as u32, 0),
                         _p0: 0,
                     },
-                    (t as u32).div_ceil(gemm_mt),
-                    (vocab as u32).div_ceil(gemm_nt),
+                    (t as u32).div_ceil(main_mt),
+                    (vocab as u32).div_ceil(main_nt),
                     bind!(0, &act.x),
                     bind!(1, &self.lm_wt),
                     bind!(2, &self.lm_b),
@@ -2202,9 +2477,10 @@ impl GpuModel {
             let bytes = gpu.readback(&qbuf, qcount as u64 * 8)?;
             let ticks: &[u64] = bytemuck::cast_slice(&bytes);
             let period = gpu.queue.get_timestamp_period() as f64;
-            // indexed by pipeline id (P_*): gelu has no pipeline (fused into
-            // the LN and the GEMM epilogue), so the names after P_LN_SD were
-            // off by one slot until this list stopped carrying a gelu entry
+            // Indexed by pipeline id (P_*), then by the three synthetic
+            // buckets. gelu has no pipeline (fused into the LN and the GEMM
+            // epilogue), so the names after P_LN_SD were off by one slot until
+            // this list stopped carrying a gelu entry.
             let names = [
                 "gemm",
                 "conv_gemm",
@@ -2217,28 +2493,46 @@ impl GpuModel {
                 "logsoftmax",
                 "transpose",
                 "gather",
+                "gemm64",
+                "gemm_f32",
+                "gemm64_f32",
+                "flash_attn",
                 "  scores",
                 "  pv",
                 "  gemm-main",
             ];
-            let mut acc = [0f64; 16];
-            let mut cnt = [0u32; 16];
+            // The score dispatch is `t/nt` workgroups wide on whichever tile
+            // served it: the short-window pipeline has its own 64-wide N.
+            let scores_gy = (scores_gy_main, scores_gy_64);
+            assert_eq!(names.len(), PROFILE_SLOTS);
+            let mut acc = [0f64; PROFILE_SLOTS];
+            let mut cnt = [0u32; PROFILE_SLOTS];
             for (i, &(p, gy)) in job_meta.iter().enumerate() {
                 let dt = ticks[i * 2 + 1].saturating_sub(ticks[i * 2]) as f64 * period / 1e6;
                 if p < acc.len() {
-                    // split the gemm pipeline by dispatch shape: pv is n=64
+                    // Split the GEMM schedule by dispatch shape: pv is n=64
                     // (gy=1), scores is n=t, everything else is a main GEMM.
-                    // The three buckets are the last three names above.
-                    let mut b = p;
-                    if p == P_GEMM {
-                        b = if gy == 1 {
-                            12
-                        } else if gy == (t as u32).div_ceil(gemm_nt) {
-                            11
-                        } else {
-                            13
-                        };
-                    }
+                    let b = match p {
+                        P_GEMM | P_GEMM_F32 => {
+                            if gy == 1 {
+                                BUCKET_PV
+                            } else if gy == scores_gy.0 {
+                                BUCKET_SCORES
+                            } else {
+                                BUCKET_MAIN
+                            }
+                        }
+                        P_GEMM64 | P_GEMM64_F32 => {
+                            if gy == 1 {
+                                BUCKET_PV
+                            } else if gy == scores_gy.1 {
+                                BUCKET_SCORES
+                            } else {
+                                BUCKET_MAIN
+                            }
+                        }
+                        other => other,
+                    };
                     acc[b] += dt;
                     cnt[b] += 1;
                 }
@@ -2686,6 +2980,12 @@ struct Scratch {
     /// and log-softmax dispatches are not in the recorded graph, so the
     /// cached replay is only valid for the same mode
     hidden: bool,
+    /// true when the graph was recorded with the fused attention dispatch:
+    /// the `kt`/`scores` handles are placeholders there and the recorded
+    /// dispatches differ, so a replay must never cross the two modes
+    flash: bool,
+    /// true when the graph was recorded for a window the 64x64 tile covers
+    tile64: bool,
     /// the buffer the recorded graph's final LN writes: `act.x` is a *local*
     /// handle the recording's odd number of swaps leaves pointing at `t3`,
     /// so a replay (whose swaps never run) must not read back through it
@@ -2709,7 +3009,11 @@ struct Scratch {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_binding_limits, transpose_pos};
+    use super::{
+        check_binding_limits, resolve_flash_attn, resolve_tile64, transpose_pos, uni_binding,
+        P_FLASH_ATTN, P_GEMM, P_GEMM64, P_GEMM64_F32, P_GEMM_F32,
+    };
+    use crate::shaders::{GemmVariant, FLASH_HEAD_DIM};
 
     /// The model's shape: 16 heads, 10288 vocabulary, f32.
     const HEADS: u64 = 16;
@@ -2784,6 +3088,165 @@ mod tests {
         assert!(hidden < full);
         assert!(check_binding_limits(300, scores, hidden, cap).is_ok());
         assert!(check_binding_limits(300, scores, full, cap).is_err());
+    }
+
+    /// 48 KiB, what this machine's Vulkan adapter reports.
+    const STORAGE: u32 = 48 * 1024;
+
+    #[test]
+    fn the_short_window_tile_follows_its_selector() {
+        // A 128-row main tile has something to gain; `M64s` needs 17,408 B
+        // as f32 and 8,704 B as f16.
+        assert!(resolve_tile64(false, 128, STORAGE, false, None) == false);
+        assert!(resolve_tile64(true, 128, STORAGE, false, None));
+        assert!(resolve_tile64(true, 128, STORAGE, true, None));
+        // `on` is how it gets measured on a device without f16.
+        for on in ["1", "true", "TRUE", "on", " On "] {
+            assert!(resolve_tile64(false, 128, STORAGE, false, Some(on)), "{on}");
+        }
+        for off in ["0", "false", "off", "OFF"] {
+            assert!(
+                !resolve_tile64(true, 128, STORAGE, true, Some(off)),
+                "{off}"
+            );
+        }
+        // Off for `auto` where f16 does not make the extra pipeline cheap,
+        // which is the zero-regression case on this P104.
+        assert!(!resolve_tile64(false, 128, STORAGE, false, Some("auto")));
+        assert!(!resolve_tile64(false, 128, STORAGE, false, Some("")));
+        // Nothing to gain when the main tile is already 64 rows.
+        assert!(!resolve_tile64(true, 64, STORAGE, true, Some("on")));
+        // Nor where the tile does not fit: f32 M64s is 17,408 B, f16 8,704 B.
+        assert!(!resolve_tile64(false, 128, 8_704, false, Some("on")));
+        assert!(resolve_tile64(false, 128, 8_704, true, Some("on")));
+        assert!(!resolve_tile64(false, 128, 8_703, true, Some("on")));
+        // The chosen variant is the one the dispatch grid assumes.
+        assert_eq!(
+            GemmVariant::M64s.shared_bytes_with(false),
+            17_408,
+            "64x64x32 tile"
+        );
+    }
+
+    #[test]
+    fn fused_attention_engages_where_the_scores_tensor_cannot() {
+        let head_dim = FLASH_HEAD_DIM as usize;
+        let mib = 1u64 << 20;
+        // 30 s: 144 MB of scores, well inside this adapter's 2047 MB binding.
+        let normal = 144_000_000u64;
+        assert!(!resolve_flash_attn(
+            None,
+            head_dim,
+            normal,
+            2047 * mib,
+            false,
+            false
+        ));
+        // The same window on a device whose binding limit is below it.
+        assert!(resolve_flash_attn(
+            None,
+            head_dim,
+            normal,
+            64 * mib,
+            false,
+            false
+        ));
+        // A window past the hard size cap.
+        assert!(resolve_flash_attn(
+            None,
+            head_dim,
+            normal,
+            2047 * mib,
+            true,
+            false
+        ));
+        // A modern adapter: f16 tiles make the fused path the better one.
+        assert!(resolve_flash_attn(
+            None,
+            head_dim,
+            normal,
+            2047 * mib,
+            false,
+            true
+        ));
+        // Explicit switches win in both directions.
+        for on in ["1", "true", "on"] {
+            assert!(resolve_flash_attn(
+                Some(on),
+                head_dim,
+                normal,
+                2047 * mib,
+                false,
+                false
+            ));
+        }
+        for off in ["0", "false", "off"] {
+            assert!(!resolve_flash_attn(
+                Some(off),
+                head_dim,
+                1 << 40,
+                1,
+                true,
+                true
+            ));
+        }
+        // The kernel is written for the 64-wide head of every Wav2Vec2
+        // checkpoint; anything else keeps the materialised path.
+        assert!(!resolve_flash_attn(
+            Some("on"),
+            80,
+            normal,
+            2047 * mib,
+            false,
+            false
+        ));
+        assert!(!resolve_flash_attn(
+            Some("on"),
+            32,
+            normal,
+            2047 * mib,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn the_new_pipelines_keep_the_uniform_binding_their_shaders_declare() {
+        // `gemm`-family shaders take `Dims` at binding 4, flash attention its
+        // `FlashAttnCfg` at binding 2. A mismatch is a bind-group validation
+        // error at the first dispatch, not at load.
+        assert_eq!(uni_binding(P_GEMM), 4);
+        assert_eq!(uni_binding(P_GEMM_F32), 4);
+        assert_eq!(uni_binding(P_GEMM64), 4);
+        assert_eq!(uni_binding(P_GEMM64_F32), 4);
+        assert_eq!(uni_binding(P_FLASH_ATTN), 2);
+        assert_eq!(
+            std::mem::size_of::<super::FlashAttnCfg>(),
+            32,
+            "FlashAttnCfg is 32 bytes"
+        );
+    }
+
+    #[test]
+    fn f32_attention_tile_falls_back_when_f16_main_tile_exceeds_f32_budget() {
+        use crate::shaders::GemmVariant;
+        // 16 KiB f16 adapter picks Base (13,312 B in f16), which needs 26,624 B
+        // in f32 -> must fall back to M64K16 (13,312 B in f32) instead of panicking.
+        assert_eq!(
+            super::resolve_f32_gemm_variant(GemmVariant::Base, 16 * 1024),
+            GemmVariant::M64K16
+        );
+        // 32 KiB f16 adapter with explicit Db16 (22,528 B in f16) needs 45,056 B
+        // in f32 -> falls back to Base (26,624 B in f32).
+        assert_eq!(
+            super::resolve_f32_gemm_variant(GemmVariant::Db16, 32 * 1024),
+            GemmVariant::Base
+        );
+        // 48 KiB adapter keeps the same variant.
+        assert_eq!(
+            super::resolve_f32_gemm_variant(GemmVariant::Db16, 48 * 1024),
+            GemmVariant::Db16
+        );
     }
 
     #[test]

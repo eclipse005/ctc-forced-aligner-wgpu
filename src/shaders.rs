@@ -12,9 +12,10 @@
 mod gemm_kernel;
 
 pub use gemm_kernel::{
-    conv_gemm, conv_gemm_variant, gemm_bias, gemm_bias_tiled, gemm_shared_bytes, gemm_tile,
-    gemm_variant, pick_gemm_variant, pick_gemm_variant_for, pos_conv, GemmVariant, KS, MT, NT,
-    POS_KS, POS_MT, POS_NT,
+    conv_gemm, conv_gemm_variant, conv_gemm_variant_with, gemm_bias, gemm_bias_tiled,
+    gemm_shared_bytes, gemm_tile, gemm_variant, gemm_variant_with, pick_gemm_variant,
+    pick_gemm_variant_for, pick_gemm_variant_for_with, pick_gemm_variant_with, pos_conv,
+    GemmVariant, KS, MT, NT, POS_KS, POS_MT, POS_NT,
 };
 
 /// What a device's subgroup width means for a reduction kernel.
@@ -651,6 +652,215 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     .to_string()
 }
 
+/// Query rows one FlashAttention workgroup owns. 32 queries × 16 keys ×
+/// 64 head dimensions is the largest tile that keeps every shared array
+/// inside WebGPU's 16 KiB floor.
+pub(crate) const FLASH_BQ: u32 = 32;
+pub(crate) const FLASH_HEAD_DIM: u32 = 64;
+
+/// Fused bidirectional attention: `softmax(q k^T * scale) v` per head,
+/// straight from the packed `qkv` buffer and straight into the output.
+///
+/// The materialised path this replaces wrote a (heads, t, t_pad) scores
+/// tensor, transposed K into a second buffer, read the scores back through a
+/// softmax kernel and then through the PV GEMM: 176–625 MiB of `scores` and
+/// 16.8 GB of traffic per 30 s window. Here the scores never leave shared
+/// memory and neither K nor V is ever transposed — the tile is loaded as
+/// `vec4`s along the 64-wide head dimension, which is the layout `qkv`
+/// already has.
+///
+/// One workgroup is 16×16 threads handling 32 queries of one head: thread
+/// `lid.y` owns query rows `lid.y` and `lid.y + 16`, thread `lid.x` owns
+/// dimension `vec4` `lid.x` of the output and key `lid.x` of the score tile.
+///
+/// Shared memory is exactly 16,384 B:
+///
+/// * `sq`  32 × 16 `vec4` = 8,192 B, this block's queries;
+/// * `skv` 16 × 16 `vec4` = 4,096 B, the key tile, reused for the values;
+/// * `sp`  32 × 16 `f32`   = 2,048 B, raw `q·k * scale`;
+/// * `sp_p` 32 × 16 `f32`  = 2,048 B, `exp(s - m_new)`.
+///
+/// `sp` and `sp_p` are separate arrays on purpose: the row max reads every
+/// entry of `sp` while the same pass writes `sp_p`, so one array would need a
+/// further barrier between the two.
+///
+/// Masked keys score `-3.4e38`, never `-inf`: `exp(-3.4e38)` is 0 while
+/// `exp(-inf - -inf)` is a NaN. A row whose `m` is still the sentinel has no
+/// prior block, and `select` gives it `alpha = 0`.
+pub(crate) fn flash_attn() -> String {
+    r#"
+struct FlashAttnCfg {
+    t: u32,
+    heads: u32,
+    hidden4: u32,
+    _p0: u32,
+    scale: f32,
+    _p1: u32,
+    _p2: u32,
+    _p3: u32,
+}
+
+// qkv as (t, 3 * hidden) viewed as vec4s: one row is 3 * hidden4 vec4s, and a
+// head's 64 values are 16 consecutive vec4s.
+@group(0) @binding(0) var<storage, read> qkv4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> out4: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> cfg: FlashAttnCfg;
+
+var<workgroup> sq: array<vec4<f32>, 512u>;
+var<workgroup> skv: array<vec4<f32>, 256u>;
+var<workgroup> sp: array<f32, 512u>;
+var<workgroup> sp_p: array<f32, 512u>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head = wid.y;
+    let q0 = wid.x * 32u + lid.y;
+    let q1 = q0 + 16u;
+    let row = 3u * cfg.hidden4;
+    let q_off = head * 16u;
+    let k_off = cfg.hidden4 + head * 16u;
+    let v_off = 2u * cfg.hidden4 + head * 16u;
+
+    // ---- prologue: this block's 32 queries, zero-padded past t
+    if (q0 < cfg.t) {
+        sq[lid.y * 16u + lid.x] = qkv4[q0 * row + q_off + lid.x];
+    } else {
+        sq[lid.y * 16u + lid.x] = vec4<f32>(0.0);
+    }
+    if (q1 < cfg.t) {
+        sq[(lid.y + 16u) * 16u + lid.x] = qkv4[q1 * row + q_off + lid.x];
+    } else {
+        sq[(lid.y + 16u) * 16u + lid.x] = vec4<f32>(0.0);
+    }
+
+    var o0 = vec4<f32>(0.0);
+    var o1 = vec4<f32>(0.0);
+    var m0 = -3.4e38;
+    var l0 = 0.0;
+    var m1 = -3.4e38;
+    var l1 = 0.0;
+    workgroupBarrier();
+
+    let ktiles = (cfg.t + 15u) / 16u;
+    for (var kt = 0u; kt < ktiles; kt = kt + 1u) {
+        let k0 = kt * 16u;
+        let krow = k0 + lid.y;
+
+        // ---- K tile (column-major in `skv`: key, then dimension)
+        if (krow < cfg.t) {
+            skv[lid.y * 16u + lid.x] = qkv4[krow * row + k_off + lid.x];
+        } else {
+            skv[lid.y * 16u + lid.x] = vec4<f32>(0.0);
+        }
+        workgroupBarrier();
+
+        // ---- A: s = q . k, thread (lid.x, lid.y) fills key lid.x of rows
+        //      lid.y and lid.y + 16
+        var s0 = 0.0;
+        var s1 = 0.0;
+        for (var d = 0u; d < 16u; d = d + 1u) {
+            let kv = skv[lid.x * 16u + d];
+            s0 = s0 + dot(sq[lid.y * 16u + d], kv);
+            s1 = s1 + dot(sq[(lid.y + 16u) * 16u + d], kv);
+        }
+        s0 = s0 * cfg.scale;
+        s1 = s1 * cfg.scale;
+        if (k0 + lid.x >= cfg.t) {
+            s0 = -3.4e38;
+            s1 = -3.4e38;
+        }
+        sp[lid.y * 16u + lid.x] = s0;
+        sp[(lid.y + 16u) * 16u + lid.x] = s1;
+        workgroupBarrier();
+
+        // ---- B: V tile and the online softmax. `sp` is read here and `sp_p`
+        //      written, so no entry is both.
+        if (krow < cfg.t) {
+            skv[lid.y * 16u + lid.x] = qkv4[krow * row + v_off + lid.x];
+        } else {
+            skv[lid.y * 16u + lid.x] = vec4<f32>(0.0);
+        }
+        var bm0 = -3.4e38;
+        var bm1 = -3.4e38;
+        for (var j = 0u; j < 16u; j = j + 1u) {
+            bm0 = max(bm0, sp[lid.y * 16u + j]);
+            bm1 = max(bm1, sp[(lid.y + 16u) * 16u + j]);
+        }
+        let m0_new = max(m0, bm0);
+        let m1_new = max(m1, bm1);
+        let alpha0 = select(0.0, exp(m0 - m0_new), m0 > -1.0e37);
+        let alpha1 = select(0.0, exp(m1 - m1_new), m1 > -1.0e37);
+        let kvalid = k0 + lid.x < cfg.t;
+        sp_p[lid.y * 16u + lid.x] =
+            select(0.0, exp(sp[lid.y * 16u + lid.x] - m0_new), kvalid);
+        sp_p[(lid.y + 16u) * 16u + lid.x] =
+            select(0.0, exp(sp[(lid.y + 16u) * 16u + lid.x] - m1_new), kvalid);
+        workgroupBarrier();
+
+        // ---- C: O = alpha * O + P V, with the row sums folded in
+        o0 = o0 * alpha0;
+        o1 = o1 * alpha1;
+        var bl0 = 0.0;
+        var bl1 = 0.0;
+        for (var j = 0u; j < 16u; j = j + 1u) {
+            let vv = skv[j * 16u + lid.x];
+            let p0 = sp_p[lid.y * 16u + j];
+            let p1 = sp_p[(lid.y + 16u) * 16u + j];
+            o0 = o0 + p0 * vv;
+            o1 = o1 + p1 * vv;
+            bl0 = bl0 + p0;
+            bl1 = bl1 + p1;
+        }
+        l0 = l0 * alpha0 + bl0;
+        m0 = m0_new;
+        l1 = l1 * alpha1 + bl1;
+        m1 = m1_new;
+        workgroupBarrier();
+    }
+
+    // ---- epilogue: the normalised rows of the block that exist
+    let o_off = head * 16u + lid.x;
+    if (q0 < cfg.t) {
+        out4[q0 * cfg.hidden4 + o_off] = o0 / l0;
+    }
+    if (q1 < cfg.t) {
+        out4[q1 * cfg.hidden4 + o_off] = o1 / l1;
+    }
+}
+"#
+    .to_string()
+}
+
+/// Parse and validate a module the way a device would, without opening one.
+///
+/// The `f16` GEMM tiles and the `df64` kernels cannot be compiled on a GPU
+/// that lacks the feature they need (this machine's P104-100 has no
+/// `SHADER_F16`), so their type check runs in naga instead: it rejects an
+/// `f32`/`f16` mix in an expression, a `vec4<f32>` stored into a `vec4<f16>`
+/// tile, an undefined binding or an unbalanced block, exactly as a driver's
+/// front end would before the pipeline is created.
+#[cfg(test)]
+pub(crate) fn naga_validate(src: &str, what: &str) {
+    let module = wgpu::naga::front::wgsl::parse_str(src)
+        .unwrap_or_else(|e| panic!("{what} does not parse: {}", e.emit_to_string(src)));
+    let mut v = wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::all(),
+    );
+    v.validate(&module)
+        .unwrap_or_else(|e| panic!("{what} does not validate: {e:?}"));
+}
+
+/// Serializes every test that opens a Vulkan device.
+///
+/// `cargo test` runs the test functions in parallel threads and this machine's
+/// driver does not survive two devices in one process, so the shader checks
+/// and the `df64` DP check each take this lock first. It lives here because
+/// both modules already depend on [`Gpu`].
+#[cfg(test)]
+pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1222,9 @@ mod tests {
 
     #[test]
     fn vulkan_shaders_compile_and_the_subgroup_folds_match_the_tree() {
+        // `cargo test` runs the test functions in parallel threads and this
+        // machine's driver does not survive two devices in one process.
+        let _gpu_lock = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(gpu) = vulkan() else { return };
         eprintln!("[shaders] {}", gpu.describe());
         let max_storage = gpu.limits().max_compute_workgroup_storage_size;
@@ -1255,6 +1468,83 @@ mod tests {
                         "conv_gemm [{mm},{nn}]: host {want} vs {have}"
                     );
                 }
+            }
+        }
+
+        // ---- flash attention: fused softmax(Q K^T * scale) V, straight from
+        //      the packed qkv buffer, against an f64 reference
+        {
+            let pipe = pipeline(&gpu, "t-flash", &flash_attn());
+            let (heads, hidden) = (4usize, 256usize);
+            let head_dim = hidden / heads;
+            assert_eq!(head_dim as u32, FLASH_HEAD_DIM, "the kernel's head width");
+            let hidden4 = (hidden / 4) as u32;
+            let scale = 0.125f64;
+            // 17 is one partial query block, 67 is two whole blocks and a
+            // partial one: both leave the zero-padded rows of `sq` in play.
+            for t_len in [17usize, 67] {
+                let qkv: Vec<f32> = (0..t_len * 3 * hidden).map(noise).collect();
+                let qb = storage_f32(&gpu, "t-flash-qkv", &qkv);
+                let ob = storage_f32(&gpu, "t-flash-out", &vec![-9.0f32; t_len * hidden]);
+                let uni = uniform_u32(
+                    &gpu,
+                    "t-flash-u",
+                    &[
+                        t_len as u32,
+                        heads as u32,
+                        hidden4,
+                        0,
+                        (scale as f32).to_bits(),
+                        0,
+                        0,
+                        0,
+                    ],
+                );
+                run(
+                    &gpu,
+                    &pipe,
+                    &[bind(0, &qb), bind(1, &ob), bind(2, &uni)],
+                    (t_len as u32).div_ceil(FLASH_BQ),
+                    heads as u32,
+                );
+                let got = read(&gpu, &ob, t_len * hidden);
+                for q in 0..t_len {
+                    for h in 0..heads {
+                        // f64 reference: full softmax, no online update
+                        let mut logits = vec![0f64; t_len];
+                        for (k, slot) in logits.iter_mut().enumerate() {
+                            let mut acc = 0f64;
+                            for d in 0..head_dim {
+                                acc += qkv[q * 3 * hidden + h * head_dim + d] as f64
+                                    * qkv[k * 3 * hidden + hidden + h * head_dim + d] as f64;
+                            }
+                            *slot = acc * scale;
+                        }
+                        let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        let p: Vec<f64> = logits.iter().map(|s| (s - m).exp()).collect();
+                        let den: f64 = p.iter().sum();
+                        for d in 0..head_dim {
+                            let mut acc = 0f64;
+                            for (k, &pk) in p.iter().enumerate() {
+                                acc +=
+                                    pk * qkv[k * 3 * hidden + 2 * hidden + h * head_dim + d] as f64;
+                            }
+                            let want = acc / den;
+                            let have = got[q * hidden + h * head_dim + d];
+                            assert!(
+                                have.is_finite(),
+                                "flash T={t_len} head {h} q {q} d {d} = {have}"
+                            );
+                            assert!(
+                                (want - have as f64).abs() < 1e-5,
+                                "flash T={t_len} head {h} q {q} d {d}: {want} vs {have}"
+                            );
+                        }
+                    }
+                }
+                // 16 KiB of workgroup storage: WebGPU's floor, and the whole
+                // reason the tile is 32 queries wide.
+                assert_eq!(16 * 512 + 16 * 256 + 4 * 512 + 4 * 512, 16_384);
             }
         }
 

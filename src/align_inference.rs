@@ -1361,8 +1361,13 @@ impl Aligner {
         }
     }
 
-    /// Logits streaming on a GPU that can run f64 shaders. `CTC_GPU_DP=0`
-    /// keeps the CPU row team. Columns and hidden stay on the CPU path.
+    /// Logits streaming on any GPU. `CTC_GPU_DP=0` keeps the CPU row team.
+    /// Columns and hidden stay on the CPU path.
+    ///
+    /// An adapter without `SHADER_F64` runs the same DP on `df64` pairs (see
+    /// `viterbi_gpu::DpPrecision`), which is why this no longer asks the device
+    /// whether it can do f64: only `CTC_GPU_DP_MODE=f64` can refuse, and it
+    /// fails at DP construction with the reason.
     fn use_gpu_viterbi(&self, kind: &BlockKind) -> bool {
         if !matches!(kind, BlockKind::Logits { .. }) {
             return false;
@@ -1371,14 +1376,7 @@ impl Aligner {
             eprintln!("ctc-aligner: CTC_GPU_DP=0, viterbi on cpu");
             return false;
         }
-        match &self.tower {
-            Tower::Gpu(g) if g.supports_f64() => true,
-            Tower::Gpu(_) => {
-                eprintln!("ctc-aligner: no f64 shaders on this adapter, viterbi stays on cpu");
-                false
-            }
-            Tower::Cpu(_) => false,
-        }
+        matches!(&self.tower, Tower::Gpu(_))
     }
 
     /// The logits window loop with the Viterbi on the same queue as the encoder.
